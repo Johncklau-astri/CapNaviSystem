@@ -187,17 +187,19 @@ def vertPreMove(dev, motors):
 def automated_movement(dev,motors):
     global worldX, worldY, worldZ # Assume actual_pos tracks motor positions
     global rollAngle, pitchAngle, yawAngle
-    interval = 1    ## in cm
-    x_range = 18    ## in cm
-    y_range = 3    ## in cm
-    z_range = 20   ## in cm
 
-    speed = 30
-    acc= 100
-    dec = 100
+    ## ALL even numbers 
+    interval = 1    ## in cm
+    x_range = 10    ## in cm
+    y_range = 3    ## in cm
+    z_range = 28   ## in cm
+
+    speed = 60
+    acc= 200
+    dec = 200
     print("Assume Magnet is around at the height as sensor, y= 0, and pitch and roll and yaw is 0")
 
-    small_timeout = 0.9
+    small_timeout = 0.2
     mid_timeout = 0.4
     big_timeout = 5
 
@@ -1289,12 +1291,12 @@ press q to quit
             rotary_travel = 10.0    # degrees (positive/negative)
             vert_travel = 2      # cm (positive/negative, for vert1 and vert2)
             hori_travel = 2      # cm (positive/negative, for hori1 and hori2)
-            pitch_travel = 1.0     # degrees (positive/negative)
+            pitch_travel = 5     # degrees (positive/negative)
 
             # Fixed speed, acceleration, deceleration
             speed = 50  # RPM or steps/s (adjust as needed)
-            acc = 100   # RPM/s or steps/s²
-            dec = 100   # RPM/s or steps/s²
+            acc = 150   # RPM/s or steps/s²
+            dec = 150   # RPM/s or steps/s²
 
             motors_init_brakeRelease(dev, motors)
 

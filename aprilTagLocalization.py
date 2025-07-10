@@ -23,9 +23,9 @@ CHECKERBOARD = (6, 8)
 CHECKERBOARD_SQUARE_SIZE = 0.025
 CALIBRATION_FILE = "VidAprilTagCalibration.npz"
 AXIS_LENGTH = TAG_SIZE
-DISPLAY_WIDTH = 1980
+DISPLAY_WIDTH = 1920
 DISPLAY_HEIGHT = 1200  # Total height: 600 for text, 600 for camera
-TEXT_FRAME_WIDTH = 1980
+TEXT_FRAME_WIDTH = 1920
 TEXT_FRAME_HEIGHT = 600
 CAMERA_FRAME_HEIGHT = 600
 NUM_CALIBRATION_FRAMES = 30
@@ -84,7 +84,6 @@ def send_position_request(mag_data, quat_data):
         client_socket.sendall(struct.pack('>I', length))
         client_socket.sendall(data_bytes)
         
-        # Receive response
         length_bytes = b''
         while len(length_bytes) < 4:
             chunk = client_socket.recv(4 - len(length_bytes))
@@ -119,7 +118,6 @@ def send_position_request(mag_data, quat_data):
             client_socket.close()
     return estX, estY, estZ
 
-# --- TCP Server for Motor Data ---
 def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
     global latest_position_data, auto_record_flag
     try:
@@ -168,7 +166,6 @@ def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
         if 'server_socket' in locals():
             server_socket.close()
 
-# --- Helper Functions ---
 def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
     h, w = frame.shape[:2]
     aspect_ratio = w / h
@@ -178,7 +175,6 @@ def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
         print("Invalid resize dimensions.")
         return frame
     resized_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    # Pad with black borders to match DISPLAY_WIDTH
     if new_w < DISPLAY_WIDTH:
         border_left = (DISPLAY_WIDTH - new_w) // 2
         border_right = DISPLAY_WIDTH - new_w - border_left
@@ -295,7 +291,8 @@ def rotation_matrix_to_quaternion(R):
         qz = 0.25 * S
     return [qw, qx, qy, qz]
 
-def draw_axes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length, origin_point):
+# Modify the draw_axes function to make text labels optional
+def draw_axes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length, origin_point, draw_labels=True):
     axis_points = np.float32([[0, 0, 0], [axis_length, 0, 0], [0, axis_length, 0], [0, 0, axis_length]])
     img_points, _ = cv2.projectPoints(axis_points, rvec, tvec, camera_matrix, dist_coeffs)
     img_points = img_points.reshape(-1, 2)
@@ -307,10 +304,12 @@ def draw_axes(frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length, origin
     cv2.line(frame, tuple(projected_origin), tuple(img_points[1].astype(int)), (0, 0, 255), 2)  # X: red
     cv2.line(frame, tuple(projected_origin), tuple(img_points[2].astype(int)), (0, 255, 0), 2)  # Y: green
     cv2.line(frame, tuple(projected_origin), tuple(img_points[3].astype(int)), (255, 0, 0), 2)  # Z: blue
-    cv2.putText(frame, "X", tuple(img_points[1].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.putText(frame, "Y", tuple(img_points[2].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(frame, "Z", tuple(img_points[3].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+    if draw_labels:
+        cv2.putText(frame, "X", tuple(img_points[1].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, "Y", tuple(img_points[2].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, "Z", tuple(img_points[3].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
+        
 def refine_pose(corners, camera_matrix, dist_coeffs):
     obj_points = np.float32([[-TAG_SIZE/2, -TAG_SIZE/2, 0], [TAG_SIZE/2, -TAG_SIZE/2, 0], [TAG_SIZE/2, TAG_SIZE/2, 0], [-TAG_SIZE/2, TAG_SIZE/2, 0]])
     corners = corners.reshape(-1, 2)
@@ -410,7 +409,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     with open(LOG_FILE, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Order', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_PitchDeg', 'Cube2_RollDeg', 'Cube2_YawDeg',
-                         'Rel_Xm', 'Rel_Ym', 'Rel_Zm', 'Mag_XuT', 'Mag_YuT', 'Mag_ZuT', 'Est_Xm', 'Est_Ym', 'Est_Zm'])
+                         'Rel_Xm', 'Rel_Ym', 'Rel_Zm', 'Mag_XuT', 'Mag_YuT', 'Mag_ZuT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
         while not stop_event.is_set():
             start_time = time.time()
             ret, frame = cap.read()
@@ -419,7 +418,6 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 break
             frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
             
-            # Create a fresh text frame
             text_frame[:] = 0  # Reset to black
             
             gray = cv2.cvtColor(frame_undistorted, cv2.COLOR_BGR2GRAY)
@@ -436,18 +434,12 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     corners = det.corners
                     for i in range(4):
                         cv2.line(frame_undistorted, tuple(corners[i].astype(int)), tuple(corners[(i+1)%4].astype(int)), (0, 255, 0), 2)
-                    cv2.putText(frame_undistorted, f"ID: {det.tag_id}", tuple(corners[0].astype(int)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    center = np.mean(corners, axis=0)
-                    cv2.circle(frame_undistorted, tuple(center.astype(int)), 5, (0, 0, 255), -1)
-                    cv2.putText(frame_undistorted, f"Center ID: {det.tag_id}", (center[0].astype(int) + 10, center[1].astype(int)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
                     rvec, tvec = refine_pose(corners, camera_matrix, dist_coeffs)
                     if rvec is None or tvec is None:
                         print(f"Pose refinement failed for tag {det.tag_id}")
                         continue
                     R, _ = cv2.Rodrigues(rvec)
-                    tag_data = {'tag_id': det.tag_id, 'tvec': tvec.flatten(), 'R': R, 'center': center}
+                    tag_data = {'tag_id': det.tag_id, 'tvec': tvec.flatten(), 'R': R, 'center': np.mean(corners, axis=0)}
                     tags.append(tag_data)
                     if det.tag_id == 4:
                         tag1_pose = tag_data
@@ -467,8 +459,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 img_points, _ = cv2.projectPoints(cube1_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                 img_cube1_center = img_points[0][0].astype(int)
                 cv2.circle(frame_undistorted, tuple(img_cube1_center), 8, (255, 255, 0), -1)
-                cv2.putText(frame_undistorted, "Origin Cube", (img_cube1_center[0] + 10, img_cube1_center[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
                 if tag1_pose is not None:
                     R_tag4 = tag1_pose['R']
                     theta_cube1 = np.radians(270)
@@ -516,30 +507,41 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         cube2X = cube2_center_ref[0]
                         cube2Y = cube2_center_ref[1]
                         cube2Z = cube2_center_ref[2]
-                        cube2_center_text = f"Cube 2 Center (Ref): x={cube2_center_ref[0]:.3f} m, y={cube2_center_ref[1]:.3f} m, z={cube2_center_ref[2]:.3f} m"
+                        cube2_center_text = f"Mea.Pos: x={cube2_center_ref[0]:.3f} m, y={cube2_center_ref[1]:.3f} m, z={cube2_center_ref[2]:.3f} m"
                         if tag2_pose is not None:
                             rel_Rsensor = R_modified_cube1.T @ R_modified_cube2
                             cube2_euler = rotation_matrix_to_euler(rel_Rsensor)
-                            cube2_orient_text = f"Cube 2 Orient: Pitch={cube2_euler[0]:.1f}deg, Roll={cube2_euler[1]:.1f}deg, Yaw={cube2_euler[2]:.1f}deg"
+                            cube2_orient_text = f"Euler: Pitch={cube2_euler[0]:.1f}deg, Roll={cube2_euler[1]:.1f}deg, Yaw={cube2_euler[2]:.1f}deg"
                         distance = np.linalg.norm(img_cube1_center - img_cube2_center)
                         if distance < 20:
                             print(f"Cube centers too close in image: {distance:.2f} pixels")
-
+            
             cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
             estX, estY, estZ = send_position_request([magX, magY, magZ], cube2_quat)
             
+            # Draw estimated position and axes
+            if cube1_center_camera is not None and tag1_pose is not None and (estX != 0 or estY != 0 or estZ != 0):
+                est_pos_ref = np.array([estX - cube1MagOffset_X, estY - cube1MagOffset_Y, estZ - cube1MagOffset_Z], dtype=np.float32)
+                est_pos_camera = R_modified_cube1 @ est_pos_ref + cube1_center_camera_smoothed
+                est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
+                img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                img_est_pos = img_points[0][0].astype(int)
+                cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 255, 0), -1)  # Red circle for estimated position
+                est_rvec, _ = cv2.Rodrigues(rel_Rsensor)
+                draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec, est_pos_camera, AXIS_LENGTH, img_est_pos)
+
             # Draw text on text_frame with semi-transparent backgrounds
             mag_text = f"Mag: X={magX:.2f} uT, Y={magY:.2f} uT, Z={magZ:.2f} uT"
             est_pos_text = f"Est Pos: x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
-            pos_error_text = f"Pos Error: x={estX-cube2X:.3f} m, y={estY-cube2Y:.3f} m, z={estZ-cube2Z:.3f} m"
+            pos_error_text = f"Pos Err: x={estX-cube2X:.3f} m, y={estY-cube2Y:.3f} m, z={estZ-cube2Z:.3f} m"
             
-            intervalOffset = 2
-            draw_text_with_background(text_frame, cube1_center_text, (50, 80), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 0), 2)
-            draw_text_with_background(text_frame, cube2_center_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
-            draw_text_with_background(text_frame, cube2_orient_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
-            draw_text_with_background(text_frame, mag_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255), 2)
-            draw_text_with_background(text_frame, est_pos_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 240, 255), 2)
-            draw_text_with_background(text_frame, pos_error_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 240, 255), 2)
+            intervalOffset = 1.7
+            # draw_text_with_background(text_frame, cube1_center_text, (50, int(80*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 0), 3)
+            draw_text_with_background(text_frame, cube2_center_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+            draw_text_with_background(text_frame, cube2_orient_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+            draw_text_with_background(text_frame, mag_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+            draw_text_with_background(text_frame, est_pos_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+            draw_text_with_background(text_frame, pos_error_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
             
             if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
                 with position_data_lock:
@@ -550,8 +552,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
             if motor_data:
                 motor_pos_text = f"Motor Pos: X={motor_data['x']:.2f} cm, Y={motor_data['y']:.2f} cm, Z={motor_data['z']:.2f} cm"
                 motor_quat_text = f"Motor Quat: [{motor_data['qw']:.3f}, {motor_data['qx']:.3f}, {motor_data['qy']:.3f}, {motor_data['qz']:.3f}]"
-                draw_text_with_background(text_frame, motor_pos_text, (50, 290), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 165, 0), 2)
-                draw_text_with_background(text_frame, motor_quat_text, (50, 330), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 165, 0), 2)
+                draw_text_with_background(text_frame, motor_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 165, 0), 2)
+                draw_text_with_background(text_frame, motor_quat_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 165, 0), 2)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('t') or auto_record_flag:
@@ -562,7 +564,6 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     errorX = estX - cube2_center_ref[0]
                     errorY = estY - cube2_center_ref[1]
                     errorZ = estZ - cube2_center_ref[2]
-                    total_error = np.sqrt(errorX**2 + errorY**2 + errorZ**2)
                     writer.writerow([
                         measurement_order,
                         f'{cube2_quat[0]:.4f}', f'{cube2_quat[1]:.4f}', f'{cube2_quat[2]:.4f}', f'{cube2_quat[3]:.3f}',
@@ -570,22 +571,20 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         f'{cube2_center_ref[0]:.6f}', f'{cube2_center_ref[1]:.6f}', f'{cube2_center_ref[2]:.6f}',
                         f'{mag_x:.3f}', f'{mag_y:.3f}', f'{mag_z:.3f}',
                         f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
+                        f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
                     ])
                     csvfile.flush()
                     draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     time.sleep(0.2)
                     auto_record_flag = False
             
-            # Resize text frame to match DISPLAY_WIDTH
             text_frame_resized = cv2.resize(text_frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
-            
-            # Resize camera frame with aspect ratio
             camera_frame_resized = resize_frame(frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
-            
-            # Combine frames
             combined_frame = np.vstack((text_frame_resized, camera_frame_resized))
             
             cv2.imshow("AprilTag Localization", combined_frame)
+            time.sleep(0.1)  # Reduce CPU usage
+            
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 stop_event.set()
                 break

@@ -11,11 +11,16 @@ import socket
 import struct
 import threading
 import argparse
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
 
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
-CSV_FILE = '1800points.csv'
+CSV_FILE = 'Allpoints.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
@@ -75,8 +80,8 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds):
             quat_sensor = [data['qw'], data['qx'], data['qy'], data['qz']]
             
             # Validate inputs
-            if any(abs(m) > 5000 for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} µT exceed ±5000 µT")
+            if any(abs(m) > 8000 for m in B_custom):
+                print(f"Invalid magnetic field values: {B_custom} µT exceed ±8000 µT")
                 response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 'error': 'Invalid magnetic field values'}
             else:
                 quat_norm = np.sqrt(sum(x**2 for x in quat_sensor))
@@ -277,8 +282,8 @@ def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z,
             if len(B_custom) != 3:
                 print("Error: Please enter exactly 3 values for B_x, B_y, B_z")
                 continue
-            if any(abs(m) > 5000 for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} exceed ±5000 µT")
+            if any(abs(m) > 8000 for m in B_custom):
+                print(f"Invalid magnetic field values: {B_custom} exceed ±8000 µT")
                 continue
         except ValueError:
             print("Error: Invalid input. Use format like '10.5,-5.2,3.1'")
@@ -419,17 +424,16 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
     ax.set_zlabel('Z (m)')
     ax.set_title('Actual vs Estimated Positions')
     ax.legend()
-    plt.savefig('position_scatter_3d.png')
     plt.show()
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.hist(pos_errors, bins=20)
     ax.set_xlabel('Positional Error (m)')
     ax.set_title('Positional Errors')
-    plt.savefig('positional_errors_histogram_csv.png')
     plt.close()
 
 def run_optimization():
+    print("Starting optimization...")
     positions, B_measured, quaternions = load_and_filter_data()
     if positions is None:
         print("Failed to load data for optimization.")
@@ -440,6 +444,9 @@ def run_optimization():
         print(f"Too few measurements ({N}). At least 5 are recommended.")
         return None, None
 
+    print(f"Loaded {N} data points for optimization.")
+
+    # Initial dipole moment guess
     m0 = np.array([-0.1, 0, 0])
     for i, r in enumerate(positions):
         x, y, z = r
@@ -452,12 +459,15 @@ def run_optimization():
             if -1000 <= m0_x <= 0:
                 m0[0] = m0_x
             break
+    print(f"Initial dipole moment guess: m = {m0}")
 
-    methods = ['TRF', 'Dogbox', 'LM', 'Differential Evolution', 'Nelder-Mead']
+    methods = ['TRF', 'Dogbox', 'LM', 'Differential Evolution', 'Nelder-Mead', 'Neural Network']
     results = []
     bounds_m = ([-1000, -1000, -1000], [0, 1000, 1000])
 
+    # Stage 1: Optimize dipole moment m
     for method in methods:
+        print(f"\nRunning {method} optimization...")
         start_time = time.time()
         try:
             if method == 'TRF':
@@ -482,6 +492,22 @@ def run_optimization():
                                  method='Nelder-Mead',
                                  options={'xatol': 1e-6, 'fatol': 1e-6})
                 m_best = np.clip(result.x, bounds_m[0], bounds_m[1])
+            elif method == 'Neural Network':
+                # Neural Network optimization
+                model = Sequential([
+                    Dense(64, activation='relu', input_shape=(10,)),  # 3 pos + 4 quat + 3 B_meas
+                    Dense(32, activation='relu'),
+                    Dense(3)  # Predict m_x, m_y, m_z
+                ])
+                model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+                
+                # Prepare input data: [x, y, z, qw, qx, qy, qz, Bx, By, Bz]
+                X = np.hstack((positions, quaternions, B_measured * 1e6))
+                y = np.tile(m0, (N, 1))  # Initial target is m0 repeated
+                model.fit(X, y, epochs=50, batch_size=32, verbose=0,
+                          callbacks=[tqdm_callback(N, 'Neural Network Training')])
+                m_best = model.predict(X[-1:], verbose=0)[0]
+                m_best = np.clip(m_best, bounds_m[0], bounds_m[1])
             
             time_taken = time.time() - start_time
             rmse, ang_err, ang_errs, B_pred = compute_metrics(m_best, positions, B_measured, quaternions)
@@ -494,6 +520,7 @@ def run_optimization():
                 'Angular Errors': ang_errs,
                 'B_pred': B_pred
             })
+            print(f"{method} completed: RMSE = {rmse:.6f} µT, Angular Error = {ang_err:.6f}°, Time = {time_taken:.2f}s")
         except Exception as e:
             print(f"Error in {method}: {str(e)}")
             results.append({
@@ -517,7 +544,10 @@ def run_optimization():
     ang_errs_best = best_result['Angular Errors']
     B_pred_best = best_result['B_pred']
     best_method = best_result['Method']
+    print(f"\nBest Stage 1 Method: {best_method}, RMSE = {rmse_best:.6f} µT, Angular Error = {ang_err_best:.6f}°")
 
+    # Stage 2: Optimize a, b parameters
+    print("\nRunning Second Stage (Nelder-Mead for a, b parameters)...")
     start_time = time.time()
     ab0 = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
     try:
@@ -529,11 +559,14 @@ def run_optimization():
         time_taken = time.time() - start_time
         rmse_final, ang_err_final, ang_errs_final, B_pred_final = compute_metrics(
             m_best, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
+        print(f"Second Stage completed: RMSE = {rmse_final:.6f} µT, Angular Error = {ang_err_final:.6f}°, Time = {time_taken:.2f}s")
     except Exception as e:
         print(f"Error in Second Stage (Nelder-Mead): {str(e)}")
         a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best = 1.0, 0.0, 1.0, 0.0, 1.0, 0.0
         rmse_final, ang_err_final, ang_errs_final, B_pred_final = rmse_best, ang_err_best, ang_errs_best, B_pred_best
 
+    # Stage 3: Refine m with fixed a, b
+    print("\nRunning Third Stage (TRF for m refinement)...")
     start_time = time.time()
     try:
         def residuals_m_third(m, positions, B_measured, quaternions, a_x, b_x, a_y, b_y, a_z, b_z):
@@ -551,11 +584,13 @@ def run_optimization():
         time_taken = time.time() - start_time
         rmse_third, ang_err_third, ang_errs_third, B_pred_third = compute_metrics(
             m_third, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
+        print(f"Third Stage completed: RMSE = {rmse_third:.6f} µT, Angular Error = {ang_err_third:.6f}°, Time = {time_taken:.2f}s")
     except Exception as e:
         print(f"Error in Third Stage (TRF): {str(e)}")
         m_third = m_best
         rmse_third, ang_err_final, ang_errs_third, B_pred_third = rmse_final, ang_err_final, ang_errs_final, B_pred_final
 
+    # Select best results
     if rmse_third < rmse_final:
         m_final = m_third
         rmse_final = rmse_third
@@ -566,6 +601,7 @@ def run_optimization():
     else:
         m_final = m_best
         best_stage = f"Second Stage ({best_method})"
+    print(f"\nFinal Best Stage: {best_stage}, RMSE = {rmse_final:.6f} µT, Angular Error = {ang_err_final:.6f}°")
 
     dipole_params = {
         'm': m_final,
@@ -592,14 +628,21 @@ def run_optimization():
     }
     with open('dipole_model_params.json', 'w') as f:
         json.dump(params, f, indent=4)
+    print("Dipole parameters saved to 'dipole_model_params.json'.")
 
     pos_bounds = (
         [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
         [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
     )
+
+    # Generate and show plots only after optimization
+    print("\nGenerating visualization plots...")
+    generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
+
     return dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final
 
 def generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final):
+    print("Creating vector field visualizations...")
     N = len(positions)
     x_vals = positions[:, 0]
     y_vals = positions[:, 1]
@@ -608,7 +651,8 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     U_theo, V_theo, W_theo = np.zeros(N), np.zeros(N), np.zeros(N)
     U_opt, V_opt, W_opt = np.zeros(N), np.zeros(N), np.zeros(N)
 
-    for i, (r, B_m, quat) in enumerate(zip(positions, B_measured, quaternions)):
+    for i in tqdm(range(N), desc="Computing vector fields"):
+        r, B_m, quat = positions[i], B_measured[i], quaternions[i]
         R_sensor = quaternion_to_rotation_matrix(quat)
         B_theo = dipole_field(r, np.array([-0.1, 0, 0]), R_sensor) * 1e6
         B_opt = dipole_field(r, dipole_params['m'], R_sensor,
@@ -631,6 +675,7 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     else:
         print("Zero field magnitude encountered. Vectors not scaled.")
 
+    # 2D Vector Plot
     fig, ax = plt.subplots(figsize=(10, 8))
     sc = ax.scatter(x_vals, z_vals, c=B_measured[:, 0] * 1e6, cmap='viridis', edgecolors='k', label='Measured B_x (µT)')
     fig.colorbar(sc, ax=ax, label='B_x (µT)')
@@ -659,9 +704,9 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     ref_length = 0.5
     ref_magnitude = ref_length * max_magnitude
     ax.quiverkey(q1, X=0.85, Y=0.95, U=ref_length, label=f'{ref_magnitude:.0f} µT', labelpos='E', coordinates='figure')
-    plt.savefig('vector_plot_2d.png')
     plt.show()
 
+    # 3D Vector Plot
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
     sc = ax.scatter(x_vals, y_vals, z_vals, c=B_measured[:, 0] * 1e6, cmap='viridis', edgecolors='k', label='Measured B_x (µT)')
@@ -692,37 +737,31 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     ax.grid(True)
     ax.quiver(0, 0, 0, ref_length, 0, 0, color='black', label=f'Reference: {ref_magnitude:.0f} µT',
               arrow_length_ratio=0.3, linewidths=1)
-    plt.savefig('vector_plot_3d.png')
     plt.show()
 
-    residuals_final = B_pred_final - B_measured * 1e6
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    for i, component in enumerate(['X', 'Y', 'Z']):
-        axes[i].scatter(B_measured[:, i] * 1e6, B_pred_final[:, i], alpha=0.5)
-        axes[i].plot([B_measured[:, i].min() * 1e6, B_measured[:, i].max() * 1e6],
-                     [B_measured[:, i].min() * 1e6, B_measured[:, i].max() * 1e6], 'r--')
-        axes[i].set_xlabel(f'Measured B_{component} (µT)')
-        axes[i].set_ylabel(f'Predicted B_{component} (µT)')
-        axes[i].set_title(f'B_{component} Fit')
-    plt.tight_layout()
-    plt.savefig('scatter_plots.png')
-    plt.close()
+    # Removed separate residual and angular error plots to avoid saving
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    for i, component in enumerate(['X', 'Y', 'Z']):
-        axes[i].hist(residuals_final[:, i], bins=20)
-        axes[i].set_xlabel(f'Residual B_{component} (µT)')
-        axes[i].set_title(f'B_{component} Residuals')
-    plt.tight_layout()
-    plt.savefig('residuals_histogram.png')
-    plt.close()
+# Custom tqdm callback for Keras
+class TqdmCallback(tf.keras.callbacks.Callback):
+    def __init__(self, total_samples, desc):
+        super().__init__()
+        self.total_samples = total_samples
+        self.desc = desc
+        self.pbar = None
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist([theta for theta in ang_errs_final if not np.isnan(theta)], bins=20)
-    ax.set_xlabel('Angular Error (degrees)')
-    ax.set_title('Angular Errors')
-    plt.savefig('angular_errors_histogram.png')
-    plt.close()
+    def on_train_begin(self, logs=None):
+        self.pbar = tqdm(total=50, desc=self.desc)  # Assuming 50 epochs
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.pbar.update(1)
+        self.pbar.set_postfix(loss=logs.get('loss'))
+
+    def on_train_end(self, logs=None):
+        self.pbar.close()
+
+def tqdm_callback(total_samples, desc):
+    return TqdmCallback(total_samples, desc)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Position estimation server or interactive modes")
@@ -740,9 +779,10 @@ if __name__ == "__main__":
 
     if positions is not None:
         pos_bounds = (
-            [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
-            [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
+            [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()-0.1],
+            [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()+0.1]
         )
+        print(f"Position bounds set to: {pos_bounds}")
 
     if args.optimize:
         result = run_optimization()
@@ -750,8 +790,6 @@ if __name__ == "__main__":
             print("Optimization failed.")
             exit(1)
         dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final = result
-        if positions is not None:
-            generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
 
     if dipole_params is None:
         print("No valid dipole parameters. Run with --optimize to generate them or ensure 'dipole_model_params.json' exists.")
