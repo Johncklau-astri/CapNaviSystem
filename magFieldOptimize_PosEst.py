@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares, differential_evolution, minimize
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
@@ -11,11 +14,6 @@ import socket
 import struct
 import threading
 import argparse
-from tqdm import tqdm
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
 
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
@@ -31,7 +29,7 @@ muT_to_T = 1e-6
 factor = mu_0 / (4 * np.pi) * 1e6
 
 # --- TCP Server for Position Estimation ---
-def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, dipole_params=None, pos_bounds=None):
+def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, dipole_params=None, pos_bounds=None, rf_models=None):
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -42,7 +40,7 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, di
             try:
                 client_socket, addr = server_socket.accept()
                 client_socket.settimeout(2.0)
-                handle_client(client_socket, addr, dipole_params, pos_bounds)
+                handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models)
             except socket.timeout:
                 continue
             except Exception as e:
@@ -54,7 +52,7 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, di
         if 'server_socket' in locals():
             server_socket.close()
 
-def handle_client(client_socket, addr, dipole_params, pos_bounds):
+def handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models):
     try:
         while not STOP_EVENT.is_set():
             # Receive data length
@@ -80,8 +78,8 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds):
             quat_sensor = [data['qw'], data['qx'], data['qy'], data['qz']]
             
             # Validate inputs
-            if any(abs(m) > 8000 for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} µT exceed ±8000 µT")
+            if any(abs(m) > 5000 for m in B_custom):
+                print(f"Invalid magnetic field values: {B_custom} µT exceed ±5000 µT")
                 response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 'error': 'Invalid magnetic field values'}
             else:
                 quat_norm = np.sqrt(sum(x**2 for x in quat_sensor))
@@ -96,12 +94,13 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds):
                         B_custom, quat_sensor, dipole_params['m'], pos_bounds,
                         dipole_params['a_x'], dipole_params['b_x'],
                         dipole_params['a_y'], dipole_params['b_y'],
-                        dipole_params['a_z'], dipole_params['b_z']
+                        dipole_params['a_z'], dipole_params['b_z'],
+                        rf_models
                     )
                     estimation_time = time.time() - start_time
                     print(f"\nArduino Input: B = {B_custom} µT, Quaternion = {quat_sensor}")
                     print(f"Initial Guess: x={r_init[0]:.6f}, y={r_init[1]:.6f}, z={r_init[2]:.6f} m")
-                    print(f"Estimated Position: x={r_est[0]:.6f}, y={r_est[1]:.6f}, z={r_est[2]:.6f} m")
+                    print(f"Corrected Estimated Position: x={r_est[0]:.6f}, y={r_est[1]:.6f}, z={r_est[2]:.6f} m")
                     response = {'estX': float(r_est[0]), 'estY': float(r_est[1]), 'estZ': float(r_est[2])}
             
             # Send response back to client
@@ -115,7 +114,6 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds):
         print(f"Unexpected error handling client {addr}: {e}")
     finally:
         client_socket.close()
-
 # --- Helper Functions ---
 def load_dipole_params():
     param_file = 'dipole_model_params.json'
@@ -221,6 +219,7 @@ def objective_ab(params, m_fixed, positions, B_measured, quaternions, lambda_reg
     reg = lambda_reg * ((a_x - 1.0)**2 + (a_y - 1.0)**2 + (a_z - 1.0)**2)
     return np.sum(res**2) + reg
 
+
 def residuals_position(r, B_measured, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z):
     B_pred = dipole_field(r, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z)
     return B_pred - B_measured
@@ -256,7 +255,7 @@ def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y
     mean_angular_error = np.nanmean(angular_errors) if angular_errors else np.nan
     return rmse, mean_angular_error, angular_errors, B_pred * 1e6
 
-def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z):
+def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, rf_models=None):
     B_custom_T = np.array(B_custom) * muT_to_T
     R_sensor = quaternion_to_rotation_matrix(quat_sensor)
     r_init = initial_position_guess(B_custom_T, m, R_sensor, pos_bounds)
@@ -264,10 +263,97 @@ def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y
         result = least_squares(residuals_position, r_init,
                               args=(B_custom_T, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z),
                               bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
-        return result.x, r_init
+        r_est = result.x
+        # Apply correction model if available
+        if rf_models is not None:
+            rf_x, rf_y, rf_z = rf_models
+            # Prepare features for correction model
+            features = np.array([[B_custom[0], B_custom[1], B_custom[2],
+                                 quat_sensor[0], quat_sensor[1], quat_sensor[2], quat_sensor[3],
+                                 r_est[0], r_est[1], r_est[2]]])
+            # Predict errors
+            error_x_pred = rf_x.predict(features)[0]
+            error_y_pred = rf_y.predict(features)[0]
+            error_z_pred = rf_z.predict(features)[0]
+            # Correct position
+            r_est = np.array([r_est[0] - error_x_pred, r_est[1] - error_y_pred, r_est[2] - error_z_pred])
+        return r_est, r_init
     except Exception as e:
         print(f"Error estimating custom position: {str(e)}")
         return r_init, r_init
+
+# --- Helper Functions (unchanged but included for context) ---
+def train_correction_model(data_df):
+    """
+    Train Random Forest models to predict position errors (Error_Xm, Error_Ym, Error_Zm)
+    based on input features.
+    Returns three trained models for X, Y, Z error corrections.
+    """
+    features = ['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 
+                'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz',
+                'Est_Xm', 'Est_Ym', 'Est_Zm']
+    targets = ['Error_Xm', 'Error_Ym', 'Error_Zm']
+    
+    missing_cols = [col for col in features + targets if col not in data_df.columns]
+    if missing_cols:
+        print(f"Cannot train correction model. Missing columns: {missing_cols}")
+        return None, None, None
+    
+    X = data_df[features].values
+    y_x = data_df['Error_Xm'].values
+    y_y = data_df['Error_Ym'].values
+    y_z = data_df['Error_Zm'].values
+    
+    X_train, X_val, y_x_train, y_x_val = train_test_split(X, y_x, test_size=0.2, random_state=42)
+    _, _, y_y_train, y_y_val = train_test_split(X, y_y, test_size=0.2, random_state=42)
+    _, _, y_z_train, y_z_val = train_test_split(X, y_z, test_size=0.2, random_state=42)
+    
+    rf_x = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf_y = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf_z = RandomForestRegressor(n_estimators=100, random_state=42)
+    
+    rf_x.fit(X_train, y_x_train)
+    rf_y.fit(X_train, y_y_train)
+    rf_z.fit(X_train, y_z_train)
+    
+    mse_x = mean_squared_error(y_x_val, rf_x.predict(X_val))
+    mse_y = mean_squared_error(y_y_val, rf_y.predict(X_val))
+    mse_z = mean_squared_error(y_z_val, rf_z.predict(X_val))
+    
+    print(f"Correction Model MSE - X: {mse_x:.6f}, Y: {mse_y:.6f}, Z: {mse_z:.6f}")
+    
+    return rf_x, rf_y, rf_z
+def apply_correction_model(data_df, rf_x, rf_y, rf_z):
+    """
+    Apply the correction model to adjust estimated positions and compute new errors.
+    Returns updated DataFrame with corrected positions and errors.
+    """
+    if rf_x is None or rf_y is None or rf_z is None:
+        print("No correction models available. Using original estimates.")
+        return data_df
+    
+    features = ['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 
+                'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz',
+                'Est_Xm', 'Est_Ym', 'Est_Zm']
+    
+    X = data_df[features].values
+    
+    # Predict errors
+    error_x_pred = rf_x.predict(X)
+    error_y_pred = rf_y.predict(X)
+    error_z_pred = rf_z.predict(X)
+    
+    # Correct estimated positions
+    data_df['Corrected_Xm'] = data_df['Est_Xm'] - error_x_pred
+    data_df['Corrected_Ym'] = data_df['Est_Ym'] - error_y_pred
+    data_df['Corrected_Zm'] = data_df['Est_Zm'] - error_z_pred
+    
+    # Compute new errors
+    data_df['Corrected_Error_Xm'] = data_df['Corrected_Xm'] - data_df['Rel_X_m']
+    data_df['Corrected_Error_Ym'] = data_df['Corrected_Ym'] - data_df['Rel_Y_m']
+    data_df['Corrected_Error_Zm'] = data_df['Corrected_Zm'] - data_df['Rel_Z_m']
+    
+    return data_df
 
 def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, true_positions=None):
     print("\nInteractive Position Estimation")
@@ -282,8 +368,8 @@ def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z,
             if len(B_custom) != 3:
                 print("Error: Please enter exactly 3 values for B_x, B_y, B_z")
                 continue
-            if any(abs(m) > 8000 for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} exceed ±8000 µT")
+            if any(abs(m) > 5000 for m in B_custom):
+                print(f"Invalid magnetic field values: {B_custom} exceed ±5000 µT")
                 continue
         except ValueError:
             print("Error: Invalid input. Use format like '10.5,-5.2,3.1'")
@@ -338,11 +424,11 @@ def load_and_filter_data():
             pass
         except FileNotFoundError:
             print(f"'{CSV_FILE}' not found.")
-            return None, None, None
+            return None, None, None, None
     
     if data is None:
         print("Could not read CSV with any encoding.")
-        return None, None, None
+        return None, None, None, None
 
     data.columns = data.columns.str.replace('µ', 'u', regex=False)
     data.columns = data.columns.str.replace('μ', 'u', regex=False)
@@ -353,7 +439,7 @@ def load_and_filter_data():
     if missing_columns:
         print(f"Missing columns in CSV: {missing_columns}")
         print(f"Available columns: {list(data.columns)}")
-        return None, None, None
+        return None, None, None, None
 
     positions = data[['Rel_X_m', 'Rel_Y_m', 'Rel_Z_m']].values
     B_measured = data[['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT']].values * muT_to_T
@@ -373,11 +459,12 @@ def load_and_filter_data():
     positions = positions[mask]
     B_measured = B_measured[mask]
     quaternions = quaternions[mask]
+    data = data[mask].reset_index(drop=True)
 
-    return positions, B_measured, quaternions
+    return positions, B_measured, quaternions, data
 
 def run_csv_interactive(dipole_params, pos_bounds, positions):
-    positions_data, B_measured, quaternions = load_and_filter_data()
+    positions_data, B_measured, quaternions, data_df = load_and_filter_data()
     if positions_data is None:
         print("Failed to load data for CSV interactive estimation.")
         return
@@ -388,7 +475,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
 
     r_estimated = np.zeros_like(positions_data)
     r_initial = np.zeros_like(positions_data)
-    pos_errors = np.zeros(len(positions_data))
+    pos_errors = np.zeros((len(positions_data), 3))
 
     for i, (B, quat) in enumerate(zip(B_measured, quaternions)):
         try:
@@ -402,39 +489,76 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
                                         dipole_params['a_z'], dipole_params['b_z']),
                                   bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
             r_estimated[i] = result.x
-            pos_errors[i] = np.linalg.norm(r_estimated[i] - positions_data[i])
+            pos_errors[i] = r_estimated[i] - positions_data[i]
         except Exception as e:
             print(f"Error estimating position for point {i}: {str(e)}")
             r_estimated[i] = positions_data[i]
             r_initial[i] = positions_data[i]
-            pos_errors[i] = 0.0
+            pos_errors[i] = [0.0, 0.0, 0.0]
 
-    mean_pos_error = np.mean(pos_errors)
-    std_pos_error = np.std(pos_errors)
-    print(f"Position Estimation Results:")
+    # Update DataFrame with estimated positions and errors
+    data_df['Est_Xm'] = r_estimated[:, 0]
+    data_df['Est_Ym'] = r_estimated[:, 1]
+    data_df['Est_Zm'] = r_estimated[:, 2]
+    data_df['Error_Xm'] = pos_errors[:, 0]
+    data_df['Error_Ym'] = pos_errors[:, 1]
+    data_df['Error_Zm'] = pos_errors[:, 2]
+
+    # Train correction model
+    rf_x, rf_y, rf_z = train_correction_model(data_df)
+    
+    # Apply correction model
+    data_df = apply_correction_model(data_df, rf_x, rf_y, rf_z)
+
+    # Compute statistics for original and corrected errors
+    original_errors = np.linalg.norm(pos_errors, axis=1)
+    corrected_errors = np.linalg.norm(data_df[['Corrected_Error_Xm', 'Corrected_Error_Ym', 'Corrected_Error_Zm']].values, axis=1)
+    
+    mean_pos_error = np.mean(original_errors)
+    std_pos_error = np.std(original_errors)
+    mean_corrected_error = np.mean(corrected_errors)
+    std_corrected_error = np.std(corrected_errors)
+    
+    print(f"Position Estimation Results (Original):")
     print(f"  Mean Positional Error = {mean_pos_error:.6f} m")
     print(f"  Std Positional Error = {std_pos_error:.6f} m")
+    print(f"Position Estimation Results (Corrected):")
+    print(f"  Mean Corrected Positional Error = {mean_corrected_error:.6f} m")
+    print(f"  Std Corrected Positional Error = {std_corrected_error:.6f} m")
 
+    # Save updated CSV
+    try:
+        data_df.to_csv(CSV_FILE, index=False, encoding='utf-8')
+        print(f"Updated CSV file saved to {CSV_FILE}")
+    except Exception as e:
+        print(f"Error saving CSV file: {str(e)}")
+
+    # Plotting original vs estimated vs corrected positions
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(positions_data[:, 0], positions_data[:, 1], positions_data[:, 2], c='b', label='Actual Positions', alpha=0.5)
     ax.scatter(r_estimated[:, 0], r_estimated[:, 1], r_estimated[:, 2], c='r', label='Estimated Positions', alpha=0.5)
+    ax.scatter(data_df['Corrected_Xm'], data_df['Corrected_Ym'], data_df['Corrected_Zm'], c='g', label='Corrected Positions', alpha=0.5)
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title('Actual vs Estimated Positions')
+    ax.set_title('Actual vs Estimated vs Corrected Positions')
     ax.legend()
+    plt.savefig('position_scatter_3d.png')
     plt.show()
 
+    # Plot histograms of errors
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(pos_errors, bins=20)
+    ax.hist(original_errors, bins=20, alpha=0.5, label='Original Errors', color='red')
+    ax.hist(corrected_errors, bins=20, alpha=0.5, label='Corrected Errors', color='green')
     ax.set_xlabel('Positional Error (m)')
-    ax.set_title('Positional Errors')
+    ax.set_title('Original vs Corrected Positional Errors')
+    ax.legend()
+    plt.savefig('positional_errors_histogram_csv.png')
     plt.close()
 
 def run_optimization():
-    print("Starting optimization...")
-    positions, B_measured, quaternions = load_and_filter_data()
+    positions, B_measured, quaternions, data_df = load_and_filter_data()
     if positions is None:
         print("Failed to load data for optimization.")
         return None, None
@@ -444,9 +568,6 @@ def run_optimization():
         print(f"Too few measurements ({N}). At least 5 are recommended.")
         return None, None
 
-    print(f"Loaded {N} data points for optimization.")
-
-    # Initial dipole moment guess
     m0 = np.array([-0.1, 0, 0])
     for i, r in enumerate(positions):
         x, y, z = r
@@ -459,15 +580,12 @@ def run_optimization():
             if -1000 <= m0_x <= 0:
                 m0[0] = m0_x
             break
-    print(f"Initial dipole moment guess: m = {m0}")
 
-    methods = ['TRF', 'Dogbox', 'LM', 'Differential Evolution', 'Nelder-Mead', 'Neural Network']
+    methods = ['TRF', 'Dogbox', 'LM', 'Differential Evolution', 'Nelder-Mead']
     results = []
     bounds_m = ([-1000, -1000, -1000], [0, 1000, 1000])
 
-    # Stage 1: Optimize dipole moment m
     for method in methods:
-        print(f"\nRunning {method} optimization...")
         start_time = time.time()
         try:
             if method == 'TRF':
@@ -492,22 +610,6 @@ def run_optimization():
                                  method='Nelder-Mead',
                                  options={'xatol': 1e-6, 'fatol': 1e-6})
                 m_best = np.clip(result.x, bounds_m[0], bounds_m[1])
-            elif method == 'Neural Network':
-                # Neural Network optimization
-                model = Sequential([
-                    Dense(64, activation='relu', input_shape=(10,)),  # 3 pos + 4 quat + 3 B_meas
-                    Dense(32, activation='relu'),
-                    Dense(3)  # Predict m_x, m_y, m_z
-                ])
-                model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-                
-                # Prepare input data: [x, y, z, qw, qx, qy, qz, Bx, By, Bz]
-                X = np.hstack((positions, quaternions, B_measured * 1e6))
-                y = np.tile(m0, (N, 1))  # Initial target is m0 repeated
-                model.fit(X, y, epochs=50, batch_size=32, verbose=0,
-                          callbacks=[tqdm_callback(N, 'Neural Network Training')])
-                m_best = model.predict(X[-1:], verbose=0)[0]
-                m_best = np.clip(m_best, bounds_m[0], bounds_m[1])
             
             time_taken = time.time() - start_time
             rmse, ang_err, ang_errs, B_pred = compute_metrics(m_best, positions, B_measured, quaternions)
@@ -520,7 +622,6 @@ def run_optimization():
                 'Angular Errors': ang_errs,
                 'B_pred': B_pred
             })
-            print(f"{method} completed: RMSE = {rmse:.6f} µT, Angular Error = {ang_err:.6f}°, Time = {time_taken:.2f}s")
         except Exception as e:
             print(f"Error in {method}: {str(e)}")
             results.append({
@@ -544,10 +645,7 @@ def run_optimization():
     ang_errs_best = best_result['Angular Errors']
     B_pred_best = best_result['B_pred']
     best_method = best_result['Method']
-    print(f"\nBest Stage 1 Method: {best_method}, RMSE = {rmse_best:.6f} µT, Angular Error = {ang_err_best:.6f}°")
 
-    # Stage 2: Optimize a, b parameters
-    print("\nRunning Second Stage (Nelder-Mead for a, b parameters)...")
     start_time = time.time()
     ab0 = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
     try:
@@ -559,14 +657,11 @@ def run_optimization():
         time_taken = time.time() - start_time
         rmse_final, ang_err_final, ang_errs_final, B_pred_final = compute_metrics(
             m_best, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
-        print(f"Second Stage completed: RMSE = {rmse_final:.6f} µT, Angular Error = {ang_err_final:.6f}°, Time = {time_taken:.2f}s")
     except Exception as e:
         print(f"Error in Second Stage (Nelder-Mead): {str(e)}")
         a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best = 1.0, 0.0, 1.0, 0.0, 1.0, 0.0
         rmse_final, ang_err_final, ang_errs_final, B_pred_final = rmse_best, ang_err_best, ang_errs_best, B_pred_best
 
-    # Stage 3: Refine m with fixed a, b
-    print("\nRunning Third Stage (TRF for m refinement)...")
     start_time = time.time()
     try:
         def residuals_m_third(m, positions, B_measured, quaternions, a_x, b_x, a_y, b_y, a_z, b_z):
@@ -584,13 +679,11 @@ def run_optimization():
         time_taken = time.time() - start_time
         rmse_third, ang_err_third, ang_errs_third, B_pred_third = compute_metrics(
             m_third, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
-        print(f"Third Stage completed: RMSE = {rmse_third:.6f} µT, Angular Error = {ang_err_third:.6f}°, Time = {time_taken:.2f}s")
     except Exception as e:
         print(f"Error in Third Stage (TRF): {str(e)}")
         m_third = m_best
         rmse_third, ang_err_final, ang_errs_third, B_pred_third = rmse_final, ang_err_final, ang_errs_final, B_pred_final
 
-    # Select best results
     if rmse_third < rmse_final:
         m_final = m_third
         rmse_final = rmse_third
@@ -601,7 +694,6 @@ def run_optimization():
     else:
         m_final = m_best
         best_stage = f"Second Stage ({best_method})"
-    print(f"\nFinal Best Stage: {best_stage}, RMSE = {rmse_final:.6f} µT, Angular Error = {ang_err_final:.6f}°")
 
     dipole_params = {
         'm': m_final,
@@ -628,21 +720,14 @@ def run_optimization():
     }
     with open('dipole_model_params.json', 'w') as f:
         json.dump(params, f, indent=4)
-    print("Dipole parameters saved to 'dipole_model_params.json'.")
 
     pos_bounds = (
         [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
         [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
     )
-
-    # Generate and show plots only after optimization
-    print("\nGenerating visualization plots...")
-    generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
-
     return dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final
 
 def generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final):
-    print("Creating vector field visualizations...")
     N = len(positions)
     x_vals = positions[:, 0]
     y_vals = positions[:, 1]
@@ -651,8 +736,7 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     U_theo, V_theo, W_theo = np.zeros(N), np.zeros(N), np.zeros(N)
     U_opt, V_opt, W_opt = np.zeros(N), np.zeros(N), np.zeros(N)
 
-    for i in tqdm(range(N), desc="Computing vector fields"):
-        r, B_m, quat = positions[i], B_measured[i], quaternions[i]
+    for i, (r, B_m, quat) in enumerate(zip(positions, B_measured, quaternions)):
         R_sensor = quaternion_to_rotation_matrix(quat)
         B_theo = dipole_field(r, np.array([-0.1, 0, 0]), R_sensor) * 1e6
         B_opt = dipole_field(r, dipole_params['m'], R_sensor,
@@ -675,7 +759,6 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     else:
         print("Zero field magnitude encountered. Vectors not scaled.")
 
-    # 2D Vector Plot
     fig, ax = plt.subplots(figsize=(10, 8))
     sc = ax.scatter(x_vals, z_vals, c=B_measured[:, 0] * 1e6, cmap='viridis', edgecolors='k', label='Measured B_x (µT)')
     fig.colorbar(sc, ax=ax, label='B_x (µT)')
@@ -704,9 +787,9 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     ref_length = 0.5
     ref_magnitude = ref_length * max_magnitude
     ax.quiverkey(q1, X=0.85, Y=0.95, U=ref_length, label=f'{ref_magnitude:.0f} µT', labelpos='E', coordinates='figure')
+    plt.savefig('vector_plot_2d.png')
     plt.show()
 
-    # 3D Vector Plot
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
     sc = ax.scatter(x_vals, y_vals, z_vals, c=B_measured[:, 0] * 1e6, cmap='viridis', edgecolors='k', label='Measured B_x (µT)')
@@ -737,32 +820,39 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     ax.grid(True)
     ax.quiver(0, 0, 0, ref_length, 0, 0, color='black', label=f'Reference: {ref_magnitude:.0f} µT',
               arrow_length_ratio=0.3, linewidths=1)
+    plt.savefig('vector_plot_3d.png')
     plt.show()
 
-    # Removed separate residual and angular error plots to avoid saving
+    residuals_final = B_pred_final - B_measured * 1e6
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for i, component in enumerate(['X', 'Y', 'Z']):
+        axes[i].scatter(B_measured[:, i] * 1e6, B_pred_final[:, i], alpha=0.5)
+        axes[i].plot([B_measured[:, i].min() * 1e6, B_measured[:, i].max() * 1e6],
+                     [B_measured[:, i].min() * 1e6, B_measured[:, i].max() * 1e6], 'r--')
+        axes[i].set_xlabel(f'Measured B_{component} (µT)')
+        axes[i].set_ylabel(f'Predicted B_{component} (µT)')
+        axes[i].set_title(f'B_{component} Fit')
+    plt.tight_layout()
+    plt.savefig('scatter_plots.png')
+    plt.close()
 
-# Custom tqdm callback for Keras
-class TqdmCallback(tf.keras.callbacks.Callback):
-    def __init__(self, total_samples, desc):
-        super().__init__()
-        self.total_samples = total_samples
-        self.desc = desc
-        self.pbar = None
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for i, component in enumerate(['X', 'Y', 'Z']):
+        axes[i].hist(residuals_final[:, i], bins=20)
+        axes[i].set_xlabel(f'Residual B_{component} (µT)')
+        axes[i].set_title(f'B_{component} Residuals')
+    plt.tight_layout()
+    plt.savefig('residuals_histogram.png')
+    plt.close()
 
-    def on_train_begin(self, logs=None):
-        self.pbar = tqdm(total=50, desc=self.desc)  # Assuming 50 epochs
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist([theta for theta in ang_errs_final if not np.isnan(theta)], bins=20)
+    ax.set_xlabel('Angular Error (degrees)')
+    ax.set_title('Angular Errors')
+    plt.savefig('angular_errors_histogram.png')
+    plt.close()
 
-    def on_epoch_end(self, epoch, logs=None):
-        self.pbar.update(1)
-        self.pbar.set_postfix(loss=logs.get('loss'))
-
-    def on_train_end(self, logs=None):
-        self.pbar.close()
-
-def tqdm_callback(total_samples, desc):
-    return TqdmCallback(total_samples, desc)
-
-
+# --- Main Execution Block (modified) ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Position estimation server or interactive modes")
     parser.add_argument('--optimize', action='store_true', help="Run optimization to generate dipole parameters")
@@ -771,18 +861,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dipole_params = load_dipole_params()
-    positions, B_measured, quaternions = load_and_filter_data()
+    positions, B_measured, quaternions, data_df = load_and_filter_data()
     pos_bounds = None
     best_stage = "Existing Parameters"
     ang_errs_final = None
     B_pred_final = None
+    rf_models = None
 
     if positions is not None:
         pos_bounds = (
-            [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()-0.1],
-            [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()+0.1]
+            [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
+            [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
         )
-        print(f"Position bounds set to: {pos_bounds}")
+        print(f"Position bounds: {pos_bounds}")
+        # Train correction model if data is available
+        if args.interactive or args.console or not (args.interactive or args.console or args.optimize):
+            rf_models = train_correction_model(data_df)
 
     if args.optimize:
         result = run_optimization()
@@ -790,13 +884,17 @@ if __name__ == "__main__":
             print("Optimization failed.")
             exit(1)
         dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final = result
+        if positions is not None:
+            generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
+            # Retrain correction model after optimization
+            rf_models = train_correction_model(data_df)
 
     if dipole_params is None:
         print("No valid dipole parameters. Run with --optimize to generate them or ensure 'dipole_model_params.json' exists.")
         exit(1)
 
     if args.console:
-        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds))
+        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, rf_models))
         server_thread.daemon = True
         server_thread.start()
         interactive_position_estimation(
@@ -807,9 +905,9 @@ if __name__ == "__main__":
             positions
         )
     elif args.interactive:
-        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds))
+        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, rf_models))
         server_thread.daemon = True
         server_thread.start()
         run_csv_interactive(dipole_params, pos_bounds, positions)
     else:
-        run_position_server(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds)
+        run_position_server(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, rf_models)
