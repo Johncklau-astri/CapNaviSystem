@@ -19,7 +19,7 @@ from gs_usb.constants import (
     CAN_RTR_FLAG,
 )
 
-## testing changes
+## testing changes 
 class Motor:
     def __init__(self, name, node_id):
         self.name = name
@@ -187,19 +187,17 @@ def vertPreMove(dev, motors):
 def automated_movement(dev,motors):
     global worldX, worldY, worldZ # Assume actual_pos tracks motor positions
     global rollAngle, pitchAngle, yawAngle
-
-    ## ALL even numbers 
     interval = 1    ## in cm
     x_range = 10    ## in cm
-    y_range = 3    ## in cm
-    z_range = 28   ## in cm
+    y_range = 1    ## in cm
+    z_range = 30   ## in cm
 
     speed = 60
     acc= 200
     dec = 200
-    print("Assume Magnet is around at the height as sensor, y= 0, and pitch and roll and yaw is 0")
+    print("Magnet should be at middle height of test range")
 
-    small_timeout = 0.2
+    small_timeout = 0.3
     mid_timeout = 0.4
     big_timeout = 5
 
@@ -207,20 +205,21 @@ def automated_movement(dev,motors):
     for y in range(0, y_range, interval):
         if( y != 0):
             if(x_range % 2 == 0):
-                setUpHoriMotorMove(dev, hori1, -x_range*interval, speed, acc, dec)
-                setUpHoriMotorMove(dev, hori2, -x_range*interval, speed, acc, dec)
+                setUpHoriMotorMove(dev, hori1, -x_range, 30, acc, dec)
+                setUpHoriMotorMove(dev, hori2, -x_range, 30, acc, dec)
+                setUpVertMotorMove(dev, vert1, -z_range, 30, acc, dec)
+                setUpVertMotorMove(dev, vert2, -z_range, 30, acc, dec)
                 launchMoveCommand(dev, motors)
             else:
-                setUpHoriMotorMove(dev, hori1, -x_range*interval, speed, acc, dec)
-                setUpHoriMotorMove(dev, hori2, -x_range*interval, speed, acc, dec)
-                setUpVertMotorMove(dev, vert1, -z_range*interval, speed, acc, dec)
-                setUpVertMotorMove(dev, vert2, -z_range*interval, speed, acc, dec)
+                setUpHoriMotorMove(dev, hori1, -x_range, 30, acc, dec)
+                setUpHoriMotorMove(dev, hori2, -x_range, 30, acc, dec)
+
                 launchMoveCommand(dev, motors)
         else:
 
             ## Start at lowest point
-            setUpVertMotorMove(dev, vert1, -z_range/2, speed, acc, dec)
-            setUpVertMotorMove(dev, vert2, -z_range/2, speed, acc, dec)
+            setUpVertMotorMove(dev, vert1, -z_range/2, 30, acc, dec)
+            setUpVertMotorMove(dev, vert2, -z_range/2, 30, acc, dec)
             launchMoveCommand(dev, motors)
             print("Press S to start the automated movement at this y-plane")
 
@@ -628,12 +627,15 @@ def setUpVertMotorMove(dev, motor_id, target_pos, speed, acc, dec):
     time.sleep(waitTime)
 
     motor = next((m for m in motors if m.node_id == motor_id), None)
+    if motor is not None:
+        motor.update_moveCommand(True)
+    else:
+        print(f"Warning: No motor found with node_id {motor_id}")
 
-    motor.update_moveCommand(True)
-def motors_init_brakeRelease(dev,motors_list):
+def motors_init_brakeRelease(dev, motors_list):
     for motor in motors_list:
-        if(motor.node_id == rotary):
-            rotaryInit(dev,motor.node_id)
+        if motor.node_id == rotary:
+            rotaryInit(dev, motor.node_id)
         else:
             motor_id = motor.node_id
             motor_init_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B40600001000000"))
@@ -1291,12 +1293,12 @@ press q to quit
             rotary_travel = 10.0    # degrees (positive/negative)
             vert_travel = 2      # cm (positive/negative, for vert1 and vert2)
             hori_travel = 2      # cm (positive/negative, for hori1 and hori2)
-            pitch_travel = 5     # degrees (positive/negative)
+            pitch_travel = 1.0     # degrees (positive/negative)
 
             # Fixed speed, acceleration, deceleration
             speed = 50  # RPM or steps/s (adjust as needed)
-            acc = 150   # RPM/s or steps/s²
-            dec = 150   # RPM/s or steps/s²
+            acc = 100   # RPM/s or steps/s²
+            dec = 100   # RPM/s or steps/s²
 
             motors_init_brakeRelease(dev, motors)
 

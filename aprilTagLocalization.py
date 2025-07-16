@@ -408,8 +408,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     
     with open(LOG_FILE, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Order', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_PitchDeg', 'Cube2_RollDeg', 'Cube2_YawDeg',
-                         'Rel_Xm', 'Rel_Ym', 'Rel_Zm', 'Mag_XuT', 'Mag_YuT', 'Mag_ZuT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
+        writer.writerow(['Order', 'Rel_Xm', 'Rel_Ym', 'Rel_Zm', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_PitchDeg', 'Cube2_RollDeg', 'Cube2_YawDeg',
+                         'Mag_XuT', 'Mag_YuT', 'Mag_ZuT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
         while not stop_event.is_set():
             start_time = time.time()
             ret, frame = cap.read()
@@ -566,9 +566,9 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     errorZ = estZ - cube2_center_ref[2]
                     writer.writerow([
                         measurement_order,
+                        f'{cube2_center_ref[0]:.6f}', f'{cube2_center_ref[1]:.6f}', f'{cube2_center_ref[2]:.6f}',
                         f'{cube2_quat[0]:.4f}', f'{cube2_quat[1]:.4f}', f'{cube2_quat[2]:.4f}', f'{cube2_quat[3]:.3f}',
                         f'{cube2_euler[0]:.2f}', f'{cube2_euler[1]:.2f}', f'{cube2_euler[2]:.2f}',
-                        f'{cube2_center_ref[0]:.6f}', f'{cube2_center_ref[1]:.6f}', f'{cube2_center_ref[2]:.6f}',
                         f'{mag_x:.3f}', f'{mag_y:.3f}', f'{mag_z:.3f}',
                         f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
                         f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
@@ -583,7 +583,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
             combined_frame = np.vstack((text_frame_resized, camera_frame_resized))
             
             cv2.imshow("AprilTag Localization", combined_frame)
-            time.sleep(0.1)  # Reduce CPU usage
+            time.sleep(0.01)  # Reduce CPU usage
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 stop_event.set()
