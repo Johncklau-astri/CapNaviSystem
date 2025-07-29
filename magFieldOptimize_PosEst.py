@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares, differential_evolution, minimize
-from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 import matplotlib
@@ -30,7 +30,7 @@ muT_to_T = 1e-6
 factor = mu_0 / (4 * np.pi) * 1e6
 
 # --- TCP Server for Position Estimation ---
-def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, dipole_params=None, pos_bounds=None, rf_models=None):
+def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, dipole_params=None, pos_bounds=None, xgb_models=None):
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -41,7 +41,7 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, di
             try:
                 client_socket, addr = server_socket.accept()
                 client_socket.settimeout(2.0)
-                handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models)
+                handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models)
             except socket.timeout:
                 continue
             except Exception as e:
@@ -53,7 +53,7 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, di
         if 'server_socket' in locals():
             server_socket.close()
 
-def handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models):
+def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models):
     try:
         while not STOP_EVENT.is_set():
             # Receive data length
@@ -80,7 +80,7 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models):
             
             # Validate inputs
             if any(abs(m) > max_Bfield for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} µT exceeded ±{max_Bfield} µT")
+                print(f"Invalid magnetic field values: {B_custom} µT exceed ±{max_Bfield} µT")
                 response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 'error': 'Invalid magnetic field values'}
             else:
                 quat_norm = np.sqrt(sum(x**2 for x in quat_sensor))
@@ -96,7 +96,7 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models):
                         dipole_params['a_x'], dipole_params['b_x'],
                         dipole_params['a_y'], dipole_params['b_y'],
                         dipole_params['a_z'], dipole_params['b_z'],
-                        rf_models
+                        xgb_models
                     )
                     estimation_time = time.time() - start_time
                     print(f"\nArduino Input: B = {B_custom} µT, Quaternion = {quat_sensor}")
@@ -115,6 +115,7 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, rf_models):
         print(f"Unexpected error handling client {addr}: {e}")
     finally:
         client_socket.close()
+
 # --- Helper Functions ---
 def load_dipole_params():
     param_file = 'dipole_model_params.json'
@@ -220,7 +221,6 @@ def objective_ab(params, m_fixed, positions, B_measured, quaternions, lambda_reg
     reg = lambda_reg * ((a_x - 1.0)**2 + (a_y - 1.0)**2 + (a_z - 1.0)**2)
     return np.sum(res**2) + reg
 
-
 def residuals_position(r, B_measured, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z):
     B_pred = dipole_field(r, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z)
     return B_pred - B_measured
@@ -256,7 +256,7 @@ def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y
     mean_angular_error = np.nanmean(angular_errors) if angular_errors else np.nan
     return rmse, mean_angular_error, angular_errors, B_pred * 1e6
 
-def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, rf_models=None):
+def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, xgb_models=None):
     if any(np.isnan(B_custom)) or any(np.isnan(quat_sensor)) or any(abs(b) > max_Bfield for b in B_custom):
         print(f"Invalid input: B_custom={B_custom}, quat_sensor={quat_sensor}")
         return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
@@ -271,25 +271,33 @@ def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y
             print(f"Optimization failed or returned NaN for B_custom={B_custom}")
             return r_init, r_init
         r_est = result.x
-        if rf_models is not None:
-            rf_x, rf_y, rf_z = rf_models
+        # Apply correction model if available
+        if xgb_models is not None:
+            xgb_x, xgb_y, xgb_z = xgb_models
+            # Prepare features for correction model
             features = np.array([[B_custom[0], B_custom[1], B_custom[2],
                                  quat_sensor[0], quat_sensor[1], quat_sensor[2], quat_sensor[3],
                                  r_est[0], r_est[1], r_est[2]]])
             if np.any(np.isnan(features)):
                 print(f"NaN in features: {features}")
                 return r_init, r_init
-            error_x_pred = rf_x.predict(features)[0]
-            error_y_pred = rf_y.predict(features)[0]
-            error_z_pred = rf_z.predict(features)[0]
+            # Predict errors
+            error_x_pred = xgb_x.predict(features)[0]
+            error_y_pred = xgb_y.predict(features)[0]
+            error_z_pred = xgb_z.predict(features)[0]
+            # Correct position
             r_est = np.array([r_est[0] - error_x_pred, r_est[1] - error_y_pred, r_est[2] - error_z_pred])
         return r_est, r_init
     except Exception as e:
         print(f"Error estimating custom position for B_custom={B_custom}: {str(e)}")
         return r_init, r_init
 
-# --- Modified train_correction_model ---
 def train_correction_model(data_df):
+    """
+    Train XGBoost models to predict position errors (Error_Xm, Error_Ym, Error_Zm)
+    based on input features.
+    Returns three trained models for X, Y, Z error corrections.
+    """
     features = ['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 
                 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz',
                 'Est_Xm', 'Est_Ym', 'Est_Zm']
@@ -308,32 +316,35 @@ def train_correction_model(data_df):
     
     X = valid_data[features].values
     y_x = valid_data['Error_Xm'].values
-    y_y = valid_data['Error_Ym'].values
-    y_z = valid_data['Error_Zm'].values
+    y_y = data_df['Error_Ym'].values
+    y_z = data_df['Error_Zm'].values
     
     X_train, X_val, y_x_train, y_x_val = train_test_split(X, y_x, test_size=0.2, random_state=42)
     _, _, y_y_train, y_y_val = train_test_split(X, y_y, test_size=0.2, random_state=42)
     _, _, y_z_train, y_z_val = train_test_split(X, y_z, test_size=0.2, random_state=42)
     
-    rf_x = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf_y = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf_z = RandomForestRegressor(n_estimators=100, random_state=42)
+    xgb_x = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
+    xgb_y = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
+    xgb_z = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
     
-    rf_x.fit(X_train, y_x_train)
-    rf_y.fit(X_train, y_y_train)
-    rf_z.fit(X_train, y_z_train)
+    xgb_x.fit(X_train, y_x_train)
+    xgb_y.fit(X_train, y_y_train)
+    xgb_z.fit(X_train, y_z_train)
     
-    mse_x = mean_squared_error(y_x_val, rf_x.predict(X_val))
-    mse_y = mean_squared_error(y_y_val, rf_y.predict(X_val))
-    mse_z = mean_squared_error(y_z_val, rf_z.predict(X_val))
+    mse_x = mean_squared_error(y_x_val, xgb_x.predict(X_val))
+    mse_y = mean_squared_error(y_y_val, xgb_y.predict(X_val))
+    mse_z = mean_squared_error(y_z_val, xgb_z.predict(X_val))
     
     print(f"Correction Model MSE - X: {mse_x:.6f}, Y: {mse_y:.6f}, Z: {mse_z:.6f}")
     
-    return rf_x, rf_y, rf_z
+    return xgb_x, xgb_y, xgb_z
 
-# --- Modified apply_correction_model ---
-def apply_correction_model(data_df, rf_x, rf_y, rf_z):
-    if rf_x is None or rf_y is None or rf_z is None:
+def apply_correction_model(data_df, xgb_x, xgb_y, xgb_z):
+    """
+    Apply the correction model to adjust estimated positions and compute new errors.
+    Returns updated DataFrame with corrected positions and errors.
+    """
+    if xgb_x is None or xgb_y is None or xgb_z is None:
         print("No correction models available. Using original estimates.")
         return data_df
     
@@ -344,19 +355,22 @@ def apply_correction_model(data_df, rf_x, rf_y, rf_z):
     valid_data = data_df[features].dropna()
     X = valid_data[features].values
     
+    # Predict errors
     error_x_pred = np.zeros(len(data_df))
     error_y_pred = np.zeros(len(data_df))
     error_z_pred = np.zeros(len(data_df))
     
     valid_indices = valid_data.index
-    error_x_pred[valid_indices] = rf_x.predict(X)
-    error_y_pred[valid_indices] = rf_y.predict(X)
-    error_z_pred[valid_indices] = rf_z.predict(X)
+    error_x_pred[valid_indices] = xgb_x.predict(X)
+    error_y_pred[valid_indices] = xgb_y.predict(X)
+    error_z_pred[valid_indices] = xgb_z.predict(X)
     
+    # Correct estimated positions
     data_df['Corrected_Xm'] = data_df['Est_Xm'] - error_x_pred
     data_df['Corrected_Ym'] = data_df['Est_Ym'] - error_y_pred
     data_df['Corrected_Zm'] = data_df['Est_Zm'] - error_z_pred
     
+    # Compute new errors
     data_df['Corrected_Error_Xm'] = data_df['Corrected_Xm'] - data_df['Rel_X_m']
     data_df['Corrected_Error_Ym'] = data_df['Corrected_Ym'] - data_df['Rel_Y_m']
     data_df['Corrected_Error_Zm'] = data_df['Corrected_Zm'] - data_df['Rel_Z_m']
@@ -376,8 +390,8 @@ def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z,
             if len(B_custom) != 3:
                 print("Error: Please enter exactly 3 values for B_x, B_y, B_z")
                 continue
-            if any(abs(m) > 5000 for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} exceed ±5000 µT")
+            if any(abs(m) > max_Bfield for m in B_custom):
+                print(f"Invalid magnetic field values: {B_custom} exceed ±{max_Bfield} µT")
                 continue
         except ValueError:
             print("Error: Invalid input. Use format like '10.5,-5.2,3.1'")
@@ -421,7 +435,6 @@ def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z,
             except ValueError:
                 pass
 
-# --- Modified load_and_filter_data ---
 def load_and_filter_data():
     encodings = ['utf-8', 'latin1', 'windows-1252', 'utf-8-sig']
     data = None
@@ -503,7 +516,6 @@ def load_and_filter_data():
 
     return positions, B_measured, quaternions, data
 
-# --- Modified run_csv_interactive ---
 def run_csv_interactive(dipole_params, pos_bounds, positions):
     positions_data, B_measured, quaternions, data_df = load_and_filter_data()
     if positions_data is None:
@@ -590,11 +602,11 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
         return
 
     # Train correction model
-    rf_x, rf_y, rf_z = train_correction_model(data_df)
+    xgb_x, xgb_y, xgb_z = train_correction_model(data_df)
     
     # Apply correction model
-    if rf_x is not None and rf_y is not None and rf_z is not None:
-        data_df = apply_correction_model(data_df, rf_x, rf_y, rf_z)
+    if xgb_x is not None:
+        data_df = apply_correction_model(data_df, xgb_x, xgb_y, xgb_z)
         # Reorder columns again to maintain desired order
         data_df = data_df[desired_columns + other_cols]
         try:
@@ -617,7 +629,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
     print(f"  Std Positional Error = {std_pos_error:.6f} m")
     print(f"Position Estimation Results (Corrected):")
     print(f"  Mean Corrected Positional Error = {mean_corrected_error:.6f} m")
-    print(f"  Std Corrected Positional Error = {std_corrected_error:.6f} m")
+    print(f"  Std Corrected Error = {std_corrected_error:.6f} m")
 
     # Plotting original vs estimated vs corrected positions
     fig = plt.figure(figsize=(12, 10))
@@ -642,7 +654,6 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
     ax.legend()
     plt.savefig('positional_errors_histogram_csv.png')
     plt.close()
-
 
 def run_optimization():
     positions, B_measured, quaternions, data_df = load_and_filter_data()
@@ -939,7 +950,7 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     plt.savefig('angular_errors_histogram.png')
     plt.close()
 
-# --- Modified main execution block ---
+# --- Main Execution Block ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Position estimation server or interactive modes")
     parser.add_argument('--optimize', action='store_true', help="Run optimization to generate dipole parameters")
@@ -950,7 +961,10 @@ if __name__ == "__main__":
     dipole_params = load_dipole_params()
     positions, B_measured, quaternions, data_df = load_and_filter_data()
     pos_bounds = None
-    rf_models = None
+    best_stage = "Existing Parameters"
+    ang_errs_final = None
+    B_pred_final = None
+    xgb_models = None
 
     if positions is not None:
         pos_bounds = (
@@ -958,11 +972,9 @@ if __name__ == "__main__":
             [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
         )
         print(f"Position bounds: {pos_bounds}")
-        if args.interactive:
-            run_csv_interactive(dipole_params, pos_bounds, positions)
-            # Reload data after updating CSV
-            positions, B_measured, quaternions, data_df = load_and_filter_data()
-            rf_models = train_correction_model(data_df)
+        # Train correction model if data is available
+        if args.interactive or args.console or not (args.interactive or args.console or args.optimize):
+            xgb_models = train_correction_model(data_df)
 
     if args.optimize:
         result = run_optimization()
@@ -972,18 +984,15 @@ if __name__ == "__main__":
         dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
         if positions is not None:
             generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
-            # Run interactive mode to generate estimates
-            run_csv_interactive(dipole_params, pos_bounds, positions)
-            # Reload data and train correction model
-            positions, B_measured, quaternions, data_df = load_and_filter_data()
-            rf_models = train_correction_model(data_df)
+            # Retrain correction model after optimization
+            xgb_models = train_correction_model(data_df)
 
     if dipole_params is None:
         print("No valid dipole parameters. Run with --optimize to generate them or ensure 'dipole_model_params.json' exists.")
         exit(1)
 
     if args.console:
-        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, rf_models))
+        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models))
         server_thread.daemon = True
         server_thread.start()
         interactive_position_estimation(
@@ -994,7 +1003,9 @@ if __name__ == "__main__":
             positions
         )
     elif args.interactive:
-        # Server already started in interactive mode
-        pass
+        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models))
+        server_thread.daemon = True
+        server_thread.start()
+        run_csv_interactive(dipole_params, pos_bounds, positions)
     else:
-        run_position_server(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, rf_models)
+        run_position_server(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models)
