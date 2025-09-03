@@ -147,6 +147,70 @@ class LockInAmplifier:
             amplitudes.append(amplitude)
 
         return amplitudes  # [amp_x, amp_y, amp_z]
+    
+def find_yaw(pitch_deg, roll_deg, transformed_vector):
+    """
+    Compute the yaw angle given pitch, roll (in degrees), and the transformed unit vector.
+    
+    Parameters:
+    - pitch_deg (float): Pitch angle in degrees (rotation about y-axis).
+    - roll_deg (float): Roll angle in degrees (rotation about x-axis).
+    - transformed_vector (np.ndarray): 3D vector after ZYX intrinsic rotation.
+    
+    Returns:
+    - float: Yaw angle in degrees, or None if the solution is invalid.
+    """
+    # Convert angles to radians
+    pitch = np.radians(pitch_deg)
+    roll = np.radians(roll_deg)
+    
+    # Define rotation matrices
+    def rotation_x(angle):
+        return np.array([
+            [1, 0, 0],
+            [0, np.cos(angle), -np.sin(angle)],
+            [0, np.sin(angle), np.cos(angle)]
+        ])
+    
+    def rotation_y(angle):
+        return np.array([
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)]
+        ])
+    
+    # Ensure transformed vector is normalized
+    transformed_vector = np.array(transformed_vector)
+    norm = np.linalg.norm(transformed_vector)
+    if not np.isclose(norm, 1.0, rtol=1e-5):
+        # print(f"Warning: Transformed vector magnitude is {norm:.2f}. Normalizing.")
+        transformed_vector = transformed_vector / norm
+    
+    # Compute combined pitch and roll rotation matrix
+    R_pr = rotation_x(roll) @ rotation_y(pitch)
+    
+    # Compute inverse of R_pr (since R_pr is orthogonal, inverse = transpose)
+    R_pr_inv = R_pr.T
+    
+    # Compute u = R_pr^-1 @ transformed_vector
+    u = R_pr_inv @ transformed_vector
+    # print(f"Intermediate vector u: {u}")
+    
+    # # u should be of the form [cos(yaw), sin(yaw), 0]
+    # if not np.isclose(u[2], 0, atol=1e-5):
+    #     print(f"Warning: Inconsistent input. z-component of u is {u[2]:.6f} (not zero).")
+    
+    # Extract cos(yaw) and sin(yaw)
+    cos_yaw, sin_yaw = u[0], u[1]
+    
+    # # Check if u is a valid unit vector in xy-plane
+    # if not np.isclose(cos_yaw**2 + sin_yaw**2, 1.0, rtol=1e-5):
+    #     print(f"Warning: Invalid solution. Magnitude of u's xy components is {cos_yaw**2 + sin_yaw**2:.6f}.")
+    
+    # Compute yaw using atan2 and convert to degrees
+    yaw = np.degrees(np.atan2(sin_yaw, cos_yaw))
+    
+    return yaw
 
 # Initialize filters and data queue
 kalman = KalmanFilter(process_noise=0.005, measurement_noise=0.1)
@@ -185,14 +249,18 @@ def processing_thread():
 
                 # Re-assign pitch and roll for our imu axis convention
                 temp = pitch_kalman
-                pitch_kalman = roll_kalman
+                pitch_kalman = -roll_kalman
                 roll_kalman = temp
 
+                # Calculate yaw angle
+                yaw = find_yaw(pitch_kalman, roll_kalman,[mag_amplitudes[2], mag_amplitudes[1], mag_amplitudes[0]])
+
                 # Print results with queue size
-                print(f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}, "
+                print(f"Yaw: {yaw:.2f}°" if yaw is not None else "Yaw: No solution",
                       f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°, "
-                      f"AC Amplitudes (µT): [X: {mag_amplitudes[2]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[0]:.2f}]")
-                
+                      f"AC Amplitudes (µT): [X: {mag_amplitudes[2]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[0]:.2f}]"
+                      f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}, "
+                      )
                 # Update plot buffers
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
