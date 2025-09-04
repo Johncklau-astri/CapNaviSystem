@@ -74,34 +74,58 @@ NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # RX from device perspecti
 last_time = time.time()
 frequency_hz = 0.0
 timestamp_deque = deque(maxlen=10)
-
-# Kalman Filter class for pitch and roll
 class KalmanFilter:
     def __init__(self, process_noise=0.005, measurement_noise=0.1):
         self.state = np.zeros(4)  # [pitch, roll, bias_x, bias_y]
-        self.P = np.eye(4) * 0.1  # Error covariance
-        self.Q = np.eye(4) * process_noise  # Process noise covariance
-        self.R = np.eye(2) * measurement_noise  # Measurement noise covariance
+        self.P = np.eye(4) * 0.1
+        self.Q = np.eye(4) * process_noise
+        self.R = np.eye(2) * measurement_noise
         self.last_time = time.time()
+        self.roll_unwrapped = 0.0  # Track unwrapped roll
+
 
     def update(self, accel_g, gyro_dps, current_time):
         ax, ay, az = accel_g
         gx, gy, gz = gyro_dps
+
+        # print(f"Gyroscope (dps): \tgx: {gx:.2f}, \tgy: {gy:.2f}, \tgz: {gz:.2f} Accel (g): ax: {ax}, ay: {ay}, az: {az}")
         dt = current_time - self.last_time
         self.last_time = current_time
 
         # Predict
         F = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         B = np.array([[dt, 0], [0, dt], [0, 0], [0, 0]])
+        
         u = np.array([gx, gy])
         self.state = F @ self.state + B @ u
         self.P = F @ self.P @ F.T + self.Q
 
+        #Adjust to take account into signage of accel data since taking square root of them would remove this info
+        #this adjustment would allow the pitch and roll calculated have range of +/-180 degrees
+        #Pitch
+        if( az > 0 and ay < 0 ):
+            extended_pitch = (180+np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
+        elif( az > 0 and ay > 0 ):
+            extended_pitch = (-180-np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
+        else:
+            extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+        #Roll
+        if( az > 0 and ax < 0 ):
+            extended_roll = (-180-np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
+        elif( az > 0 and ax > 0 ):
+            extended_roll = (180-np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
+        else:
+            extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+
         # Measurement
         z = np.array([
-            np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi,
-            np.arctan2(-ay, az) * 180 / np.pi
+            extended_pitch,
+            extended_roll
         ])
+        # Print accelerometer angles
+        # print(f"Accelerometer angles (°): Pitch: {z[0]:.2f}, Roll: {z[1]:.2f}  Accelerometer (g): ax: {ax}, ay: {ay}, az: {az} | ")
+
+
         H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
         y = z - H @ self.state
         S = H @ self.P @ H.T + self.R
@@ -112,6 +136,8 @@ class KalmanFilter:
         self.P = (np.eye(4) - K @ H) @ self.P
 
         return self.state[0], self.state[1]
+
+
 
 # Lock-in Amplifier class for magnetometer AC component
 class LockInAmplifier:
@@ -150,13 +176,14 @@ class LockInAmplifier:
     
 def find_yaw(pitch_deg, roll_deg, transformed_vector):
     """
-    Compute the yaw angle given pitch, roll (in degrees), and the transformed unit vector.
-    
+    Compute the yaw angle given pitch (x-axis rotation), roll (y-axis rotation) in degrees,
+    and the transformed unit vector, assuming ZYX intrinsic rotation.
+
     Parameters:
-    - pitch_deg (float): Pitch angle in degrees (rotation about y-axis).
-    - roll_deg (float): Roll angle in degrees (rotation about x-axis).
-    - transformed_vector (np.ndarray): 3D vector after ZYX intrinsic rotation.
-    
+    - pitch_deg (float): Pitch angle in degrees (rotation about x-axis).
+    - roll_deg (float): Roll angle in degrees (rotation about y-axis).
+    - transformed_vector (np.ndarray): 3D vector after ZYX intrinsic rotation, [mx, my, mz].
+
     Returns:
     - float: Yaw angle in degrees, or None if the solution is invalid.
     """
@@ -182,12 +209,12 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector):
     # Ensure transformed vector is normalized
     transformed_vector = np.array(transformed_vector)
     norm = np.linalg.norm(transformed_vector)
-    if not np.isclose(norm, 1.0, rtol=1e-5):
-        # print(f"Warning: Transformed vector magnitude is {norm:.2f}. Normalizing.")
-        transformed_vector = transformed_vector / norm
+    # if not np.isclose(norm, 1.0, rtol=1e-5):
+    #     print(f"Warning: Transformed vector magnitude is {norm:.2f}. Normalizing.")
+    transformed_vector = transformed_vector / norm
     
-    # Compute combined pitch and roll rotation matrix
-    R_pr = rotation_x(roll) @ rotation_y(pitch)
+    # Compute combined pitch and roll rotation matrix (ZYX order: roll after pitch)
+    R_pr = rotation_y(roll) @ rotation_x(pitch)
     
     # Compute inverse of R_pr (since R_pr is orthogonal, inverse = transpose)
     R_pr_inv = R_pr.T
@@ -199,6 +226,7 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector):
     # # u should be of the form [cos(yaw), sin(yaw), 0]
     # if not np.isclose(u[2], 0, atol=1e-5):
     #     print(f"Warning: Inconsistent input. z-component of u is {u[2]:.6f} (not zero).")
+    #     return None
     
     # Extract cos(yaw) and sin(yaw)
     cos_yaw, sin_yaw = u[0], u[1]
@@ -206,11 +234,13 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector):
     # # Check if u is a valid unit vector in xy-plane
     # if not np.isclose(cos_yaw**2 + sin_yaw**2, 1.0, rtol=1e-5):
     #     print(f"Warning: Invalid solution. Magnitude of u's xy components is {cos_yaw**2 + sin_yaw**2:.6f}.")
+    #     return None
     
     # Compute yaw using atan2 and convert to degrees
     yaw = np.degrees(np.atan2(sin_yaw, cos_yaw))
     
     return yaw
+
 
 # Initialize filters and data queue
 kalman = KalmanFilter(process_noise=0.005, measurement_noise=0.1)
@@ -247,28 +277,23 @@ def processing_thread():
                     if elapsed_time > 0:
                         loop_freq_hz = 9 / elapsed_time
 
-                # Re-assign pitch and roll for our imu axis convention
-                temp = pitch_kalman
-                pitch_kalman = -roll_kalman
-                roll_kalman = temp
-
                 # Calculate yaw angle
-                yaw = find_yaw(pitch_kalman, roll_kalman,[mag_amplitudes[2], mag_amplitudes[1], mag_amplitudes[0]])
+                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes)
 
-                # Print results with queue size
+                # # # Print results with queue size
                 print(f"Yaw: {yaw:.2f}°" if yaw is not None else "Yaw: No solution",
                       f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°, "
-                      f"AC Amplitudes (µT): [X: {mag_amplitudes[2]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[0]:.2f}]"
-                      f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}, "
-                      )
+                      f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]"
+                      f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}")                  
+                
                 # Update plot buffers
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
                 plot_mag_y.append(mag_uT[1])
                 plot_mag_z.append(mag_uT[2])
-                plot_amp_x.append(mag_amplitudes[2])
+                plot_amp_x.append(mag_amplitudes[0])
                 plot_amp_y.append(mag_amplitudes[1])
-                plot_amp_z.append(mag_amplitudes[0])
+                plot_amp_z.append(mag_amplitudes[2])
                 
                 data_queue.task_done()
             except queue.Empty:
@@ -302,6 +327,26 @@ def notification_handler(sender, data):
         accel_g = [x * 2.0 / 32768 for x in accel]
         gyro_dps = [x * 245.0 / 32768 for x in gyro]
         mag_uT = [x * 1.1 for x in mag]
+
+        ## adjust for imu and HALL orientation on PCB
+
+        accel_g[2] = -accel_g[2]
+
+        gyro_dps[0] = -gyro_dps[0]
+        gyro_dps[1] = -gyro_dps[1]
+        gyro_dps[2] = gyro_dps[2]
+
+        temp = mag_uT[0]
+        temp1 = mag_uT[2]
+        mag_uT[0] = mag_uT[1]
+        mag_uT[1] = temp1
+        mag_uT[2] = temp
+
+
+
+        # print(f"Accel (g): ax: {accel_g[0]:.2f}, ay: {accel_g[1]:.2f}, az: {accel_g[2]:.2f} |"
+        #        f" Gyro (°/s): gx: {gyro_dps[0]:.2f}, gy: {gyro_dps[1]:.2f}, gz: {gyro_dps[2]:.2f} |"
+        #        f" Mag (µT): mx: {mag_uT[0]:.2f}, my: {mag_uT[1]:.2f}, mz: {mag_uT[2]:.2f}")
 
         # Queue data for processing
         data_queue.put((current_time, accel_g, gyro_dps, mag_uT, running_freq_hz))
