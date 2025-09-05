@@ -139,7 +139,6 @@ class KalmanFilter:
 
 
 
-# Lock-in Amplifier class for magnetometer AC component
 class LockInAmplifier:
     def __init__(self, target_freq=10.0, alpha=0.01):
         self.target_freq = target_freq  # 10 Hz
@@ -159,6 +158,7 @@ class LockInAmplifier:
 
         # Process each axis
         amplitudes = []
+        phase_angles = []  # Store phase angles for each axis
         for i in range(3):  # x, y, z
             # Multiply signal with reference
             prod_in = mag_uT[i] * ref_in
@@ -172,9 +172,14 @@ class LockInAmplifier:
             amplitude = np.sqrt(self.x_in[i]**2 + self.x_quad[i]**2)
             amplitudes.append(amplitude)
 
-        return amplitudes  # [amp_x, amp_y, amp_z]
+            # Compute phase angle in degrees relative to a reference 10Hz sine wave of 0 phase angle
+            phase = np.degrees(np.arctan2(self.x_quad[i], self.x_in[i]))
+            phase_angles.append(phase)
+
+        return amplitudes, phase_angles  # Return [amp_x, amp_y, amp_z], [phase_x, phase_y, phase_z]
     
-def find_yaw(pitch_deg, roll_deg, transformed_vector):
+    
+def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
     """
     Compute the yaw angle given pitch (x-axis rotation), roll (y-axis rotation) in degrees,
     and the transformed unit vector, assuming ZYX intrinsic rotation.
@@ -238,8 +243,8 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector):
     
     # Compute yaw using atan2 and convert to degrees
     yaw = np.degrees(np.atan2(sin_yaw, cos_yaw))
-    
-    return yaw
+
+    return yaw if mag_phase[1] > 0 else -yaw
 
 
 # Initialize filters and data queue
@@ -247,11 +252,13 @@ kalman = KalmanFilter(process_noise=0.005, measurement_noise=0.1)
 lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
 data_queue = queue.Queue()
 
+
+
 def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
     """Process Kalman filter and lock-in amplifier calculations in a separate thread."""
     pitch_kalman, roll_kalman = kalman.update(accel_g, gyro_dps, current_time)
-    mag_amplitudes = lockin.update(mag_uT, current_time)
-    return pitch_kalman, roll_kalman, mag_amplitudes
+    mag_amplitudes, mag_phases = lockin.update(mag_uT, current_time)  # Unpack amplitudes and phases
+    return pitch_kalman, roll_kalman, mag_amplitudes, mag_phases
 
 def processing_thread():
     """Process IMU data from the queue, prioritizing the latest packet."""
@@ -267,8 +274,8 @@ def processing_thread():
                 
                 # Offload calculations to a separate thread
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                pitch_kalman, roll_kalman, mag_amplitudes = future.result()
-                
+                pitch_kalman, roll_kalman, mag_amplitudes, mag_phases = future.result()
+
                 # Calculate loop frequency
                 loop_timestamps.append(loop_start_time)
                 loop_freq_hz = 0.0
@@ -278,12 +285,13 @@ def processing_thread():
                         loop_freq_hz = 9 / elapsed_time
 
                 # Calculate yaw angle
-                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes)
+                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes,mag_phases)
 
                 # # # Print results with queue size
                 print(f"Yaw: {yaw:.2f}°" if yaw is not None else "Yaw: No solution",
                       f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°, "
                       f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]"
+                        f"  AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}] "
                       f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}")                  
                 
                 # Update plot buffers
