@@ -102,11 +102,12 @@ class KalmanFilter:
 
         #Adjust to take account into signage of accel data since taking square root of them would remove this info
         #this adjustment would allow the pitch and roll calculated have range of +/-180 degrees
+        # pitch and roll ref to global system
         #Pitch
         if( az > 0 and ay < 0 ):
             extended_pitch = (180+np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
         elif( az > 0 and ay > 0 ):
-            extended_pitch = (-180-np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
+            extended_pitch = (-180+np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
         else:
             extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
         #Roll
@@ -211,6 +212,7 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
             [-np.sin(angle), 0, np.cos(angle)]
         ])
     
+
     # Ensure transformed vector is normalized
     transformed_vector = np.array(transformed_vector)
     norm = np.linalg.norm(transformed_vector)
@@ -244,7 +246,7 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
     # Compute yaw using atan2 and convert to degrees
     yaw = np.degrees(np.atan2(sin_yaw, cos_yaw))
 
-    return yaw if mag_phase[1] > 0 else -yaw
+    return yaw,u
 
 
 # Initialize filters and data queue
@@ -285,15 +287,17 @@ def processing_thread():
                         loop_freq_hz = 9 / elapsed_time
 
                 # Calculate yaw angle
-                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes,mag_phases)
+                yaw, u = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
 
                 # # # Print results with queue size
-                print(f"Yaw: {yaw:.2f}°" if yaw is not None else "Yaw: No solution",
-                      f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°, "
-                      f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]"
-                        f"  AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}] "
-                      f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}")                  
-                
+                print(f"Yaw: {yaw:.2f}°\t" if yaw is not None else "Yaw: No solution",
+                      f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°,\t "
+                      f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]\t"
+                        f"  AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}]\t"
+                    #   f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
+                      f"  Ux: {u[0]:.2f}, Uy: {u[1]:.2f}, Uz: {u[2]:.2f}"
+                      )
+
                 # Update plot buffers
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
