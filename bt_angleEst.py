@@ -181,22 +181,10 @@ class LockInAmplifier:
     
     
 def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
-    """
-    Compute the yaw angle given pitch (x-axis rotation), roll (y-axis rotation) in degrees,
-    and the transformed unit vector, assuming ZYX intrinsic rotation.
 
-    Parameters:
-    - pitch_deg (float): Pitch angle in degrees (rotation about x-axis).
-    - roll_deg (float): Roll angle in degrees (rotation about y-axis).
-    - transformed_vector (np.ndarray): 3D vector after ZYX intrinsic rotation, [mx, my, mz].
+    # Using ZYX Tait-Bryan angles convention
+    # pitch (Y), roll (X), yaw (Z)
 
-    Returns:
-    - float: Yaw angle in degrees, or None if the solution is invalid.
-    """
-    # Convert angles to radians
-    pitch = np.radians(pitch_deg)
-    roll = np.radians(roll_deg)
-    
     # Define rotation matrices
     def rotation_x(angle):
         return np.array([
@@ -211,42 +199,38 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
             [0, 1, 0],
             [-np.sin(angle), 0, np.cos(angle)]
         ])
+    def rotation_z(angle):
+        return np.array([
+            [np.cos(angle), -np.sin(angle), 0],
+            [np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1]
+        ])
     
+    # Convert angles to radians
+    pitch = np.radians(pitch_deg)
+    roll = np.radians(roll_deg)
 
-    # Ensure transformed vector is normalized
-    transformed_vector = np.array(transformed_vector)
-    norm = np.linalg.norm(transformed_vector)
-    # if not np.isclose(norm, 1.0, rtol=1e-5):
-    #     print(f"Warning: Transformed vector magnitude is {norm:.2f}. Normalizing.")
-    transformed_vector = transformed_vector / norm
-    
-    # Compute combined pitch and roll rotation matrix (ZYX order: roll after pitch)
-    R_pr = rotation_y(roll) @ rotation_x(pitch)
-    
-    # Compute inverse of R_pr (since R_pr is orthogonal, inverse = transpose)
-    R_pr_inv = R_pr.T
-    
-    # Compute u = R_pr^-1 @ transformed_vector
-    u = R_pr_inv @ transformed_vector
-    # print(f"Intermediate vector u: {u}")
-    
-    # # u should be of the form [cos(yaw), sin(yaw), 0]
-    # if not np.isclose(u[2], 0, atol=1e-5):
-    #     print(f"Warning: Inconsistent input. z-component of u is {u[2]:.6f} (not zero).")
-    #     return None
-    
-    # Extract cos(yaw) and sin(yaw)
-    cos_yaw, sin_yaw = u[0], u[1]
-    
-    # # Check if u is a valid unit vector in xy-plane
-    # if not np.isclose(cos_yaw**2 + sin_yaw**2, 1.0, rtol=1e-5):
-    #     print(f"Warning: Invalid solution. Magnitude of u's xy components is {cos_yaw**2 + sin_yaw**2:.6f}.")
-    #     return None
-    
-    # Compute yaw using atan2 and convert to degrees
-    yaw = np.degrees(np.atan2(sin_yaw, cos_yaw))
+    unit_z = np.array([0, 0, 1])
 
-    return yaw,u
+    capf_vertical = rotation_y(-pitch) @ rotation_x(-roll) @ unit_z
+
+    #normalize capf_vertical & transformed_vector
+    capf_vertical = capf_vertical / np.linalg.norm(capf_vertical)
+    transformed_vector = transformed_vector / np.linalg.norm(transformed_vector)
+
+    #project transformed_vector onto plane perpendicular to capf_vertical
+    acProj = transformed_vector - np.dot(transformed_vector, capf_vertical) * capf_vertical
+
+    #project capsule long axis onto plane perpendicular to capf_vertical
+    CaplongAxis = np.array([1, 0, 0])  # Capsule long axis
+    CaplongAxisProj = CaplongAxis - np.dot(CaplongAxis, capf_vertical) * capf_vertical
+
+    yaw = np.degrees(np.arccos(np.dot(CaplongAxisProj, acProj)))
+
+    # print(f"Angle: {np.degrees(np.arccos(np.dot(CaplongAxisProj, acProj))):.2f} degrees"
+    #       f"\t capf_vertical: {capf_vertical}, acProj: {acProj}, CaplongAxisProj: {CaplongAxisProj}")
+
+    return yaw
 
 
 # Initialize filters and data queue
@@ -287,15 +271,15 @@ def processing_thread():
                         loop_freq_hz = 9 / elapsed_time
 
                 # Calculate yaw angle
-                yaw, u = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
+                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
 
                 # # # Print results with queue size
-                print(f"Yaw: {yaw:.2f}°\t" if yaw is not None else "Yaw: No solution",
+                print(
+                    f"Yaw: {yaw:.2f}°\t" if yaw is not None else "Yaw: No solution",
                       f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°,\t "
                       f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]\t"
                         f"  AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}]\t"
-                    #   f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
-                      f"  Ux: {u[0]:.2f}, Uy: {u[1]:.2f}, Uz: {u[2]:.2f}"
+                      f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
                       )
 
                 # Update plot buffers
@@ -349,9 +333,7 @@ def notification_handler(sender, data):
         gyro_dps[2] = gyro_dps[2]
 
         temp = mag_uT[0]
-        temp1 = mag_uT[2]
-        mag_uT[0] = mag_uT[1]
-        mag_uT[1] = temp1
+        mag_uT[0] = mag_uT[2]
         mag_uT[2] = temp
 
 
