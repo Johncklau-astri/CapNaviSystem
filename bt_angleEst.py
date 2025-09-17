@@ -61,12 +61,18 @@ class KalmanFilter:
         else:
             extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
 
-        if az > 0 and ax < 0:
-            extended_roll = (-180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
-        elif az > 0 and ax > 0:
-            extended_roll = (180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
-        else:
-            extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+        # if az > 0 and ax < 0:
+        #     extended_roll = (-180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
+        # elif az > 0 and ax > 0:
+        #     extended_roll = (180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
+        # else:
+        #     extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+
+        
+
+        # extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+
+        extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
 
         # Measurement
         z = np.array([extended_pitch, extended_roll])
@@ -157,23 +163,108 @@ def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
             [0, 1, 0],
             [-np.sin(angle), 0, np.cos(angle)]
         ])
+    def sin_theta_cross_product(vector_a, vector_b, signed=False, reference_axis=None):
+        # Convert inputs to numpy arrays
+        a = np.array(vector_a)
+        b = np.array(vector_b)
+        
+        # Check if vectors are 3D
+        if a.shape != (3,) or b.shape != (3,):
+            raise ValueError("Vectors must be 3-dimensional")
+        
+        # Compute the cross product
+        cross_product = np.cross(a, b)
+        
+        # Compute magnitudes
+        mag_cross = np.linalg.norm(cross_product)
+        mag_a = np.linalg.norm(a)
+        mag_b = np.linalg.norm(b)
+        
+        # Avoid division by zero
+        if mag_a == 0 or mag_b == 0:
+            raise ValueError("Vector magnitude cannot be zero")
+        
+        # Compute sin(theta)
+        sin_theta = mag_cross / (mag_a * mag_b)
+        
+        # Ensure sin_theta is within [-1, 1] for numerical precision
+        sin_theta = np.clip(sin_theta, -1, 1)
+        
+        # If signed is requested, determine the sign based on the cross product's direction
+        if signed:
+            if reference_axis is None:
+                # Default to z-axis (e.g., [0, 0, 1]) for reference
+                reference_axis = np.array([0, 0, 1])
+            else:
+                reference_axis = np.array(reference_axis)
+                if reference_axis.shape != (3,):
+                    raise ValueError("Reference axis must be 3-dimensional")
+            
+            # Compute the sign based on the dot product of cross product and reference axis
+            sign = np.sign(np.dot(cross_product, reference_axis))
+            sin_theta *= sign
+        
+        return sin_theta
     
+    # Define unit vectors
     unit_z = np.array([0, 0, 1])
     CaplongAxis = np.array([1, 0, 0])
+    
+    # Convert pitch and roll to radians
     pitch = np.radians(pitch_deg)
     roll = np.radians(roll_deg)
+    
+    # Compute the normal vector to the plane (capf_vertical)
     capf_vertical = rotation_y(-pitch) @ rotation_x(-roll) @ unit_z
     capf_vertical = capf_vertical / np.linalg.norm(capf_vertical)
+    
+    # Normalize input vector
     transformed_vector = transformed_vector / np.linalg.norm(transformed_vector)
+    
+    # Project vectors onto the plane perpendicular to capf_vertical
     acProj = transformed_vector - np.dot(transformed_vector, capf_vertical) * capf_vertical
     CaplongAxisProj = CaplongAxis - np.dot(CaplongAxis, capf_vertical) * capf_vertical
 
+    # print(f"acProj (before norm): {acProj},transformed_vector: {transformed_vector}")
+    
+    # Normalize projections
+    acProj = acProj / np.linalg.norm(acProj) if np.linalg.norm(acProj) != 0 else acProj
+    CaplongAxisProj = CaplongAxisProj / np.linalg.norm(CaplongAxisProj) if np.linalg.norm(CaplongAxisProj) != 0 else CaplongAxisProj
+    
+    # Compute the smallest angle using dot product
+    cos_theta = np.clip(np.dot(CaplongAxisProj, acProj), -1.0, 1.0)  # Clip to avoid numerical errors
+    theta = np.arccos(cos_theta)  # Angle in radians
+    theta_deg = np.degrees(theta)
 
-    yaw = np.degrees(np.arccos(np.dot(CaplongAxisProj, acProj)))
-    sign = int(np.cross(CaplongAxisProj, acProj) )
-    print("Sign:", sign)
+    sine = sin_theta_cross_product(CaplongAxisProj, acProj, signed=True, reference_axis= -1*capf_vertical )
+    # print(f"sin_theta_cross_product_value: {sine}")
+    
+    # # Define a 2D coordinate system in the plane
+    # # Basis vector 1: CaplongAxisProj (normalized)
+    # v = CaplongAxisProj
+    # # Basis vector 2: Perpendicular to u and capf_vertical
+    # u = np.cross(capf_vertical, v)
+    # u = u / np.linalg.norm(u) if np.linalg.norm(u) != 0 else u
 
-    return yaw
+    # # Project vectors onto the 2D plane (u, v)
+    # acProj_2d = np.array([np.dot(acProj, u), np.dot(acProj, v)])
+    # CaplongAxisProj_2d = np.array([np.dot(CaplongAxisProj, u), np.dot(CaplongAxisProj, v)])
+    
+    # # Compute 2D cross product to determine direction
+    # cross_2d = np.cross(CaplongAxisProj_2d, acProj_2d)
+
+
+    # print(f"Yaw angle (degrees): {theta_deg}")
+    
+    # Determine counterclockwise angle
+    if sine > 0:
+        yaw = theta_deg  # acProj is counterclockwise from CaplongAxisProj
+    elif sine < 0:
+        yaw = 360 - theta_deg  # acProj is clockwise, so use 360 - theta
+    else:
+        yaw = 0 if theta_deg == 0 else 180  # Parallel or anti-parallel
+    
+    return yaw,sine,acProj,CaplongAxisProj,capf_vertical
 
 def live_plot():
     fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
@@ -246,13 +337,16 @@ def processing_thread():
                     if elapsed_time > 0:
                         loop_freq_hz = 9 / elapsed_time
 
-                yaw = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
+                yaw,sine,acProj,CaplongAxisProj,capf_vertical = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
                 print(
-                    f"Yaw: {yaw:.2f}°\t" if yaw is not None else "Yaw: No solution",
-                    f"Kalman Pitch: {pitch_kalman:.2f}°, Roll: {roll_kalman:.2f}°,\t "
-                    f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]\t"
-                    f"AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}]\t\t"
-                    f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
+                    f"Yaw: {yaw:.2f}°\tSine: {sine:.2f}°\t "if yaw is not None else "Yaw: N/A\t    ",
+                    f"acx: {acProj[0]:.2f}\tacy: {acProj[1]:.2f}\tacz: {acProj[2]:.2f}\t"
+                    f"CaplongAxisProj x: {CaplongAxisProj[0]:.2f}\t  y: {CaplongAxisProj[1]:.2f}\t  z: {CaplongAxisProj[2]:.2f}\t"
+                    f"Capf_vertical x: {capf_vertical[0]:.2f}\t y: {capf_vertical[1]:.2f}\t z: {capf_vertical[2]:.2f}\t",
+                    f"Kalman Pitch: {pitch_kalman:.2f}°\t Roll: {roll_kalman:.2f}°,\t "
+                    # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]\t  "
+                    f"AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}]\t"
+                    # f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
                 )
 
                 plot_time.append(current_time)
