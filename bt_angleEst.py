@@ -55,11 +55,11 @@ class KalmanFilter:
 
         # Adjust for accelerometer data signage
         if az > 0 and ay < 0:
-            extended_pitch = (180 + np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
+            extended_pitch = (180 + np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi)
         elif az > 0 and ay > 0:
-            extended_pitch = (-180 + np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi)
+            extended_pitch = (-180 + np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi)
         else:
-            extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+            extended_pitch = -np.arctan2(ay, np.sqrt( az**2)) * 180 / np.pi
 
         # if az > 0 and ax < 0:
         #     extended_roll = (-180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
@@ -70,7 +70,7 @@ class KalmanFilter:
 
         
 
-        # extended_pitch = -np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
+        # extended_pitch = -np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi
 
         extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
 
