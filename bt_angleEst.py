@@ -32,59 +32,99 @@ frequency_hz = 0.0
 timestamp_deque = deque(maxlen=10)
 
 class KalmanFilter:
-    def __init__(self, process_noise=0.005, measurement_noise=0.1):
-        self.state = np.zeros(4)  # [pitch, roll, bias_x, bias_y]
-        self.P = np.eye(4) * 0.1
-        self.Q = np.eye(4) * process_noise
-        self.R = np.eye(2) * measurement_noise
+    def __init__(self, process_noise_pose=0.005, process_noise_bias=0.0001, measurement_noise=0.1, hysteresis_time=0.2):
+        self.state = np.zeros(4)  # [pitch, roll, bias_x, bias_y] in degrees
+        self.P = np.eye(4) * 0.1  # Initial covariance
+        # Different process noise for pose (pitch, roll) and biases
+        self.Q = np.diag([process_noise_pose, process_noise_pose, process_noise_bias, process_noise_bias])
+        self.R_nominal = np.eye(2) * measurement_noise  # Base R for static conditions
+        self.R_dynamic = np.eye(2) * (measurement_noise * 150)  # Inflated R for dynamic
+        self.accel_threshold = 0.08  # g; threshold for dynamic conditions
+        self.hysteresis_time = hysteresis_time  # Time (s) to wait before switching back to static
         self.last_time = time.time()
-        self.roll_unwrapped = 0.0
+        self.in_dynamic = False  # Flag: currently treating as dynamic
+        self.static_start_time = None  # Time when static condition first detected
 
     def update(self, accel_g, gyro_dps, current_time):
-        ax, ay, az = accel_g
-        gx, gy, gz = gyro_dps
+        ax, ay, az = accel_g  # Accelerometer data in g (body frame)
+        gx, gy, gz = gyro_dps  # Gyroscope data in deg/s (body frame); gz unused
+
+                # In process_data(), after unpacking but before kalman.update()
+        gz = gyro_dps[2]  # Body yaw rate r ≈ ψ̇
+        theta_rad = np.radians(self.state[0])  # Use current pitch estimate (or previous)
+        phi_rad = np.radians(self.state[1])     # If roll is small, sin(phi)≈0
+
+        # Decouple for pure yaw assumption (φ̇=θ̇=0)
+        gx_corrected = gyro_dps[0] + gz * np.sin(theta_rad)
+        gy_corrected = gyro_dps[1] - gz * np.sin(phi_rad) * np.cos(theta_rad) / np.cos(theta_rad) if abs(np.cos(theta_rad)) > 0.1 else gyro_dps[1]
+        gyro_dps_corrected = [gx_corrected, gy_corrected, gyro_dps[2]]  # gz unchanged
+
+        gx, gy = gyro_dps_corrected[0], gyro_dps_corrected[1]
+
+
         dt = current_time - self.last_time
+        if dt <= 0:
+            dt = 0.001  # Prevent division by zero or negative dt
         self.last_time = current_time
 
-        # Predict
-        F = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-        B = np.array([[dt, 0], [0, dt], [0, 0], [0, 0]])
-        u = np.array([gx, gy])
-        self.state = F @ self.state + B @ u
+        # Predict: pitch (rotation about y-axis), roll (rotation about x-axis)
+        F = np.array([[1, 0, 0, dt],    # pitch: + (gy - bias_y)*dt (y-axis rotation)
+                      [0, 1, dt, 0],    # roll: + (gx - bias_x)*dt (x-axis rotation)
+                      [0, 0, 1, 0],     # bias_x constant (gyro x-axis bias)
+                      [0, 0, 0, 1]])    # bias_y constant (gyro y-axis bias)
+        B = np.array([[0, dt],           # pitch: apply gy - bias_y
+                      [dt, 0],           # roll: apply gx - bias_x
+                      [0, 0],
+                      [0, 0]])          # Shape (4, 2)
+        u = np.array([gx - self.state[2], gy - self.state[3]])  # Shape (2,), [gx - bias_x, gy - bias_y], treated as (2, 1) for B @ u
+        self.state = F @ self.state + B @ u  # (4, 4) @ (4,) + (4, 2) @ (2,) = (4,)
         self.P = F @ self.P @ F.T + self.Q
 
-        # Adjust for accelerometer data signage
-        if az > 0 and ay < 0:
-            extended_pitch = (180 + np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi)
-        elif az > 0 and ay > 0:
-            extended_pitch = (-180 + np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi)
+        # Adaptive R: Detect dynamic conditions with hysteresis
+        accel_mag = np.sqrt(ax**2 + ay**2 + az**2)
+        is_static_condition = abs(accel_mag - 1.0) <= self.accel_threshold
+
+        if not is_static_condition:
+            # Clearly dynamic: enter/remain in dynamic mode
+            self.in_dynamic = True
+            self.static_start_time = None
+            R = self.R_dynamic
         else:
-            extended_pitch = -np.arctan2(ay, np.sqrt( az**2)) * 180 / np.pi
+            # Static condition detected
+            if self.in_dynamic:
+                # Hysteresis: wait for hysteresis_time before switching to static
+                if self.static_start_time is None:
+                    self.static_start_time = current_time
+                if current_time - self.static_start_time >= self.hysteresis_time:
+                    self.in_dynamic = False
+                    R = self.R_nominal
+                else:
+                    # Still in hysteresis period: treat as dynamic
+                    R = self.R_dynamic
+            else:
+                # Already in static mode: stay static
+                R = self.R_nominal
 
-        # if az > 0 and ax < 0:
-        #     extended_roll = (-180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
-        # elif az > 0 and ax > 0:
-        #     extended_roll = (180 - np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi)
-        # else:
-        #     extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
+        # Accel-based measurements (global frame, relative to gravity)
+        sqrt_az = np.sqrt(max(az**2, 1e-6))  # Avoid division by zero
+        if az < 0 and ax < 0:
+            extended_pitch = 180 + (np.arctan2(ax, sqrt_az) * 180 / np.pi)
+        elif az < 0 and ax > 0:
+            extended_pitch = -180 + (np.arctan2(ax, sqrt_az) * 180 / np.pi)
+        else:
+            extended_pitch = -np.arctan2(ax, sqrt_az) * 180 / np.pi
+        extended_roll = np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
 
-        
-
-        # extended_pitch = -np.arctan2(ay, np.sqrt(az**2)) * 180 / np.pi
-
-        extended_roll = np.arctan2(ax, np.sqrt(ay**2 + az**2)) * 180 / np.pi
-
-        # Measurement
-        z = np.array([extended_pitch, extended_roll])
-        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
-        y = z - H @ self.state
-        S = H @ self.P @ H.T + self.R
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        # Update
-        self.state = self.state + K @ y
+        # Measurement update
+        z = np.array([extended_pitch, extended_roll])  # Shape (2,), global-frame pitch and roll
+        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])   # Shape (2, 4)
+        y = np.clip(z - H @ self.state, -30, 30)  # Shape (2,), clip innovation to ±30°
+        S = H @ self.P @ H.T + R  # Shape (2, 2)
+        K = self.P @ H.T @ np.linalg.inv(S)  # Shape (4, 2)
+        self.state = self.state + K @ y  # (4,) + (4, 2) @ (2,) = (4,)
         self.P = (np.eye(4) - K @ H) @ self.P
-        return self.state[0], self.state[1]
+        return self.state[0], self.state[1], self.in_dynamic  # pitch, roll (degrees), effective dynamic flag
+    
 
 class LockInAmplifier:
     def __init__(self, target_freq=10.0, alpha=0.01):
@@ -304,18 +344,20 @@ def live_plot():
     plt.show()
 
 # Initialize filters and data queue
-kalman = KalmanFilter(process_noise=0.005, measurement_noise=0.1)
+kalman = KalmanFilter(process_noise_pose=0.005, process_noise_bias=0.0001, measurement_noise=0.1)
 lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
 
 def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
-    pitch_kalman, roll_kalman = kalman.update(accel_g, gyro_dps, current_time)
+
+    
+    pitch_kalman, roll_kalman, is_dynamic = kalman.update(accel_g, gyro_dps, current_time)
     if calibration_trigger.is_set():
         lockin.calibrate(mag_uT, current_time)
         calibration_trigger.clear()
     mag_amplitudes, mag_phases = lockin.update(mag_uT, current_time)
-    return pitch_kalman, roll_kalman, mag_amplitudes, mag_phases
+    return pitch_kalman, roll_kalman, mag_amplitudes, mag_phases, is_dynamic
 
 def processing_thread():
     loop_timestamps = deque(maxlen=10)
@@ -328,7 +370,7 @@ def processing_thread():
                     current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get_nowait()
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                pitch_kalman, roll_kalman, mag_amplitudes, mag_phases = future.result()
+                pitch_kalman, roll_kalman, mag_amplitudes, mag_phases, is_dynamic = future.result()
 
                 loop_timestamps.append(loop_start_time)
                 loop_freq_hz = 0.0
@@ -338,15 +380,24 @@ def processing_thread():
                         loop_freq_hz = 9 / elapsed_time
 
                 yaw,sine,acProj,CaplongAxisProj,capf_vertical = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
+
+                accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
+
                 print(
-                    f"Yaw: {yaw:.2f}°\tSine: {sine:.2f}°\t "if yaw is not None else "Yaw: N/A\t    ",
-                    f"acx: {acProj[0]:.2f}\tacy: {acProj[1]:.2f}\tacz: {acProj[2]:.2f}\t"
-                    f"CaplongAxisProj x: {CaplongAxisProj[0]:.2f}\t  y: {CaplongAxisProj[1]:.2f}\t  z: {CaplongAxisProj[2]:.2f}\t"
-                    f"Capf_vertical x: {capf_vertical[0]:.2f}\t y: {capf_vertical[1]:.2f}\t z: {capf_vertical[2]:.2f}\t",
-                    f"Kalman Pitch: {pitch_kalman:.2f}°\t Roll: {roll_kalman:.2f}°,\t "
-                    # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.2f}, Y: {mag_amplitudes[1]:.2f}, Z: {mag_amplitudes[2]:.2f}]\t  "
-                    f"AC Phases (°): [X: {mag_phases[0]:.2f}, Y: {mag_phases[1]:.2f}, Z: {mag_phases[2]:.2f}]\t"
-                    # f"BLE Freq: {running_freq_hz:.2f} Hz, Loop Freq: {loop_freq_hz:.2f} Hz, Queue Size: {data_queue.qsize()}"
+                    f"Yaw: {yaw:.1f}°\tSine: {sine:.1f}°\t "if yaw is not None else "Yaw: N/A\t    ",
+                    f"Kalman Pitch: {pitch_kalman:.1f}°\t Roll: {roll_kalman:.1f}°,\t "
+                    f"Dynamic: {'Yes' if is_dynamic else 'No'},\t "
+                    f"accel_mag: {accel_mag:.3f} g\t"
+                    f"AccelX: {accel_g[0]:.2f}g\t AccelY: {accel_g[1]:.2f}g\t AccelZ: {accel_g[2]:.2f}g,\t "
+                    f"GyroX: {gyro_dps[0]:.1f}°/s\t GyroY: {gyro_dps[1]:.1f}°/s\t GyroZ: {gyro_dps[2]:.1f}°/s,\t "
+
+                    # f"acx: {acProj[0]:.1f}\tacy: {acProj[1]:.1f}\tacz: {acProj[2]:.1f}\t"
+                    # f"CaplongAxisProj x: {CaplongAxisProj[0]:.1f}\t  y: {CaplongAxisProj[1]:.1f}\t  z: {CaplongAxisProj[2]:.1f}\t"
+                    # f"Capf_vertical x: {capf_vertical[0]:.1f}\t y: {capf_vertical[1]:.1f}\t z: {capf_vertical[2]:.1f}\t",
+                    # # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t  "
+                    # f"AC Phases (°): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t"
+                    # f"Accel Mag: {accel_mag:.3f} g\t"
+                    # # f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
                 )
 
                 plot_time.append(current_time)
@@ -378,12 +429,21 @@ def notification_handler(sender, data):
         accel = struct.unpack("<hhh", accel_data)
         gyro = struct.unpack("<hhh", gyro_data)
         mag = struct.unpack(">hhh", mag_data)
+
         accel_g = [x * 2.0 / 32768 for x in accel]
         gyro_dps = [x * 245.0 / 32768 for x in gyro]
         mag_uT = [x * 1.1 for x in mag]
-        accel_g[2] = -accel_g[2]
-        gyro_dps[0] = -gyro_dps[0]
-        gyro_dps[1] = -gyro_dps[1]
+
+        temp = accel_g[0]
+        accel_g[0] = accel_g[1]
+        accel_g[1] = temp
+
+        temp = -gyro_dps[0]
+        gyro_dps[0] = -gyro_dps[1]
+        gyro_dps[1] = temp
+        gyro_dps[2] = -gyro_dps[2]
+        
+
         temp = mag_uT[0]
         mag_uT[0] = mag_uT[2]
         mag_uT[2] = temp
