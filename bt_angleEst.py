@@ -20,6 +20,12 @@ plot_mag_z = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_x = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_y = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_z = deque(maxlen=PLOT_BUFFER_LEN)
+plot_roll = deque(maxlen=PLOT_BUFFER_LEN)
+plot_pitch = deque(maxlen=PLOT_BUFFER_LEN)
+plot_yaw = deque(maxlen=PLOT_BUFFER_LEN)
+plot_omega_x = deque(maxlen=PLOT_BUFFER_LEN)
+plot_omega_y = deque(maxlen=PLOT_BUFFER_LEN)
+plot_omega_z = deque(maxlen=PLOT_BUFFER_LEN)
 
 # Define Nordic UART Service (NUS) UUIDs
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -31,100 +37,175 @@ last_time = time.time()
 frequency_hz = 0.0
 timestamp_deque = deque(maxlen=10)
 
-class KalmanFilter:
-    def __init__(self, process_noise_pose=0.005, process_noise_bias=0.0001, measurement_noise=0.1, hysteresis_time=0.2):
-        self.state = np.zeros(4)  # [pitch, roll, bias_x, bias_y] in degrees
-        self.P = np.eye(4) * 0.1  # Initial covariance
-        # Different process noise for pose (pitch, roll) and biases
-        self.Q = np.diag([process_noise_pose, process_noise_pose, process_noise_bias, process_noise_bias])
-        self.R_nominal = np.eye(2) * measurement_noise  # Base R for static conditions
-        self.R_dynamic = np.eye(2) * (measurement_noise * 150)  # Inflated R for dynamic
-        self.accel_threshold = 0.08  # g; threshold for dynamic conditions
-        self.hysteresis_time = hysteresis_time  # Time (s) to wait before switching back to static
-        self.last_time = time.time()
-        self.in_dynamic = False  # Flag: currently treating as dynamic
-        self.static_start_time = None  # Time when static condition first detected
+class MadgwickFilter:
+    def __init__(self, beta=0.1, dt=0.01):
+        """
+        Initialize Madgwick filter parameters.
+        
+        Args:
+            beta (float): Algorithm gain beta
+            dt (float): Sample period [s]
+        """
+        self.beta = beta
+        self.dt = dt
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])  # Initial quaternion [w, x, y, z]
+        
+        # Reference vectors in Earth frame
+        self.gravity_ref = np.array([0.0, 0.0, 1.0])  # Gravity points down
+        self.magnetic_ref = np.array([0.0, -1.0, 0.0])  # Magnetic field points North
 
-    def update(self, accel_g, gyro_dps, current_time):
-        ax, ay, az = accel_g  # Accelerometer data in g (body frame)
-        gx, gy, gz = gyro_dps  # Gyroscope data in deg/s (body frame); gz unused
+    def quaternion_multiply(self, q1, q2):
+        """Multiply two quaternions."""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
 
-                # In process_data(), after unpacking but before kalman.update()
-        gz = gyro_dps[2]  # Body yaw rate r ≈ ψ̇
-        theta_rad = np.radians(self.state[0])  # Use current pitch estimate (or previous)
-        phi_rad = np.radians(self.state[1])     # If roll is small, sin(phi)≈0
+    def quaternion_conjugate(self, q):
+        """Compute quaternion conjugate."""
+        return np.array([q[0], -q[1], -q[2], -q[3]])
 
-        # Decouple for pure yaw assumption (φ̇=θ̇=0)
-        gx_corrected = gyro_dps[0] + gz * np.sin(theta_rad)
-        gy_corrected = gyro_dps[1] - gz * np.sin(phi_rad) * np.cos(theta_rad) / np.cos(theta_rad) if abs(np.cos(theta_rad)) > 0.1 else gyro_dps[1]
-        gyro_dps_corrected = [gx_corrected, gy_corrected, gyro_dps[2]]  # gz unchanged
+    def normalize_quaternion(self, q):
+        """Normalize quaternion to unit length."""
+        norm = np.linalg.norm(q)
+        if norm > 0:
+            return q / norm
+        return q
 
-        gx, gy = gyro_dps_corrected[0], gyro_dps_corrected[1]
+    def normalize_vector(self, v):
+        """Normalize vector to unit length."""
+        norm = np.linalg.norm(v)
+        if norm > 0:
+            return v / norm
+        return v
 
+    def init(self):
+        """
+        Initialize or reset filter state.
+        """
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        return self.q
 
-        dt = current_time - self.last_time
-        if dt <= 0:
-            dt = 0.001  # Prevent division by zero or negative dt
-        self.last_time = current_time
+    def update_imu(self, gyro, accel):
+        """
+        Update Madgwick filter with gyro and accelerometer data (6DOF).
+        
+        Args:
+            gyro (np.ndarray): Angular velocity [rad/s] (3x1: [wx, wy, wz])
+            accel (np.ndarray): Accelerometer data [g] (3x1: [ax, ay, az])
+        
+        Returns:
+            np.ndarray: Updated quaternion
+        """
+        # Normalize accelerometer
+        accel_normalized = self.normalize_vector(accel)
+        
+        # Extract quaternion elements
+        q0, q1, q2, q3 = self.q
+        
+        # Gradient descent algorithm corrective step
+        # Objective function and Jacobian for accelerometer
+        f = np.array([
+            2.0 * (q1*q3 - q0*q2) - accel_normalized[0],
+            2.0 * (q0*q1 + q2*q3) - accel_normalized[1],
+            2.0 * (0.5 - q1*q1 - q2*q2) - accel_normalized[2]
+        ])
+        
+        J = np.array([
+            [-2.0*q2, 2.0*q3, -2.0*q0, 2.0*q1],
+            [2.0*q1, 2.0*q0, 2.0*q3, 2.0*q2],
+            [0.0, -4.0*q1, -4.0*q2, 0.0]
+        ])
+        
+        # Compute gradient
+        gradient = J.T @ f
+        if np.linalg.norm(gradient) > 0:
+            gradient = gradient / np.linalg.norm(gradient)
+        
+        # Compute quaternion derivative from gyro and gradient descent
+        q_dot_gyro = 0.5 * self.quaternion_multiply(self.q, np.array([0.0, *gyro]))
+        q_dot_gradient = self.beta * gradient
+        
+        # Integrate rate of change of quaternion
+        q_dot = q_dot_gyro - q_dot_gradient
+        self.q = self.q + q_dot * self.dt
+        self.q = self.normalize_quaternion(self.q)
+        
+        return self.q
 
-        # Predict: pitch (rotation about y-axis), roll (rotation about x-axis)
-        F = np.array([[1, 0, 0, dt],    # pitch: + (gy - bias_y)*dt (y-axis rotation)
-                      [0, 1, dt, 0],    # roll: + (gx - bias_x)*dt (x-axis rotation)
-                      [0, 0, 1, 0],     # bias_x constant (gyro x-axis bias)
-                      [0, 0, 0, 1]])    # bias_y constant (gyro y-axis bias)
-        B = np.array([[0, dt],           # pitch: apply gy - bias_y
-                      [dt, 0],           # roll: apply gx - bias_x
-                      [0, 0],
-                      [0, 0]])          # Shape (4, 2)
-        u = np.array([gx - self.state[2], gy - self.state[3]])  # Shape (2,), [gx - bias_x, gy - bias_y], treated as (2, 1) for B @ u
-        self.state = F @ self.state + B @ u  # (4, 4) @ (4,) + (4, 2) @ (2,) = (4,)
-        self.P = F @ self.P @ F.T + self.Q
-
-        # Adaptive R: Detect dynamic conditions with hysteresis
-        accel_mag = np.sqrt(ax**2 + ay**2 + az**2)
-        is_static_condition = abs(accel_mag - 1.0) <= self.accel_threshold
-
-        if not is_static_condition:
-            # Clearly dynamic: enter/remain in dynamic mode
-            self.in_dynamic = True
-            self.static_start_time = None
-            R = self.R_dynamic
-        else:
-            # Static condition detected
-            if self.in_dynamic:
-                # Hysteresis: wait for hysteresis_time before switching to static
-                if self.static_start_time is None:
-                    self.static_start_time = current_time
-                if current_time - self.static_start_time >= self.hysteresis_time:
-                    self.in_dynamic = False
-                    R = self.R_nominal
-                else:
-                    # Still in hysteresis period: treat as dynamic
-                    R = self.R_dynamic
-            else:
-                # Already in static mode: stay static
-                R = self.R_nominal
-
-        # Accel-based measurements (global frame, relative to gravity)
-        sqrt_az = np.sqrt(max(az**2, 1e-6))  # Avoid division by zero
-        if az < 0 and ax < 0:
-            extended_pitch = 180 + (np.arctan2(ax, sqrt_az) * 180 / np.pi)
-        elif az < 0 and ax > 0:
-            extended_pitch = -180 + (np.arctan2(ax, sqrt_az) * 180 / np.pi)
-        else:
-            extended_pitch = -np.arctan2(ax, sqrt_az) * 180 / np.pi
-        extended_roll = np.arctan2(ay, np.sqrt(ax**2 + az**2)) * 180 / np.pi
-
-        # Measurement update
-        z = np.array([extended_pitch, extended_roll])  # Shape (2,), global-frame pitch and roll
-        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])   # Shape (2, 4)
-        y = np.clip(z - H @ self.state, -30, 30)  # Shape (2,), clip innovation to ±30°
-        S = H @ self.P @ H.T + R  # Shape (2, 2)
-        K = self.P @ H.T @ np.linalg.inv(S)  # Shape (4, 2)
-        self.state = self.state + K @ y  # (4,) + (4, 2) @ (2,) = (4,)
-        self.P = (np.eye(4) - K @ H) @ self.P
-        return self.state[0], self.state[1], self.in_dynamic  # pitch, roll (degrees), effective dynamic flag
-    
+    def update(self, gyro, accel, mag):
+        """
+        Update Madgwick filter with gyro, accelerometer and magnetometer data (9DOF).
+        
+        Args:
+            gyro (np.ndarray): Angular velocity [rad/s] (3x1: [wx, wy, wz])
+            accel (np.ndarray): Accelerometer data [g] (3x1: [ax, ay, az])
+            mag (np.ndarray): Magnetometer data [uT] (3x1: [mx, my, mz])
+        
+        Returns:
+            tuple: Updated quaternion, error vector, corrected gyro
+        """
+        # Normalize accelerometer and magnetometer
+        accel_normalized = self.normalize_vector(accel)
+        mag_normalized = self.normalize_vector(mag)
+        
+        # Extract quaternion elements
+        q0, q1, q2, q3 = self.q
+        
+        # Reference direction of Earth's magnetic field
+        h = self.quaternion_multiply(
+            self.quaternion_multiply(self.q, np.array([0.0, *mag_normalized])),
+            self.quaternion_conjugate(self.q)
+        )[1:]
+        
+        b = np.array([0.0, np.linalg.norm([h[0], h[1]]), 0.0, h[2]])
+        
+        # Gradient descent algorithm corrective step
+        # Objective function and Jacobian for accelerometer and magnetometer
+        f = np.array([
+            2.0 * (q1*q3 - q0*q2) - accel_normalized[0],
+            2.0 * (q0*q1 + q2*q3) - accel_normalized[1],
+            2.0 * (0.5 - q1*q1 - q2*q2) - accel_normalized[2],
+            2.0 * b[1] * (0.5 - q2*q2 - q3*q3) + 2.0 * b[3] * (q1*q3 - q0*q2) - mag_normalized[0],
+            2.0 * b[1] * (q1*q2 - q0*q3) + 2.0 * b[3] * (q0*q1 + q2*q3) - mag_normalized[1],
+            2.0 * b[1] * (q0*q2 + q1*q3) + 2.0 * b[3] * (0.5 - q1*q1 - q2*q2) - mag_normalized[2]
+        ])
+        
+        J = np.array([
+            [-2.0*q2, 2.0*q3, -2.0*q0, 2.0*q1],
+            [2.0*q1, 2.0*q0, 2.0*q3, 2.0*q2],
+            [0.0, -4.0*q1, -4.0*q2, 0.0],
+            [-2.0*b[3]*q2, 2.0*b[3]*q3, -4.0*b[1]*q2 - 2.0*b[3]*q0, -4.0*b[1]*q3 + 2.0*b[3]*q1],
+            [-2.0*b[1]*q3 + 2.0*b[3]*q1, 2.0*b[1]*q2 + 2.0*b[3]*q0, 2.0*b[1]*q1 + 2.0*b[3]*q3, -2.0*b[1]*q0 + 2.0*b[3]*q2],
+            [2.0*b[1]*q2, 2.0*b[1]*q3 - 4.0*b[3]*q1, 2.0*b[1]*q0 - 4.0*b[3]*q2, 2.0*b[1]*q1]
+        ])
+        
+        # Compute gradient
+        gradient = J.T @ f
+        if np.linalg.norm(gradient) > 0:
+            gradient = gradient / np.linalg.norm(gradient)
+        
+        # Compute quaternion derivative from gyro and gradient descent
+        q_dot_gyro = 0.5 * self.quaternion_multiply(self.q, np.array([0.0, *gyro]))
+        q_dot_gradient = self.beta * gradient
+        
+        # For debugging - estimate corrected gyro
+        # This is an approximation for visualization purposes
+        corrected_gyro = gyro - 2.0 * self.beta * gradient[1:]
+        
+        # Integrate rate of change of quaternion
+        q_dot = q_dot_gyro - q_dot_gradient
+        self.q = self.q + q_dot * self.dt
+        self.q = self.normalize_quaternion(self.q)
+        
+        # Return error vector for debugging (approximated from gradient)
+        error = gradient[1:] * self.beta
+        
+        return self.q, error, corrected_gyro
 
 class LockInAmplifier:
     def __init__(self, target_freq=10.0, alpha=0.01):
@@ -189,175 +270,96 @@ class LockInAmplifier:
             phase_angles.append(np.degrees(phase))
         return amplitudes, phase_angles
 
-def find_yaw(pitch_deg, roll_deg, transformed_vector, mag_phase):
-    def rotation_x(angle):
-        return np.array([
-            [1, 0, 0],
-            [0, np.cos(angle), -np.sin(angle)],
-            [0, np.sin(angle), np.cos(angle)]
-        ])
-    
-    def rotation_y(angle):
-        return np.array([
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)]
-        ])
-    def sin_theta_cross_product(vector_a, vector_b, signed=False, reference_axis=None):
-        # Convert inputs to numpy arrays
-        a = np.array(vector_a)
-        b = np.array(vector_b)
-        
-        # Check if vectors are 3D
-        if a.shape != (3,) or b.shape != (3,):
-            raise ValueError("Vectors must be 3-dimensional")
-        
-        # Compute the cross product
-        cross_product = np.cross(a, b)
-        
-        # Compute magnitudes
-        mag_cross = np.linalg.norm(cross_product)
-        mag_a = np.linalg.norm(a)
-        mag_b = np.linalg.norm(b)
-        
-        # Avoid division by zero
-        if mag_a == 0 or mag_b == 0:
-            raise ValueError("Vector magnitude cannot be zero")
-        
-        # Compute sin(theta)
-        sin_theta = mag_cross / (mag_a * mag_b)
-        
-        # Ensure sin_theta is within [-1, 1] for numerical precision
-        sin_theta = np.clip(sin_theta, -1, 1)
-        
-        # If signed is requested, determine the sign based on the cross product's direction
-        if signed:
-            if reference_axis is None:
-                # Default to z-axis (e.g., [0, 0, 1]) for reference
-                reference_axis = np.array([0, 0, 1])
-            else:
-                reference_axis = np.array(reference_axis)
-                if reference_axis.shape != (3,):
-                    raise ValueError("Reference axis must be 3-dimensional")
-            
-            # Compute the sign based on the dot product of cross product and reference axis
-            sign = np.sign(np.dot(cross_product, reference_axis))
-            sin_theta *= sign
-        
-        return sin_theta
-    
-    # Define unit vectors
-    unit_z = np.array([0, 0, 1])
-    CaplongAxis = np.array([1, 0, 0])
-    
-    # Convert pitch and roll to radians
-    pitch = np.radians(pitch_deg)
-    roll = np.radians(roll_deg)
-    
-    # Compute the normal vector to the plane (capf_vertical)
-    capf_vertical = rotation_y(-pitch) @ rotation_x(-roll) @ unit_z
-    capf_vertical = capf_vertical / np.linalg.norm(capf_vertical)
-    
-    # Normalize input vector
-    transformed_vector = transformed_vector / np.linalg.norm(transformed_vector)
-    
-    # Project vectors onto the plane perpendicular to capf_vertical
-    acProj = transformed_vector - np.dot(transformed_vector, capf_vertical) * capf_vertical
-    CaplongAxisProj = CaplongAxis - np.dot(CaplongAxis, capf_vertical) * capf_vertical
+def quaternion_to_euler(q):
+    """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
+    w, x, y, z = q
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = np.degrees(np.arctan2(t0, t1))
 
-    # print(f"acProj (before norm): {acProj},transformed_vector: {transformed_vector}")
-    
-    # Normalize projections
-    acProj = acProj / np.linalg.norm(acProj) if np.linalg.norm(acProj) != 0 else acProj
-    CaplongAxisProj = CaplongAxisProj / np.linalg.norm(CaplongAxisProj) if np.linalg.norm(CaplongAxisProj) != 0 else CaplongAxisProj
-    
-    # Compute the smallest angle using dot product
-    cos_theta = np.clip(np.dot(CaplongAxisProj, acProj), -1.0, 1.0)  # Clip to avoid numerical errors
-    theta = np.arccos(cos_theta)  # Angle in radians
-    theta_deg = np.degrees(theta)
+    t2 = +2.0 * (w * y - z * x)
+    t2 = np.clip(t2, -1.0, 1.0)
+    pitch_y = np.degrees(np.arcsin(t2))
 
-    sine = sin_theta_cross_product(CaplongAxisProj, acProj, signed=True, reference_axis= -1*capf_vertical )
-    # print(f"sin_theta_cross_product_value: {sine}")
-    
-    # # Define a 2D coordinate system in the plane
-    # # Basis vector 1: CaplongAxisProj (normalized)
-    # v = CaplongAxisProj
-    # # Basis vector 2: Perpendicular to u and capf_vertical
-    # u = np.cross(capf_vertical, v)
-    # u = u / np.linalg.norm(u) if np.linalg.norm(u) != 0 else u
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = np.degrees(np.arctan2(t3, t4))
 
-    # # Project vectors onto the 2D plane (u, v)
-    # acProj_2d = np.array([np.dot(acProj, u), np.dot(acProj, v)])
-    # CaplongAxisProj_2d = np.array([np.dot(CaplongAxisProj, u), np.dot(CaplongAxisProj, v)])
-    
-    # # Compute 2D cross product to determine direction
-    # cross_2d = np.cross(CaplongAxisProj_2d, acProj_2d)
-
-
-    # print(f"Yaw angle (degrees): {theta_deg}")
-    
-    # Determine counterclockwise angle
-    if sine > 0:
-        yaw = theta_deg  # acProj is counterclockwise from CaplongAxisProj
-    elif sine < 0:
-        yaw = 360 - theta_deg  # acProj is clockwise, so use 360 - theta
-    else:
-        yaw = 0 if theta_deg == 0 else 180  # Parallel or anti-parallel
-    
-    return yaw,sine,acProj,CaplongAxisProj,capf_vertical
+    return roll_x, pitch_y, yaw_z
 
 def live_plot():
-    fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    (ax1, ax2) = axs
+    fig, axs = plt.subplots(4, 1, figsize=(10, 16), sharex=True)
+    (ax1, ax2, ax3, ax4) = axs
     ax1.set_title('Raw Magnetometer (uT)')
     ax2.set_title('Lock-in AC Amplitude (uT)')
-    ax2.set_xlabel('Time (s)')
+    ax3.set_title('Euler Angles (degrees)')
+    ax4.set_title('Corrected Omega (deg/s)')
+    ax4.set_xlabel('Time (s)')
     lines1 = [ax1.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines2 = [ax2.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
+    lines3 = [ax3.plot([], [], label=lbl)[0] for lbl in ['Roll', 'Pitch', 'Yaw']]
+    lines4 = [ax4.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     ax1.set_ylim(-10000, 10000)
     ax2.set_ylim(-1000, 1000)
+    ax3.set_ylim(-180, 180)
+    ax4.set_ylim(-200, 200)  # Adjust based on expected omega range
     ax1.legend()
     ax2.legend()
+    ax3.legend()
+    ax4.legend()
 
     def init():
-        for l in lines1 + lines2:
+        for l in lines1 + lines2 + lines3 + lines4:
             l.set_data([], [])
-        return lines1 + lines2
+        return lines1 + lines2 + lines3 + lines4
 
     def update(frame):
         t = np.array(plot_time)
         if t.size == 0:
-            return lines1 + lines2
+            return lines1 + lines2 + lines3 + lines4
         t = t - t[0]
         data1 = [np.array(plot_mag_x), np.array(plot_mag_y), np.array(plot_mag_z)]
         data2 = [np.array(plot_amp_x), np.array(plot_amp_y), np.array(plot_amp_z)]
+        data3 = [np.array(plot_roll), np.array(plot_pitch), np.array(plot_yaw)]
+        data4 = [np.array(plot_omega_x), np.array(plot_omega_y), np.array(plot_omega_z)]
         for i in range(3):
             lines1[i].set_data(t, data1[i])
             lines2[i].set_data(t, data2[i])
+            lines3[i].set_data(t, data3[i])
+            lines4[i].set_data(t, data4[i])
         for ax in axs:
             ax.relim()
-            ax.autoscale_view()
-        return lines1 + lines2
+            ax.autoscale_view(scaley=False)
+        return lines1 + lines2 + lines3 + lines4
 
     ani = animation.FuncAnimation(fig, update, init_func=init, blit=True, interval=100)
     plt.tight_layout()
     plt.show()
 
 # Initialize filters and data queue
-kalman = KalmanFilter(process_noise_pose=0.005, process_noise_bias=0.0001, measurement_noise=0.1)
+filter = MadgwickFilter(beta=0.1, dt=0.0125)  # Using Madgwick instead of Mahony
+q = filter.init()
+
 lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
+
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
 
 def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
-
-    
-    pitch_kalman, roll_kalman, is_dynamic = kalman.update(accel_g, gyro_dps, current_time)
     if calibration_trigger.is_set():
         lockin.calibrate(mag_uT, current_time)
         calibration_trigger.clear()
+    
     mag_amplitudes, mag_phases = lockin.update(mag_uT, current_time)
-    return pitch_kalman, roll_kalman, mag_amplitudes, mag_phases, is_dynamic
+    
+    # Use raw magnetometer data for Madgwick filter, not lock-in amplitudes
+    q, error, omega_corrected = filter.update(
+        np.radians(gyro_dps), 
+        np.array(accel_g), 
+        np.array(mag_amplitudes)  # Using raw mag data for orientation estimation
+    )
+
+    return q, error, omega_corrected, mag_amplitudes, mag_phases
 
 def processing_thread():
     loop_timestamps = deque(maxlen=10)
@@ -370,7 +372,8 @@ def processing_thread():
                     current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get_nowait()
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                pitch_kalman, roll_kalman, mag_amplitudes, mag_phases, is_dynamic = future.result()
+                q, error, omega_corrected, mag_amplitudes, mag_phases = future.result()
+                roll, pitch, yaw = quaternion_to_euler(q)
 
                 loop_timestamps.append(loop_start_time)
                 loop_freq_hz = 0.0
@@ -379,25 +382,16 @@ def processing_thread():
                     if elapsed_time > 0:
                         loop_freq_hz = 9 / elapsed_time
 
-                yaw,sine,acProj,CaplongAxisProj,capf_vertical = find_yaw(pitch_kalman, roll_kalman, mag_amplitudes, mag_phases)
-
                 accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
 
                 print(
-                    f"Yaw: {yaw:.1f}°\tSine: {sine:.1f}°\t "if yaw is not None else "Yaw: N/A\t    ",
-                    f"Kalman Pitch: {pitch_kalman:.1f}°\t Roll: {roll_kalman:.1f}°,\t "
-                    f"Dynamic: {'Yes' if is_dynamic else 'No'},\t "
-                    f"accel_mag: {accel_mag:.3f} g\t"
-                    f"AccelX: {accel_g[0]:.2f}g\t AccelY: {accel_g[1]:.2f}g\t AccelZ: {accel_g[2]:.2f}g,\t "
-                    f"GyroX: {gyro_dps[0]:.1f}°/s\t GyroY: {gyro_dps[1]:.1f}°/s\t GyroZ: {gyro_dps[2]:.1f}°/s,\t "
-
-                    # f"acx: {acProj[0]:.1f}\tacy: {acProj[1]:.1f}\tacz: {acProj[2]:.1f}\t"
-                    # f"CaplongAxisProj x: {CaplongAxisProj[0]:.1f}\t  y: {CaplongAxisProj[1]:.1f}\t  z: {CaplongAxisProj[2]:.1f}\t"
-                    # f"Capf_vertical x: {capf_vertical[0]:.1f}\t y: {capf_vertical[1]:.1f}\t z: {capf_vertical[2]:.1f}\t",
-                    # # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t  "
-                    # f"AC Phases (°): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t"
-                    # f"Accel Mag: {accel_mag:.3f} g\t"
-                    # # f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
+                    f"Yaw: {yaw:.1f}°\t "
+                    f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    f"q: {q}\t"
+                    # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
+                    # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
+                    f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
+                    f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
                 )
 
                 plot_time.append(current_time)
@@ -407,6 +401,12 @@ def processing_thread():
                 plot_amp_x.append(mag_amplitudes[0])
                 plot_amp_y.append(mag_amplitudes[1])
                 plot_amp_z.append(mag_amplitudes[2])
+                plot_roll.append(roll)
+                plot_pitch.append(pitch)
+                plot_yaw.append(yaw)
+                plot_omega_x.append(np.degrees(omega_corrected[0]))
+                plot_omega_y.append(np.degrees(omega_corrected[1]))
+                plot_omega_z.append(np.degrees(omega_corrected[2]))
                 data_queue.task_done()
             except queue.Empty:
                 continue
