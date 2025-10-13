@@ -10,6 +10,11 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from concurrent.futures import ThreadPoolExecutor
 import keyboard  # Added for keyboard input detection
+import socket
+import json
+import struct
+from scipy.spatial.transform import Rotation
+
 
 # For real-time plotting (buffer length: 1000 samples)
 PLOT_BUFFER_LEN = 1000
@@ -27,6 +32,13 @@ plot_omega_x = deque(maxlen=PLOT_BUFFER_LEN)
 plot_omega_y = deque(maxlen=PLOT_BUFFER_LEN)
 plot_omega_z = deque(maxlen=PLOT_BUFFER_LEN)
 
+# TCP Server for sending data to aprilTagLocalization
+TCP_SERVER_HOST = 'localhost'
+TCP_SERVER_PORT = 12347  # New port for bt_angleEst data
+tcp_clients = []
+tcp_server_running = False
+tcp_server_socket = None
+
 # Define Nordic UART Service (NUS) UUIDs
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # TX from device perspective
@@ -38,7 +50,7 @@ frequency_hz = 0.0
 timestamp_deque = deque(maxlen=10)
 
 class MadgwickFilter:
-    def __init__(self, beta=0.1, dt=0.01):
+    def __init__(self, beta=0.1):
         """
         Initialize Madgwick filter parameters.
         
@@ -47,8 +59,8 @@ class MadgwickFilter:
             dt (float): Sample period [s]
         """
         self.beta = beta
-        self.dt = dt
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])  # Initial quaternion [w, x, y, z]
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        self.last_time = None  # Track last update time
         
         # Reference vectors in Earth frame
         self.gravity_ref = np.array([0.0, 0.0, 1.0])  # Gravity points down
@@ -90,54 +102,7 @@ class MadgwickFilter:
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         return self.q
 
-    def update_imu(self, gyro, accel):
-        """
-        Update Madgwick filter with gyro and accelerometer data (6DOF).
-        
-        Args:
-            gyro (np.ndarray): Angular velocity [rad/s] (3x1: [wx, wy, wz])
-            accel (np.ndarray): Accelerometer data [g] (3x1: [ax, ay, az])
-        
-        Returns:
-            np.ndarray: Updated quaternion
-        """
-        # Normalize accelerometer
-        accel_normalized = self.normalize_vector(accel)
-        
-        # Extract quaternion elements
-        q0, q1, q2, q3 = self.q
-        
-        # Gradient descent algorithm corrective step
-        # Objective function and Jacobian for accelerometer
-        f = np.array([
-            2.0 * (q1*q3 - q0*q2) - accel_normalized[0],
-            2.0 * (q0*q1 + q2*q3) - accel_normalized[1],
-            2.0 * (0.5 - q1*q1 - q2*q2) - accel_normalized[2]
-        ])
-        
-        J = np.array([
-            [-2.0*q2, 2.0*q3, -2.0*q0, 2.0*q1],
-            [2.0*q1, 2.0*q0, 2.0*q3, 2.0*q2],
-            [0.0, -4.0*q1, -4.0*q2, 0.0]
-        ])
-        
-        # Compute gradient
-        gradient = J.T @ f
-        if np.linalg.norm(gradient) > 0:
-            gradient = gradient / np.linalg.norm(gradient)
-        
-        # Compute quaternion derivative from gyro and gradient descent
-        q_dot_gyro = 0.5 * self.quaternion_multiply(self.q, np.array([0.0, *gyro]))
-        q_dot_gradient = self.beta * gradient
-        
-        # Integrate rate of change of quaternion
-        q_dot = q_dot_gyro - q_dot_gradient
-        self.q = self.q + q_dot * self.dt
-        self.q = self.normalize_quaternion(self.q)
-        
-        return self.q
-
-    def update(self, gyro, accel, mag):
+    def update(self, gyro, accel, mag, current_time=None):
         """
         Update Madgwick filter with gyro, accelerometer and magnetometer data (9DOF).
         
@@ -149,6 +114,17 @@ class MadgwickFilter:
         Returns:
             tuple: Updated quaternion, error vector, corrected gyro
         """
+
+        # Calculate actual dt
+        if current_time is None:
+            current_time = time.time()
+            
+        if self.last_time is None:
+            dt = 0.01  # Initial guess
+        else:
+            dt = current_time - self.last_time
+            
+        self.last_time = current_time
         # Normalize accelerometer and magnetometer
         accel_normalized = self.normalize_vector(accel)
         mag_normalized = self.normalize_vector(mag)
@@ -162,8 +138,8 @@ class MadgwickFilter:
             self.quaternion_conjugate(self.q)
         )[1:]
         
-        b = np.array([0.0, np.linalg.norm([h[0], h[1]]), 0.0, h[2]])
-        
+        b = np.array([0.0, np.linalg.norm([self.magnetic_ref[0], self.magnetic_ref[1]]), 
+                        0.0, self.magnetic_ref[2]])        
         # Gradient descent algorithm corrective step
         # Objective function and Jacobian for accelerometer and magnetometer
         f = np.array([
@@ -199,7 +175,7 @@ class MadgwickFilter:
         
         # Integrate rate of change of quaternion
         q_dot = q_dot_gyro - q_dot_gradient
-        self.q = self.q + q_dot * self.dt
+        self.q = self.q + q_dot * dt
         self.q = self.normalize_quaternion(self.q)
         
         # Return error vector for debugging (approximated from gradient)
@@ -337,7 +313,7 @@ def live_plot():
     plt.show()
 
 # Initialize filters and data queue
-filter = MadgwickFilter(beta=0.1, dt=0.0125)  # Using Madgwick instead of Mahony
+filter = MadgwickFilter(beta=0.1)# Using Madgwick instead of Mahony
 q = filter.init()
 
 lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
@@ -354,9 +330,10 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
     
     # Use raw magnetometer data for Madgwick filter, not lock-in amplitudes
     q, error, omega_corrected = filter.update(
-        np.radians(gyro_dps), 
-        np.array(accel_g), 
-        np.array(mag_amplitudes)  # Using raw mag data for orientation estimation
+        np.radians(gyro_dps),
+        np.array(accel_g),
+        np.array(mag_amplitudes),
+        current_time=current_time
     )
 
     return q, error, omega_corrected, mag_amplitudes, mag_phases
@@ -373,6 +350,12 @@ def processing_thread():
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
                 q, error, omega_corrected, mag_amplitudes, mag_phases = future.result()
+
+                # # rotate q
+                # q = rotate_quaternion_scipy(q, angle_degrees=180, axis='x')
+                # q = rotate_quaternion_scipy(q, angle_degrees=90, axis='z')
+
+
                 roll, pitch, yaw = quaternion_to_euler(q)
 
                 loop_timestamps.append(loop_start_time)
@@ -384,15 +367,21 @@ def processing_thread():
 
                 accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
 
+
+
                 print(
-                    f"Yaw: {yaw:.1f}°\t "
-                    f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    # f"Yaw: {yaw:.1f}°\t "
+                    # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
                     f"q: {q}\t"
-                    # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
-                    # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
+                    f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
+                    f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
+                    # # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
+                    # # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
-                    f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
+                    # f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
                 )
+                send_to_tcp_clients(q, mag_uT)
+
 
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
@@ -412,6 +401,23 @@ def processing_thread():
                 continue
             except Exception as e:
                 print(f"Processing thread error: {e}")
+
+def rotate_quaternion_scipy(q, angle_degrees, axis='z'):
+    """
+    Rotate quaternion using scipy's Rotation class
+    """
+    # Create rotation from axis-angle
+    axis_rotation = Rotation.from_rotvec(np.radians(angle_degrees) * np.eye(3)['xyz'.index(axis)])
+    
+    # Convert input quaternion to scipy Rotation
+    current_rot = Rotation.from_quat([q[1], q[2], q[3], q[0]])  # [x, y, z, w] format
+    
+    # Apply rotation
+    result_rot = axis_rotation * current_rot
+    
+    # Convert back to [w, x, y, z] format
+    result_quat = result_rot.as_quat()  # [x, y, z, w]
+    return np.array([result_quat[3], result_quat[0], result_quat[1], result_quat[2]])
 
 def notification_handler(sender, data):
     global last_time, frequency_hz
@@ -449,6 +455,71 @@ def notification_handler(sender, data):
         mag_uT[2] = temp
         data_queue.put((current_time, accel_g, gyro_dps, mag_uT, running_freq_hz))
 
+def send_to_tcp_clients(q, mag_uT):
+    """Send quaternion and magnetometer data to connected TCP clients."""
+    global tcp_clients
+    if not tcp_clients or not tcp_server_running:
+        
+        return
+    
+    data = {
+        'qw': float(q[0]),
+        'qx': float(q[1]),
+        'qy': float(q[2]),
+        'qz': float(q[3]),
+        'magX': float(mag_uT[0]),
+        'magY': float(mag_uT[1]),
+        'magZ': float(mag_uT[2]),
+        'timestamp': time.time()
+    }
+    
+    data_str = json.dumps(data)
+    data_bytes = data_str.encode('utf-8')
+    length = len(data_bytes)
+    
+    clients_to_remove = []
+    for client_socket in tcp_clients:
+        try:
+            client_socket.sendall(struct.pack('>I', length))
+            client_socket.sendall(data_bytes)
+        except (socket.error, BrokenPipeError):
+            clients_to_remove.append(client_socket)
+    
+    # Remove disconnected clients
+    for client_socket in clients_to_remove:
+        tcp_clients.remove(client_socket)
+        client_socket.close()
+
+def tcp_server_thread():
+    """Run TCP server to send data to aprilTagLocalization."""
+    global tcp_server_running, tcp_server_socket, tcp_clients
+    
+    tcp_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_server_socket.bind((TCP_SERVER_HOST, TCP_SERVER_PORT))
+    tcp_server_socket.listen(5)
+    tcp_server_socket.settimeout(1.0)
+    tcp_server_running = True
+    
+    print(f"BT AngleEst TCP server listening on {TCP_SERVER_HOST}:{TCP_SERVER_PORT}")
+    
+    while tcp_server_running:
+        try:
+            client_socket, addr = tcp_server_socket.accept()
+            client_socket.settimeout(1.0)
+            tcp_clients.append(client_socket)
+            print(f"BT AngleEst: Client connected from {addr}")
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if tcp_server_running:
+                print(f"BT AngleEst TCP server error: {e}")
+    
+    # Cleanup
+    for client_socket in tcp_clients:
+        client_socket.close()
+    tcp_server_socket.close()
+
 def keyboard_listener():
     """Listen for keyboard input to trigger calibration."""
     print("Press 'c' to calibrate the sensor's phase angles when in known orientation.")
@@ -484,10 +555,16 @@ async def connect_and_receive(device_name):
 
 async def main():
     device_name = "Nordic_UART_Service"
+
     processing_thread_instance = threading.Thread(target=processing_thread, daemon=True)
     processing_thread_instance.start()
+
     keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
     keyboard_thread.start()
+
+    # Start TCP server thread
+    tcp_thread = threading.Thread(target=tcp_server_thread, daemon=True)
+    tcp_thread.start()
     try:
         await connect_and_receive(device_name)
     except Exception as e:
