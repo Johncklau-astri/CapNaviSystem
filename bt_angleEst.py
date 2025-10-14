@@ -350,9 +350,49 @@ def processing_thread():
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
                 q, error, omega_corrected, mag_amplitudes, mag_phases = future.result()
+                def quaternion_A_to_B(quat_A):
+                    """
+                    Convert quaternion from system A to system B such that
+                    the same physical orientation results in the same Euler angles.
+                    
+                    System B has:
+                    - Same x-axis as system A
+                    - Opposite y-axis (A_y = -B_y)  
+                    - Opposite z-axis (A_z = -B_z)
+                    
+                    Parameters:
+                    quat_A: quaternion in system A [x, y, z, w] format
+                    
+                    Returns:
+                    quat_B: quaternion in system B [x, y, z, w] format
+                    """
+                    quat_A = np.array(quat_A, dtype=float)
+                    if quat_A.shape != (4,):
+                        raise ValueError("Quaternion must be a 4-element array [x, y, z, w]")
+                    
+                    # Normalize the input quaternion
+                    quat_A = quat_A / np.linalg.norm(quat_A)
+                    
+                    # For the same physical orientation in different coordinate systems,
+                    # we need to account for the axis directions
+                    # Since y and z axes are flipped, we need to adjust the quaternion components
+                    quat_B = quat_A.copy()
+                    
+                    # When y and z axes are flipped, we adjust the quaternion components:
+                    # x component stays the same (x-axis unchanged)
+                    # y and z components change sign (due to axis flips)
+                    # w component stays the same
+                    quat_B[1] = -quat_B[1]  # y component
+                    quat_B[2] = -quat_B[2]  # z component
+                    
+                    return quat_B
+
+                mod_q = quaternion_A_to_B(np.array([q[1], q[2], q[3], q[0]]))  # Convert to [x, y, z, w] and then to system B
+                mod_q = np.array([mod_q[3], mod_q[0], mod_q[1], mod_q[2]])  # Back to [w, x, y, z] format
+
+                
 
                 # # rotate q
-                # q = rotate_quaternion_scipy(q, angle_degrees=180, axis='x')
                 # q = rotate_quaternion_scipy(q, angle_degrees=90, axis='z')
 
 
@@ -373,14 +413,15 @@ def processing_thread():
                     # f"Yaw: {yaw:.1f}°\t "
                     # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
                     f"q: {q}\t"
+                    f"mod_q: {mod_q}\t"
                     f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
-                    f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
+                    # f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
                     # # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
                     # # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
                     # f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
                 )
-                send_to_tcp_clients(q, mag_uT)
+                send_to_tcp_clients(mod_q, mag_uT)
 
 
                 plot_time.append(current_time)
