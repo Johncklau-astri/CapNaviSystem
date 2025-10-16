@@ -15,6 +15,7 @@ import json
 import struct
 from scipy.spatial.transform import Rotation
 
+mag_uT_buffer = deque(maxlen=250)
 
 # For real-time plotting (buffer length: 1000 samples)
 PLOT_BUFFER_LEN = 1000
@@ -49,8 +50,13 @@ last_time = time.time()
 frequency_hz = 0.0
 timestamp_deque = deque(maxlen=10)
 
+# Connection management
+connection_active = True
+max_reconnection_attempts = 10
+reconnection_delay = 5  # seconds
+
 class MadgwickFilter:
-    def __init__(self, beta=0.1):
+    def __init__(self, beta=0.5):
         """
         Initialize Madgwick filter parameters.
         
@@ -246,6 +252,43 @@ class LockInAmplifier:
             phase_angles.append(np.degrees(phase))
         return amplitudes, phase_angles
 
+def quaternion_A_to_B(quat_A):
+    """
+    Convert quaternion from system A to system B such that
+    the same physical orientation results in the same Euler angles.
+    
+    System B has:
+    - Same x-axis as system A
+    - Opposite y-axis (A_y = -B_y)  
+    - Opposite z-axis (A_z = -B_z)
+    
+    Parameters:
+    quat_A: quaternion in system A [x, y, z, w] format
+    
+    Returns:
+    quat_B: quaternion in system B [x, y, z, w] format
+    """
+    quat_A = np.array(quat_A, dtype=float)
+    if quat_A.shape != (4,):
+        raise ValueError("Quaternion must be a 4-element array [x, y, z, w]")
+    
+    # Normalize the input quaternion
+    quat_A = quat_A / np.linalg.norm(quat_A)
+    
+    # For the same physical orientation in different coordinate systems,
+    # we need to account for the axis directions
+    # Since y and z axes are flipped, we need to adjust the quaternion components
+    quat_B = quat_A.copy()
+    
+    # When y and z axes are flipped, we adjust the quaternion components:
+    # x component stays the same (x-axis unchanged)
+    # y and z components change sign (due to axis flips)
+    # w component stays the same
+    quat_B[1] = -quat_B[1]  # y component
+    quat_B[2] = -quat_B[2]  # z component
+    
+    return quat_B
+
 def quaternion_to_euler(q):
     """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
     w, x, y, z = q
@@ -313,7 +356,7 @@ def live_plot():
     plt.show()
 
 # Initialize filters and data queue
-filter = MadgwickFilter(beta=0.1)# Using Madgwick instead of Mahony
+filter = MadgwickFilter()# Using Madgwick instead of Mahony
 q = filter.init()
 
 lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
@@ -350,51 +393,13 @@ def processing_thread():
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
                 q, error, omega_corrected, mag_amplitudes, mag_phases = future.result()
-                def quaternion_A_to_B(quat_A):
-                    """
-                    Convert quaternion from system A to system B such that
-                    the same physical orientation results in the same Euler angles.
-                    
-                    System B has:
-                    - Same x-axis as system A
-                    - Opposite y-axis (A_y = -B_y)  
-                    - Opposite z-axis (A_z = -B_z)
-                    
-                    Parameters:
-                    quat_A: quaternion in system A [x, y, z, w] format
-                    
-                    Returns:
-                    quat_B: quaternion in system B [x, y, z, w] format
-                    """
-                    quat_A = np.array(quat_A, dtype=float)
-                    if quat_A.shape != (4,):
-                        raise ValueError("Quaternion must be a 4-element array [x, y, z, w]")
-                    
-                    # Normalize the input quaternion
-                    quat_A = quat_A / np.linalg.norm(quat_A)
-                    
-                    # For the same physical orientation in different coordinate systems,
-                    # we need to account for the axis directions
-                    # Since y and z axes are flipped, we need to adjust the quaternion components
-                    quat_B = quat_A.copy()
-                    
-                    # When y and z axes are flipped, we adjust the quaternion components:
-                    # x component stays the same (x-axis unchanged)
-                    # y and z components change sign (due to axis flips)
-                    # w component stays the same
-                    quat_B[1] = -quat_B[1]  # y component
-                    quat_B[2] = -quat_B[2]  # z component
-                    
-                    return quat_B
+
+                # Store mag_uT in buffer and calculate average
+                mag_uT_buffer.append(mag_uT)
+                avg_mag_uT = np.mean(list(mag_uT_buffer), axis=0) if mag_uT_buffer else mag_uT
 
                 mod_q = quaternion_A_to_B(np.array([q[1], q[2], q[3], q[0]]))  # Convert to [x, y, z, w] and then to system B
                 mod_q = np.array([mod_q[3], mod_q[0], mod_q[1], mod_q[2]])  # Back to [w, x, y, z] format
-
-                
-
-                # # rotate q
-                # q = rotate_quaternion_scipy(q, angle_degrees=90, axis='z')
-
 
                 roll, pitch, yaw = quaternion_to_euler(q)
 
@@ -407,22 +412,22 @@ def processing_thread():
 
                 accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
 
-
-
                 print(
                     # f"Yaw: {yaw:.1f}°\t "
                     # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
-                    f"q: {q}\t"
-                    f"mod_q: {mod_q}\t"
-                    f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
+                    f"q: {q[0]:.2f} , {q[1]:.2f} , {q[2]:.2f} , {q[3]:.2f}\t"
+                    f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
+                    f"Avg Mag (uT): [X: {avg_mag_uT[0]:.1f}, Y: {avg_mag_uT[1]:.1f}, Z: {avg_mag_uT[2]:.1f}]\t "
+                    f"Phases (deg): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t "
+                    # f"Cur. Time: {current_time:.2f}\t "
+                    # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
                     # f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
                     # # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
                     # # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
-                    # f"BLE Freq: {running_freq_hz:.1f} Hz, Loop Freq: {loop_freq_hz:.1f} Hz, Queue Size: {data_queue.qsize()}"
+                    f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
                 )
-                send_to_tcp_clients(mod_q, mag_uT)
-
+                send_to_tcp_clients(mod_q, avg_mag_uT)
 
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
@@ -572,27 +577,76 @@ def keyboard_listener():
         time.sleep(0.1)
 
 async def connect_and_receive(device_name):
+    global connection_active
+    
     print(f"Scanning for device with name: {device_name}...")
-    devices = await BleakScanner.discover()
-    target_device = None
-    for device in devices:
-        if device.name == device_name:
-            target_device = device
-            break
-    if not target_device:
-        print(f"Device {device_name} not found!")
-        return
-    print(f"Found device: {target_device.name} ({target_device.address})")
-    async with BleakClient(target_device.address) as client:
-        print(f"Connected to {target_device.name}")
-        await client.start_notify(NUS_TX_UUID, notification_handler)
-        print("Notifications enabled. Waiting for data...")
+    
+    reconnection_attempts = 0
+    
+    while connection_active and reconnection_attempts < max_reconnection_attempts:
         try:
-            while True:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            await client.stop_notify(NUS_TX_UUID)
-            print("Disconnected")
+            devices = await BleakScanner.discover()
+            target_device = None
+            for device in devices:
+                if device.name == device_name:
+                    target_device = device
+                    break
+            
+            if not target_device:
+                print(f"Device {device_name} not found! Attempt {reconnection_attempts + 1}/{max_reconnection_attempts}")
+                reconnection_attempts += 1
+                if reconnection_attempts < max_reconnection_attempts:
+                    print(f"Retrying in {reconnection_delay} seconds...")
+                    await asyncio.sleep(reconnection_delay)
+                continue
+            
+            print(f"Found device: {target_device.name} ({target_device.address})")
+            print(f"Attempting connection {reconnection_attempts + 1}/{max_reconnection_attempts}...")
+            
+            # Reset reconnection attempts on successful discovery
+            reconnection_attempts = 0
+            
+            async with BleakClient(
+                target_device.address, 
+                timeout=30.0,
+                winrt=dict(use_cached_services=False)  # Windows-specific fix
+            ) as client:
+                print(f"Connected to {target_device.name}")
+                await client.start_notify(NUS_TX_UUID, notification_handler)
+                print("Notifications enabled. Receiving data...")
+                
+                # Monitor connection status
+                while client.is_connected and connection_active:
+                    await asyncio.sleep(1)
+                
+                if not client.is_connected:
+                    print("Device disconnected unexpectedly")
+                    # Try to stop notifications gracefully
+                    try:
+                        await client.stop_notify(NUS_TX_UUID)
+                    except:
+                        pass
+                    
+                if connection_active:
+                    print(f"Attempting reconnection in {reconnection_delay} seconds...")
+                    await asyncio.sleep(reconnection_delay)
+                    
+        except asyncio.TimeoutError:
+            print(f"Connection timeout on attempt {reconnection_attempts + 1}/{max_reconnection_attempts}")
+            reconnection_attempts += 1
+            if reconnection_attempts < max_reconnection_attempts:
+                print(f"Retrying in {reconnection_delay} seconds...")
+                await asyncio.sleep(reconnection_delay)
+        except Exception as e:
+            print(f"Connection error on attempt {reconnection_attempts + 1}/{max_reconnection_attempts}: {e}")
+            reconnection_attempts += 1
+            if reconnection_attempts < max_reconnection_attempts:
+                print(f"Retrying in {reconnection_delay} seconds...")
+                await asyncio.sleep(reconnection_delay)
+    
+    if reconnection_attempts >= max_reconnection_attempts:
+        print(f"Failed to connect after {max_reconnection_attempts} attempts")
+    print("Connection manager stopped")
 
 async def main():
     device_name = "Nordic_UART_Service"
@@ -606,15 +660,32 @@ async def main():
     # Start TCP server thread
     tcp_thread = threading.Thread(target=tcp_server_thread, daemon=True)
     tcp_thread.start()
+    
     try:
         await connect_and_receive(device_name)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in main: {e}")
+    finally:
+        global connection_active
+        connection_active = False
 
 def start_asyncio():
     asyncio.run(main())
 
+def stop_connection():
+    """Function to stop the connection manager from another thread"""
+    global connection_active
+    connection_active = False
+
 if __name__ == "__main__":
     asyncio_thread = threading.Thread(target=start_asyncio, daemon=True)
     asyncio_thread.start()
-    live_plot()
+    
+    try:
+        live_plot()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        stop_connection()
+    except Exception as e:
+        print(f"Plot error: {e}")
+        stop_connection()
