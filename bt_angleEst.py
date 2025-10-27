@@ -252,46 +252,56 @@ class LockInAmplifier:
             phase_angles.append(np.degrees(phase))
         return amplitudes, phase_angles
 
-def quaternion_A_to_B(quat_A):
+
+def quaternion_a_to_b(q_a):
     """
-    Convert quaternion from system A to system B such that
-    the same physical orientation results in the same Euler angles.
+    Convert quaternion from system A to system B.
     
-    System B has:
-    - Same x-axis as system A
-    - Opposite y-axis (A_y = -B_y)  
-    - Opposite z-axis (A_z = -B_z)
+    System A: X→North, Y→East, Z→Down
+    System B: X→West, Y→South, Z→Up
+    
+    Transformations:
+    - X rotation in A = -Y rotation in B
+    - Y rotation in A = -X rotation in B  
+    - Z rotation in A = -Z rotation in B
     
     Parameters:
-    quat_A: quaternion in system A [x, y, z, w] format
+    q_a: quaternion in system A as [w, x, y, z] or (w, x, y, z)
     
     Returns:
-    quat_B: quaternion in system B [x, y, z, w] format
+    q_b: quaternion in system B as [w, x, y, z]
     """
-    quat_A = np.array(quat_A, dtype=float)
-    if quat_A.shape != (4,):
-        raise ValueError("Quaternion must be a 4-element array [x, y, z, w]")
     
-    # Normalize the input quaternion
-    quat_A = quat_A / np.linalg.norm(quat_A)
+    # Ensure quaternion is in numpy array format
+    q_a = np.array(q_a)
     
-    # For the same physical orientation in different coordinate systems,
-    # we need to account for the axis directions
-    # Since y and z axes are flipped, we need to adjust the quaternion components
-    quat_B = quat_A.copy()
+    # Extract components
+    w, x, y, z = q_a
     
-    # When y and z axes are flipped, we adjust the quaternion components:
-    # x component stays the same (x-axis unchanged)
-    # y and z components change sign (due to axis flips)
-    # w component stays the same
-    quat_B[1] = -quat_B[1]  # y component
-    quat_B[2] = -quat_B[2]  # z component
+    # Create transformation quaternion that maps:
+    # A_X → -B_Y, A_Y → -B_X, A_Z → -B_Z
+    # This is equivalent to a 90-degree rotation around the Z-axis
+    # followed by appropriate sign changes
     
-    return quat_B
+    # The transformation can be represented as swapping axes with sign changes:
+    # x_b = -y_a, y_b = -x_a, z_b = -z_a
+    
+    # Construct the transformed quaternion
+    q_b = np.array([w, -y, -x, -z])
+    
+    # Normalize the result to ensure it's a valid unit quaternion
+    q_b = q_b / np.linalg.norm(q_b)
+    
+    return q_b
+
 
 def quaternion_to_euler(q):
-    """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
+    """Convert quaternion to Euler angles with modified coordinate system.
+    Positive pitch = -X rotation, Positive roll = -Y rotation, Yaw = +Z rotation.
+    """
     w, x, y, z = q
+    
+    # Calculate the standard conversions
     t0 = +2.0 * (w * x + y * z)
     t1 = +1.0 - 2.0 * (x * x + y * y)
     roll_x = np.degrees(np.arctan2(t0, t1))
@@ -303,7 +313,14 @@ def quaternion_to_euler(q):
     t3 = +2.0 * (w * z + x * y)
     t4 = +1.0 - 2.0 * (y * y + z * z)
     yaw_z = np.degrees(np.arctan2(t3, t4))
-
+    
+    # Apply coordinate system transformation
+    # Positive pitch = -X rotation → negate pitch
+    # Positive roll = -Y rotation → negate roll
+    # Yaw remains unchanged
+    roll_x = -roll_x    # Positive roll = -Y rotation
+    pitch_y = -pitch_y  # Positive pitch = -X rotation
+    
     return roll_x, pitch_y, yaw_z
 
 def live_plot():
@@ -355,6 +372,35 @@ def live_plot():
     plt.tight_layout()
     plt.show()
 
+
+def rotate_quaternion_z_neg90_manual(q):
+    """
+    Rotate quaternion by -90 degrees about Z-axis using manual quaternion multiplication.
+    
+    Args:
+        q: Quaternion in [w, x, y, z] format
+        
+    Returns:
+        Rotated quaternion in [w, x, y, z] format
+    """
+    # Quaternion for -90 degree rotation about Z-axis
+    angle_rad = np.radians(-90)
+    w_rot = np.cos(angle_rad / 2)
+    z_rot = np.sin(angle_rad / 2)
+    rotation_quat = np.array([w_rot, 0, 0, z_rot])  # [w, x, y, z]
+    
+    # Quaternion multiplication: q_result = rotation_quat * q
+    w1, x1, y1, z1 = rotation_quat
+    w2, x2, y2, z2 = q
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return np.array([w, x, y, z])
+
+
 # Initialize filters and data queue
 filter = MadgwickFilter()# Using Madgwick instead of Mahony
 q = filter.init()
@@ -398,10 +444,12 @@ def processing_thread():
                 mag_uT_buffer.append(mag_uT)
                 avg_mag_uT = np.mean(list(mag_uT_buffer), axis=0) if mag_uT_buffer else mag_uT
 
-                mod_q = quaternion_A_to_B(np.array([q[1], q[2], q[3], q[0]]))  # Convert to [x, y, z, w] and then to system B
-                mod_q = np.array([mod_q[3], mod_q[0], mod_q[1], mod_q[2]])  # Back to [w, x, y, z] format
+                mod_q = rotate_quaternion_z_neg90_manual(q)
+                mod_q = quaternion_a_to_b(mod_q)
 
-                roll, pitch, yaw = quaternion_to_euler(q)
+               
+
+                pitch , roll,  yaw = quaternion_to_euler(mod_q)
 
                 loop_timestamps.append(loop_start_time)
                 loop_freq_hz = 0.0
@@ -413,8 +461,8 @@ def processing_thread():
                 accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
 
                 print(
-                    # f"Yaw: {yaw:.1f}°\t "
-                    # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    f"Yaw: {yaw:.1f}°\t "
+                    f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
                     f"q: {q[0]:.2f} , {q[1]:.2f} , {q[2]:.2f} , {q[3]:.2f}\t"
                     f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
                     f"Avg Mag (uT): [X: {avg_mag_uT[0]:.1f}, Y: {avg_mag_uT[1]:.1f}, Z: {avg_mag_uT[2]:.1f}]\t "
@@ -490,6 +538,7 @@ def notification_handler(sender, data):
         accel_g[0] = accel_g[1]
         accel_g[1] = temp
 
+
         temp = -gyro_dps[0]
         gyro_dps[0] = -gyro_dps[1]
         gyro_dps[1] = temp
@@ -499,6 +548,11 @@ def notification_handler(sender, data):
         temp = mag_uT[0]
         mag_uT[0] = mag_uT[2]
         mag_uT[2] = temp
+
+
+
+
+
         data_queue.put((current_time, accel_g, gyro_dps, mag_uT, running_freq_hz))
 
 def send_to_tcp_clients(q, mag_uT):
