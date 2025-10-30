@@ -34,14 +34,13 @@ NUM_CALIBRATION_FRAMES = 30
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
-cube1MagOffset_X = 0.0
-cube1MagOffset_Y = 0.0
-cube1MagOffset_Z = 0.112
+cube2MagOffset_X = 0.0
+cube2MagOffset_Y = 0.0
+cube2MagOffset_Z = 0.112
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
 MOTOR_SERVER_PORT = 12345
 BT_ANGLE_EST_PORT = 12347  # Port for receiving data from bt_angleEst
-FONT_SCALE = 1.8
 
 # Global variables
 magX = 0.0
@@ -632,7 +631,7 @@ def draw_text_with_background(frame, text, org, font, font_scale, color, thickne
     top_left = (org[0] - 5, org[1] - text_size[1] - 5)
     bottom_right = (org[0] + text_size[0] + 5, org[1] + baseline + 5)
     overlay = frame.copy()
-    cv2.rectangle(overlay, top_left, bottom_right, bg_color, -1)
+    # cv2.rectangle(overlay, top_left, bottom_right, bg_color, -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
     cv2.putText(frame, text, org, font, font_scale, color, thickness)
 
@@ -880,10 +879,16 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 R_cube1_camera = None
                 R_cube2_camera = None
                 R_worldCube_camera = None
-                bt_quat_global = None
+                btcap_global = None
                 R_cube2_global = None
                 R_cap_cube2 = None
                 R_btcap_cube2 = None
+                R_cap_global = None
+                R_cap_mag = None
+                R_btcap_mag = None
+
+                est_pos_ref = None
+                t_cube1_cube2_tag = None
 
                 worldCube_center_camera = None
                 cube1_center_camera = None
@@ -911,6 +916,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         
                     worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
                     if worldCube_center_camera is not None:
+                        print(f"World Cube Center Camera: {worldCube_center_camera}")
                         worldCube_center_z_buffer.append(worldCube_center_camera[2])
                         if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             worldCube_center_z_buffer.pop(0)
@@ -928,9 +934,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
                     
                     
-                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[3, 4, 5], reference_tag_id=4)
+                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1, 2], reference_tag_id=4)
                     cube1_center_text = "Cube 1 Center: Not detected"
                     if cube1_center_camera is not None:
+                        print(f"Cube 1 Center Camera: {cube1_center_camera}")
                         cube1_center_z_buffer.append(cube1_center_camera[2])
                         if len(cube1_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             cube1_center_z_buffer.pop(0)
@@ -942,19 +949,18 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_cube1_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube1_center), 8, (255, 255, 0), -1)
 
-                        R_cube1_camera = compute_cube_orientation(tags, [3, 4, 5])
+                        R_cube1_camera = compute_cube_orientation(tags, [1, 2])
                         cube1_rvec_camera, _ = cv2.Rodrigues(R_cube1_camera)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube1_rvec_camera, cube1_center_camera_smoothed, AXIS_LENGTH, img_cube1_center)
-                        draw_text_with_background(frame_undistorted, "Cap", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        draw_text_with_background(frame_undistorted, "CAP", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                         cube1_center_text = f"Cube 1 Center: x={cube1_center_camera_smoothed[0]:.3f} m, y={cube1_center_camera_smoothed[1]:.3f} m, z={cube1_center_camera_smoothed[2]:.3f} m"
                     
-                    cube2_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[0, 1, 2], reference_tag_id=1)
-                    cube2X = 0
-                    cube2Y = 0
-                    cube2Z = 0
+                    cube2_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[3, 4, 5], reference_tag_id=1)
+
                     cube2_center_text = "Cube 2 Center: Not detected"
                     cube2_orient_text = "Cube 2 Orient: Not detected"
                     if cube2_center_camera is not None:
+                        print(f"Cube 2 Center Camera: {cube2_center_camera}")
                         cube2_center_z_buffer.append(cube2_center_camera[2])
                         if len(cube2_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             cube2_center_z_buffer.pop(0)
@@ -965,107 +971,109 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_points, _ = cv2.projectPoints(cube2_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_cube2_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube2_center), 8, (0, 255, 255), -1)
-                        R_cube2_camera = compute_cube_orientation(tags, [0, 1, 2])
+                        R_cube2_camera = compute_cube_orientation(tags, [3, 4, 5])
                         cube2_rvec_camera, _ = cv2.Rodrigues(R_cube2_camera)
-                        draw_text_with_background(frame_undistorted, "Mag", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec_camera, cube2_center_camera_smoothed, AXIS_LENGTH, img_cube2_center)
 
                     ## Safety check: Ensure cube centers are not too close in image
-                    distance = np.linalg.norm(img_cube1_center - img_cube2_center)
-                    if distance < 20:
-                        print(f"Cube centers too close in image: {distance:.2f} pixels")    
+                    if(cube1_center_camera is not None and cube2_center_camera is not None):
+                        distance = np.linalg.norm(img_cube1_center - img_cube2_center)
+                        if distance < 20:
+                            print(f"Cube centers too close in image: {distance:.2f} pixels")
+                        
 
                     # Get latest BT data
                     latest_bt_data = get_latest_bt_data()
                     if latest_bt_data:
                         with bt_data_lock:
-                            magX = -latest_bt_data.get('magX', 0.0)
-                            magY = latest_bt_data.get('magY', 0.0)
+
+
+                            magX = -latest_bt_data.get('magY', 0.0)
+                            magY = -latest_bt_data.get('magX', 0.0)
                             magZ = -latest_bt_data.get('magZ', 0.0)
-                            bt_quat_global = [
+                            btcap_global = [
                                 latest_bt_data.get('qw', 1.0),
                                 latest_bt_data.get('qx', 0.0),
                                 latest_bt_data.get('qy', 0.0),
                                 latest_bt_data.get('qz', 0.0)
-                            ]    
+                            ]
+
                     
                     ## Calculating relative position of Cap and Mag using TAG
                     if cube1_center_camera is not None and cube2_center_camera is not None:
-                        cube2_center_ref = transform_to_ref_cube_frame(cube2_center_camera_smoothed, cube1_center_camera_smoothed, R_cube1_camera)
-                        cube2_center_ref[0] += cube1MagOffset_X
-                        cube2_center_ref[1] += cube1MagOffset_Y
-                        cube2_center_ref[2] += cube1MagOffset_Z
-                        cube2X = cube2_center_ref[0]
-                        cube2Y = cube2_center_ref[1]
-                        cube2Z = cube2_center_ref[2]
-                        cube2_center_text = f"Mea.Pos: x={cube2_center_ref[0]:.3f} m, y={cube2_center_ref[1]:.3f} m, z={cube2_center_ref[2]:.3f} m"
+                        t_cube1_cube2_tag = transform_to_ref_cube_frame(cube1_center_camera_smoothed, cube2_center_camera_smoothed,  R_cube2_camera)
+                        t_cube1_cube2_tag[0] += cube2MagOffset_X
+                        t_cube1_cube2_tag[1] += cube2MagOffset_Y
+                        t_cube1_cube2_tag[2] += cube2MagOffset_Z
+                        cube2_center_text = f"t_Cap_Mag_tag: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m"
+                        
                     ## Calculating relative orientation of Cap and Mag using TAG
                     if R_cube2_camera is not None and R_cube1_camera is not None:
-                        rel_Rsensor = R_cube2_camera.T @ R_cube1_camera
-                        cube2_euler = rotation_matrix_to_euler(rel_Rsensor)
+                        R_cap_mag = R_cube2_camera.T @ R_cube1_camera
+                        R_cube2_cube1 = R_cube1_camera.T @ R_cube2_camera
+                        rel_Rsensor = R_cube2_cube1
+                        cube2_euler = rotation_matrix_to_euler(R_cube2_cube1)
                         cube2_orient_text = f"Euler: Pitch={cube2_euler[0]:.1f}deg, Roll={cube2_euler[1]:.1f}deg, Yaw={cube2_euler[2]:.1f}deg"
 
                     ## Calculating Mag global orientation using TAG
-                    ## And Cap relative orientation to Mag     
+                    ## And Cap relative orientation to Mag  using BT data 
                     if R_cube2_camera is not None and R_worldCube_camera is not None:
                         R_cube2_global = R_worldCube_camera.T @ R_cube2_camera
-                        if bt_quat_global is not None:
-                            R_btquat_global = quaternion_to_rotation_matrix(bt_quat_global)  # Convert bt quat to rotation matrix
-                            R_btcap_cube2 = R_btquat_global.T @ R_cube2_global
+                        if btcap_global is not None:
+                            R_btcap_global = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
+                            R_btcap_mag =  R_cube2_global.T @ R_btcap_global
+
+                    ## Cap Global orientation
+                    if R_cube1_camera is not None and R_worldCube_camera is not None:
+                        R_cap_global = R_worldCube_camera.T @ R_cube1_camera        
 
                     # Update position estimation at controlled rate (NON-BLOCKING)
                     current_time = time.time()
                     if current_time - last_position_update > POSITION_UPDATE_INTERVAL:
-                        update_position_estimation(rotation_matrix_to_quaternion(R_btcap_cube2),magX,magY,magZ)  # This is now non-blocking
+                        update_position_estimation(rotation_matrix_to_quaternion(R_btcap_mag),magX,magY,magZ)  # This is now non-blocking
                         last_position_update = current_time
 
                     # Draw estimated position and axes
-                    if cube1_center_camera is not None and R_cube1_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and bt_quat_global is not None:
-                        est_pos_ref = np.array([estX - cube1MagOffset_X, estY - cube1MagOffset_Y, estZ - cube1MagOffset_Z], dtype=np.float32)
-                        est_pos_camera = R_cube1_camera @ est_pos_ref + cube1_center_camera_smoothed
+                    if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and btcap_global is not None:
+                        est_pos_ref = np.array([estX - cube2MagOffset_X, estY - cube2MagOffset_Y, estZ - cube2MagOffset_Z], dtype=np.float32)
+                        est_pos_camera = R_cube2_camera @ est_pos_ref + cube2_center_camera_smoothed
                         est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
                         img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_est_pos = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)  # Red circle for estimated position
-                        
-                        # Use hardcoded cube2_rvec value
-                        cube2_rvec_hardcoded = np.array([1.69552522, 0.61320622, -0.28387271], dtype=np.float32)
-                        
-                        # Convert both orientations to rotation matrices
-                        R_cube2, _ = cv2.Rodrigues(cube2_rvec_hardcoded)  # Convert hardcoded cube2 rvec to rotation matrix
-                        R_bt = quaternion_to_rotation_matrix(bt_quat_global)  # Convert bt quat to rotation matrix
-                        
-                        # Calculate relative orientation: R_relative = R_bt * R_cube2.T
-                        R_relative = R_bt @ R_cube2.T
-                        
-                        # Convert back to rotation vector for drawing
-                        relative_rvec, _ = cv2.Rodrigues(R_relative)
-                        
+                        R_bt = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
+                        R_btcap_cam = R_worldCube_camera @R_bt  # Cap orientation in camera frame
                         # Draw axes with the relative orientation
-                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, relative_rvec, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
 
                     q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
-                    q_btcap_cube2 = rotation_matrix_to_quaternion(R_btcap_cube2) if R_btcap_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
-        
+                    q_btcap_mag = rotation_matrix_to_quaternion(R_btcap_mag) if R_btcap_mag is not None else [1.0, 0.0, 0.0, 0.0]
+                    q_cap_global = rotation_matrix_to_quaternion(R_cap_global) if R_cap_global is not None else [1.0, 0.0, 0.0, 0.0]
+                    cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
+                    q_cap_mag = rotation_matrix_to_quaternion(R_cap_mag) if R_cap_mag is not None else None
+
                     # Draw text on text_frame with semi-transparent backgrounds
                     mag_text = f"Mag: X={magX:.2f} uT, Y={magY:.2f} uT, Z={magZ:.2f} uT"
-                    est_pos_text = f"Est Pos: x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
-                    pos_error_text = f"Pos Err: x={estX-cube2X:.3f} m, y={estY-cube2Y:.3f} m, z={estZ-cube2Z:.3f} m"
-                    q_btCap_Global_text = f"q_btCap_Global: [{bt_quat_global[0]:.3f}, {bt_quat_global[1]:.3f}, {bt_quat_global[2]:.3f}, {bt_quat_global[3]:.3f}]" if bt_quat_global is not None else "BT Quat Global: N/A"
-                    q_Mag_global_text = f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
-                    q_cap_Mag_text = f"q_btcap_Mag: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]"if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
+                    q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
+                    q_Cap_global_text =     f"q_Cap_global: [{q_cap_global[0]:.3f}, {q_cap_global[1]:.3f}, {q_cap_global[2]:.3f}, {q_cap_global[3]:.3f}]" if q_cap_global is not None else "Cube2 Quat Cap: N/A"
+                    q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{cube2_quat[0]:.3f}, {cube2_quat[1]:.3f}, {cube2_quat[2]:.3f}, {cube2_quat[3]:.3f}]" if cube2_quat is not None else "Rel Relsensor: N/A"
+                    q_cap_Mag_text =        f"q_btcap_Mag: [{q_btcap_mag[0]:.3f}, {q_btcap_mag[1]:.3f}, {q_btcap_mag[2]:.3f}, {q_btcap_mag[3]:.3f}]" if q_btcap_mag is not None else "Cube2 Quat Cap: N/A"
+                    q_btCap_Global_text =   f"q_btCap_Global: [{btcap_global[0]:.3f}, {btcap_global[1]:.3f}, {btcap_global[2]:.3f}, {btcap_global[3]:.3f}]" if btcap_global is not None else "BT Quat Global: N/A"
+                    est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
+                    pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
                     
-                    cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
-                    q_TAG_Cap_Mag_text = f"TAG_q_Cap_Mag: [{cube2_quat[0]:.3f}, {cube2_quat[1]:.3f}, {cube2_quat[2]:.3f}, {cube2_quat[3]:.3f}]" if cube2_quat is not None else "Rel Relsensor: N/A"
-                    
-                    intervalOffset = 1.7
-                    draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-
-                    draw_text_with_background(text_frame, q_btCap_Global_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, q_Mag_global_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                    draw_text_with_background(text_frame, q_TAG_Cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                    draw_text_with_background(text_frame, pos_error_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    intervalOffset = 1.4
+                    FONT_SCALE = 1.6
+                    draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, q_Mag_global_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, q_Cap_global_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, q_TAG_Cap_Mag_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, q_btCap_Global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
+                    draw_text_with_background(text_frame, cube2_center_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
                     # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
                     # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
                     
@@ -1077,15 +1085,15 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('t') or auto_record_flag:
-                        if magX is not None and magY is not None and magZ is not None and R_cube2 is not None:
+                        if magX is not None and magY is not None and magZ is not None and cube2_quat is not None:
                             measurement_order += 1
                             cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
-                            errorX = estX - cube2_center_ref[0]
-                            errorY = estY - cube2_center_ref[1]
-                            errorZ = estZ - cube2_center_ref[2]
+                            errorX = estX - t_cube1_cube2_tag[0]
+                            errorY = estY - t_cube1_cube2_tag[1]
+                            errorZ = estZ - t_cube1_cube2_tag[2]
                             writer.writerow([
                                 measurement_order,
-                                f'{cube2_center_ref[0]:.6f}', f'{cube2_center_ref[1]:.6f}', f'{cube2_center_ref[2]:.6f}',
+                                f'{t_cube1_cube2_tag[0]:.6f}', f'{t_cube1_cube2_tag[1]:.6f}', f'{t_cube1_cube2_tag[2]:.6f}',
                                 f'{cube2_quat[0]:.4f}', f'{cube2_quat[1]:.4f}', f'{cube2_quat[2]:.4f}', f'{cube2_quat[3]:.3f}',
                                 f'{cube2_euler[0]:.2f}', f'{cube2_euler[1]:.2f}', f'{cube2_euler[2]:.2f}',
                                 f'{magX:.3f}', f'{magY:.3f}', f'{magZ:.3f}',

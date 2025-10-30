@@ -190,17 +190,36 @@ class MadgwickFilter:
         return self.q, error, corrected_gyro
 
 class LockInAmplifier:
-    def __init__(self, target_freq=10.0, alpha=0.01):
+    def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.01):
         self.target_freq = target_freq
         self.alpha = alpha
+        self.hp_alpha = hp_alpha  # High-pass filter coefficient
         self.x_in = [0.0, 0.0, 0.0]
         self.x_quad = [0.0, 0.0, 0.0]
+        self.dc_offsets = [0.0, 0.0, 0.0]  # DC offset estimates for X, Y, Z
+        self.filtered_signals = [0.0, 0.0, 0.0]  # High-pass filtered signals
         self.last_time = time.time()
         self.phase_offsets = [0.0, 0.0, 0.0]  # Store phase offsets for X, Y, Z
         self.is_calibrated = False
 
+    def high_pass_filter(self, mag_uT):
+        """Apply high-pass filter to remove DC offset from input signals."""
+        filtered = []
+        for i in range(3):
+            # Update DC offset estimate (low-pass filtered version)
+            self.dc_offsets[i] = (1 - self.hp_alpha) * self.dc_offsets[i] + self.hp_alpha * mag_uT[i]
+            # Remove DC offset (high-pass filter)
+            filtered_signal = mag_uT[i] - self.dc_offsets[i]
+            # Optional: Additional high-pass filtering for better DC rejection
+            self.filtered_signals[i] = filtered_signal
+            filtered.append(filtered_signal)
+        return filtered
+
     def calibrate(self, mag_uT, current_time):
         """Calibrate phase angles to be negative in the current orientation."""
+        # Apply high-pass filter to remove DC offset
+        filtered_mag = self.high_pass_filter(mag_uT)
+        
         dt = current_time - self.last_time
         self.last_time = current_time
         t = current_time
@@ -208,20 +227,24 @@ class LockInAmplifier:
         ref_quad = np.cos(2 * np.pi * self.target_freq * t)
 
         for i in range(3):
-            prod_in = mag_uT[i] * ref_in
-            prod_quad = mag_uT[i] * ref_quad
+            prod_in = filtered_mag[i] * ref_in
+            prod_quad = filtered_mag[i] * ref_quad
             self.x_in[i] = (1 - self.alpha) * self.x_in[i] + self.alpha * prod_in
             self.x_quad[i] = (1 - self.alpha) * self.x_quad[i] + self.alpha * prod_quad
             current_phase = np.arctan2(self.x_quad[i], self.x_in[i])
 
             # Adjust phase to be negative (shift to range [-180, 0])
-            if(current_phase >= 0):
+            if current_phase >= 0:
                 self.phase_offsets[i] = 1
 
         self.is_calibrated = True
         print("Calibration complete. Phase offsets (degrees):", [np.degrees(off) for off in self.phase_offsets])
+        print("DC offsets (uT):", self.dc_offsets)
 
     def update(self, mag_uT, current_time):
+        # Apply high-pass filter to remove DC offset
+        filtered_mag = self.high_pass_filter(mag_uT)
+        
         dt = current_time - self.last_time
         self.last_time = current_time
         t = current_time
@@ -231,26 +254,35 @@ class LockInAmplifier:
         amplitudes = []
         phase_angles = []
         for i in range(3):
-            prod_in = mag_uT[i] * ref_in
-            prod_quad = mag_uT[i] * ref_quad
+            prod_in = filtered_mag[i] * ref_in
+            prod_quad = filtered_mag[i] * ref_quad
             self.x_in[i] = (1 - self.alpha) * self.x_in[i] + self.alpha * prod_in
             self.x_quad[i] = (1 - self.alpha) * self.x_quad[i] + self.alpha * prod_quad
             amplitude = np.sqrt(self.x_in[i]**2 + self.x_quad[i]**2)
             phase = np.arctan2(self.x_quad[i], self.x_in[i])
+            
             # Apply phase offset
             if self.is_calibrated:
                 if self.phase_offsets[i] == 1:
                     phase = -phase  # Shift by 180 degrees
-                else:
-                    phase = phase
+            
+            # Determine amplitude sign based on phase
             if phase > 0:
-                amplitude = amplitude
+                signed_amplitude = amplitude
             else:
-                amplitude = -amplitude        
+                signed_amplitude = -amplitude        
 
-            amplitudes.append(amplitude)
+            amplitudes.append(signed_amplitude)
             phase_angles.append(np.degrees(phase))
+            
         return amplitudes, phase_angles
+
+    def reset_dc_offsets(self):
+        """Reset DC offset estimates (useful when conditions change dramatically)."""
+        self.dc_offsets = [0.0, 0.0, 0.0]
+        self.filtered_signals = [0.0, 0.0, 0.0]
+        print("DC offsets reset")
+
 
 
 def quaternion_a_to_b(q_a):
@@ -405,7 +437,7 @@ def rotate_quaternion_z_neg90_manual(q):
 filter = MadgwickFilter()# Using Madgwick instead of Mahony
 q = filter.init()
 
-lockin = LockInAmplifier(target_freq=10.0, alpha=0.03)
+lockin = LockInAmplifier(target_freq=10.0, alpha=0.03 , hp_alpha=0.01)
 
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
@@ -463,10 +495,10 @@ def processing_thread():
                 print(
                     f"Yaw: {yaw:.1f}°\t "
                     f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
-                    f"q: {q[0]:.2f} , {q[1]:.2f} , {q[2]:.2f} , {q[3]:.2f}\t"
+                    # f"q: {q[0]:.2f} , {q[1]:.2f} , {q[2]:.2f} , {q[3]:.2f}\t"
                     f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
                     f"Avg Mag (uT): [X: {avg_mag_uT[0]:.1f}, Y: {avg_mag_uT[1]:.1f}, Z: {avg_mag_uT[2]:.1f}]\t "
-                    f"Phases (deg): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t "
+                    # f"Phases (deg): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t "
                     # f"Cur. Time: {current_time:.2f}\t "
                     # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
                     # f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
@@ -546,8 +578,9 @@ def notification_handler(sender, data):
         
 
         temp = mag_uT[0]
-        mag_uT[0] = mag_uT[2]
+        mag_uT[0] = -mag_uT[2]
         mag_uT[2] = temp
+        mag_uT[1] = -mag_uT[1]
 
 
 
