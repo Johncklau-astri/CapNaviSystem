@@ -26,12 +26,14 @@ plot_mag_z = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_x = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_y = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_z = deque(maxlen=PLOT_BUFFER_LEN)
-plot_roll = deque(maxlen=PLOT_BUFFER_LEN)
+plot_ac_x = deque(maxlen=PLOT_BUFFER_LEN)
+plot_ac_y = deque(maxlen=PLOT_BUFFER_LEN)
+plot_ac_z = deque(maxlen=PLOT_BUFFER_LEN)
 plot_pitch = deque(maxlen=PLOT_BUFFER_LEN)
 plot_yaw = deque(maxlen=PLOT_BUFFER_LEN)
-plot_omega_x = deque(maxlen=PLOT_BUFFER_LEN)
-plot_omega_y = deque(maxlen=PLOT_BUFFER_LEN)
-plot_omega_z = deque(maxlen=PLOT_BUFFER_LEN)
+plot_dc_x = deque(maxlen=PLOT_BUFFER_LEN)
+plot_dc_y = deque(maxlen=PLOT_BUFFER_LEN)
+plot_dc_z = deque(maxlen=PLOT_BUFFER_LEN)
 
 # TCP Server for sending data to aprilTagLocalization
 TCP_SERVER_HOST = 'localhost'
@@ -190,7 +192,7 @@ class MadgwickFilter:
         return self.q, error, corrected_gyro
 
 class LockInAmplifier:
-    def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.01):
+    def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.1):
         self.target_freq = target_freq
         self.alpha = alpha
         self.hp_alpha = hp_alpha  # High-pass filter coefficient
@@ -275,7 +277,7 @@ class LockInAmplifier:
             amplitudes.append(signed_amplitude)
             phase_angles.append(np.degrees(phase))
             
-        return amplitudes, phase_angles
+        return amplitudes, phase_angles , filtered_mag
 
     def reset_dc_offsets(self):
         """Reset DC offset estimates (useful when conditions change dramatically)."""
@@ -360,17 +362,17 @@ def live_plot():
     (ax1, ax2, ax3, ax4) = axs
     ax1.set_title('Raw Magnetometer (uT)')
     ax2.set_title('Lock-in AC Amplitude (uT)')
-    ax3.set_title('Euler Angles (degrees)')
-    ax4.set_title('Corrected Omega (deg/s)')
+    ax3.set_title('AC mag (uT)')
+    ax4.set_title('DC mag (uT)')
     ax4.set_xlabel('Time (s)')
     lines1 = [ax1.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines2 = [ax2.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
-    lines3 = [ax3.plot([], [], label=lbl)[0] for lbl in ['Roll', 'Pitch', 'Yaw']]
+    lines3 = [ax3.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines4 = [ax4.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
-    ax1.set_ylim(-10000, 10000)
-    ax2.set_ylim(-1000, 1000)
-    ax3.set_ylim(-180, 180)
-    ax4.set_ylim(-200, 200)  # Adjust based on expected omega range
+    ax1.set_ylim(-3000, 3000)
+    ax2.set_ylim(-300, 300)
+    ax3.set_ylim(-500, 500)
+    ax4.set_ylim(-3000, 3000)  # Adjust based on expected omega range
     ax1.legend()
     ax2.legend()
     ax3.legend()
@@ -388,8 +390,8 @@ def live_plot():
         t = t - t[0]
         data1 = [np.array(plot_mag_x), np.array(plot_mag_y), np.array(plot_mag_z)]
         data2 = [np.array(plot_amp_x), np.array(plot_amp_y), np.array(plot_amp_z)]
-        data3 = [np.array(plot_roll), np.array(plot_pitch), np.array(plot_yaw)]
-        data4 = [np.array(plot_omega_x), np.array(plot_omega_y), np.array(plot_omega_z)]
+        data3 = [np.array(plot_ac_x), np.array(plot_ac_y), np.array(plot_ac_z)]
+        data4 = [np.array(plot_dc_x), np.array(plot_dc_y), np.array(plot_dc_z)]
         for i in range(3):
             lines1[i].set_data(t, data1[i])
             lines2[i].set_data(t, data2[i])
@@ -437,7 +439,7 @@ def rotate_quaternion_z_neg90_manual(q):
 filter = MadgwickFilter()# Using Madgwick instead of Mahony
 q = filter.init()
 
-lockin = LockInAmplifier(target_freq=10.0, alpha=0.03 , hp_alpha=0.01)
+lockin = LockInAmplifier()
 
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
@@ -447,7 +449,7 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
         lockin.calibrate(mag_uT, current_time)
         calibration_trigger.clear()
     
-    mag_amplitudes, mag_phases = lockin.update(mag_uT, current_time)
+    mag_amplitudes, mag_phases , filtered_mag = lockin.update(mag_uT, current_time)
     
     # Use raw magnetometer data for Madgwick filter, not lock-in amplitudes
     q, error, omega_corrected = filter.update(
@@ -457,10 +459,17 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
         current_time=current_time
     )
 
-    return q, error, omega_corrected, mag_amplitudes, mag_phases
+    return q, error, omega_corrected, mag_amplitudes, mag_phases, filtered_mag
 
 def processing_thread():
     loop_timestamps = deque(maxlen=10)
+    
+    # Low-pass filter parameters for magnetometer data
+    lpf_alpha = 0.07  # Smoothing factor (0.0 to 1.0), lower = more smoothing
+    lpf_mag_x = 0.0
+    lpf_mag_y = 0.0
+    lpf_mag_z = 0.0
+    
     with ThreadPoolExecutor(max_workers=2) as executor:
         while True:
             try:
@@ -470,16 +479,17 @@ def processing_thread():
                     current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get_nowait()
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                q, error, omega_corrected, mag_amplitudes, mag_phases = future.result()
+                q, error, omega_corrected, mag_amplitudes, mag_phases , filtered_mag = future.result()
 
-                # Store mag_uT in buffer and calculate average
-                mag_uT_buffer.append(mag_uT)
-                avg_mag_uT = np.mean(list(mag_uT_buffer), axis=0) if mag_uT_buffer else mag_uT
+                # Apply low-pass filter to remove AC component from magnetometer data
+                lpf_mag_x = (1 - lpf_alpha) * lpf_mag_x + lpf_alpha * mag_uT[0]
+                lpf_mag_y = (1 - lpf_alpha) * lpf_mag_y + lpf_alpha * mag_uT[1]
+                lpf_mag_z = (1 - lpf_alpha) * lpf_mag_z + lpf_alpha * mag_uT[2]
+                
+                dc_mag_uT = np.array([lpf_mag_x, lpf_mag_y, lpf_mag_z])
 
                 mod_q = rotate_quaternion_z_neg90_manual(q)
                 mod_q = quaternion_a_to_b(mod_q)
-
-               
 
                 pitch , roll,  yaw = quaternion_to_euler(mod_q)
 
@@ -494,20 +504,22 @@ def processing_thread():
 
                 print(
                     f"Yaw: {yaw:.1f}°\t "
-                    f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
-                    # f"q: {q[0]:.2f} , {q[1]:.2f} , {q[2]:.2f} , {q[3]:.2f}\t"
+                    f"Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    f"Accel (g): [X: {accel_g[0]:.2f}, Y: {accel_g[1]:.2f}, Z: {accel_g[2]:.2f}]\t "
+                    f"Raw Mag (uT): [X: {mag_uT[0]:.1f}, Y: {mag_uT[1]:.1f}, Z: {mag_uT[2]:.1f}]\t "
                     f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
-                    f"Avg Mag (uT): [X: {avg_mag_uT[0]:.1f}, Y: {avg_mag_uT[1]:.1f}, Z: {avg_mag_uT[2]:.1f}]\t "
-                    # f"Phases (deg): [X: {mag_phases[0]:.1f}, Y: {mag_phases[1]:.1f}, Z: {mag_phases[2]:.1f}]\t "
-                    # f"Cur. Time: {current_time:.2f}\t "
-                    # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
-                    # f"gyro: x:{gyro_dps[0]:.1f}°/s, y:{gyro_dps[1]:.1f}°/s, z:{gyro_dps[2]:.1f}°/s\t "
-                    # # f"Error: [{error[0]:.3f}, {error[1]:.3f}, {error[2]:.3f}],\t\t "
-                    # # f"omega_corrected (deg/s): [{np.degrees(omega_corrected[0]):.1f}, {np.degrees(omega_corrected[1]):.1f}, {np.degrees(omega_corrected[2]):.1f}],\t "
+                    f"LPF Mag (uT): [X: {dc_mag_uT[0]:.1f}, Y: {dc_mag_uT[1]:.1f}, Z: {dc_mag_uT[2]:.1f}]\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
                     f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
                 )
-                send_to_tcp_clients(mod_q, avg_mag_uT)
+                
+                #removing geomagnetic influence on dc_mag_uT
+                geomag_uT = np.array([13.0, -18.0, -35.0])
+
+                # transform dc_mag_uT vector to world frame
+
+
+                send_to_tcp_clients(mod_q, dc_mag_uT)
 
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
@@ -516,12 +528,14 @@ def processing_thread():
                 plot_amp_x.append(mag_amplitudes[0])
                 plot_amp_y.append(mag_amplitudes[1])
                 plot_amp_z.append(mag_amplitudes[2])
-                plot_roll.append(roll)
+                plot_ac_x.append(filtered_mag[0])
+                plot_ac_y.append(filtered_mag[1])
+                plot_ac_z.append(filtered_mag[2])
                 plot_pitch.append(pitch)
                 plot_yaw.append(yaw)
-                plot_omega_x.append(np.degrees(omega_corrected[0]))
-                plot_omega_y.append(np.degrees(omega_corrected[1]))
-                plot_omega_z.append(np.degrees(omega_corrected[2]))
+                plot_dc_x.append(dc_mag_uT[0])
+                plot_dc_y.append(dc_mag_uT[1])
+                plot_dc_z.append(dc_mag_uT[2])
                 data_queue.task_done()
             except queue.Empty:
                 continue
