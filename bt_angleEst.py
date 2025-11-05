@@ -15,6 +15,41 @@ import json
 import struct
 from scipy.spatial.transform import Rotation
 
+LOG_FILENAME = "magnetometer_log.txt"
+log_file = None
+logging_enabled = False
+
+def start_logging():
+    """Start logging magnetometer data to file."""
+    global log_file, logging_enabled
+    try:
+        log_file = open(LOG_FILENAME, 'w')
+        logging_enabled = True
+        print(f"Started logging magnetometer data to {LOG_FILENAME}")
+    except Exception as e:
+        print(f"Error opening log file: {e}")
+
+def stop_logging():
+    """Stop logging and close the file."""
+    global log_file, logging_enabled
+    if log_file:
+        log_file.close()
+        log_file = None
+    logging_enabled = False
+    print("Stopped logging magnetometer data")
+
+def log_magnetometer_data(mag_uT):
+    """Log magnetometer data in the format: X,Y,Z"""
+    global log_file, logging_enabled
+    if logging_enabled and log_file:
+        try:
+            # Format: X,Y,Z\n (with 1 decimal place like your sample)
+            log_file.write(f"{mag_uT[0]:.1f},{mag_uT[1]:.1f},{mag_uT[2]:.1f}\n")
+            log_file.flush()  # Ensure data is written immediately
+        except Exception as e:
+            print(f"Error writing to log file: {e}")
+
+
 mag_uT_buffer = deque(maxlen=250)
 
 # For real-time plotting (buffer length: 1000 samples)
@@ -26,14 +61,12 @@ plot_mag_z = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_x = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_y = deque(maxlen=PLOT_BUFFER_LEN)
 plot_amp_z = deque(maxlen=PLOT_BUFFER_LEN)
-plot_ac_x = deque(maxlen=PLOT_BUFFER_LEN)
-plot_ac_y = deque(maxlen=PLOT_BUFFER_LEN)
-plot_ac_z = deque(maxlen=PLOT_BUFFER_LEN)
-plot_pitch = deque(maxlen=PLOT_BUFFER_LEN)
-plot_yaw = deque(maxlen=PLOT_BUFFER_LEN)
-plot_dc_x = deque(maxlen=PLOT_BUFFER_LEN)
-plot_dc_y = deque(maxlen=PLOT_BUFFER_LEN)
-plot_dc_z = deque(maxlen=PLOT_BUFFER_LEN)
+plot_lp_x = deque(maxlen=PLOT_BUFFER_LEN)
+plot_lp_y = deque(maxlen=PLOT_BUFFER_LEN)
+plot_lp_z = deque(maxlen=PLOT_BUFFER_LEN)
+plot_hp_x = deque(maxlen=PLOT_BUFFER_LEN)
+plot_hp_y = deque(maxlen=PLOT_BUFFER_LEN)
+plot_hp_z = deque(maxlen=PLOT_BUFFER_LEN)
 
 # TCP Server for sending data to aprilTagLocalization
 TCP_SERVER_HOST = 'localhost'
@@ -192,7 +225,7 @@ class MadgwickFilter:
         return self.q, error, corrected_gyro
 
 class LockInAmplifier:
-    def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.1):
+    def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.01):
         self.target_freq = target_freq
         self.alpha = alpha
         self.hp_alpha = hp_alpha  # High-pass filter coefficient
@@ -327,7 +360,61 @@ def quaternion_a_to_b(q_a):
     q_b = q_b / np.linalg.norm(q_b)
     
     return q_b
+def rotation_matrix_to_quaternion(R):
+    """Convert rotation matrix to quaternion [qw, qx, qy, qz]"""
+    if R is None:
+        return [1.0, 0.0, 0.0, 0.0]
+    
+    # Ensure R is a proper 3x3 matrix
+    if R.shape != (3, 3):
+        print(f"Warning: Invalid rotation matrix shape {R.shape}, returning identity quaternion")
+        return [1.0, 0.0, 0.0, 0.0]
+    
+    trace = np.trace(R)
+    if trace > 0:
+        S = np.sqrt(trace + 1.0) * 2
+        qw = 0.25 * S
+        qx = (R[2, 1] - R[1, 2]) / S
+        qy = (R[0, 2] - R[2, 0]) / S
+        qz = (R[1, 0] - R[0, 1]) / S
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        S = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        qw = (R[2, 1] - R[1, 2]) / S
+        qx = 0.25 * S
+        qy = (R[0, 1] + R[1, 0]) / S
+        qz = (R[0, 2] + R[2, 0]) / S
+    elif R[1, 1] > R[2, 2]:
+        S = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        qw = (R[0, 2] - R[2, 0]) / S
+        qx = (R[0, 1] + R[1, 0]) / S
+        qy = 0.25 * S
+        qz = (R[1, 2] + R[2, 1]) / S
+    else:
+        S = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        qw = (R[1, 0] - R[0, 1]) / S
+        qx = (R[0, 2] + R[2, 0]) / S
+        qy = (R[1, 2] + R[2, 1]) / S
+        qz = 0.25 * S
+    
+    return [qw, qx, qy, qz]
 
+
+def quaternion_to_rotation_matrix(q):
+    """Convert quaternion [qw, qx, qy, qz] to rotation matrix"""
+    qw, qx, qy, qz = q
+    # Normalize quaternion
+    norm = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+    if norm == 0:
+        return np.eye(3)
+    qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
+    
+    # Calculate rotation matrix
+    R = np.array([
+        [1 - 2*qy*qy - 2*qz*qz, 2*qx*qy - 2*qz*qw, 2*qx*qz + 2*qy*qw],
+        [2*qx*qy + 2*qz*qw, 1 - 2*qx*qx - 2*qz*qz, 2*qy*qz - 2*qx*qw],
+        [2*qx*qz - 2*qy*qw, 2*qy*qz + 2*qx*qw, 1 - 2*qx*qx - 2*qy*qy]
+    ])
+    return R
 
 def quaternion_to_euler(q):
     """Convert quaternion to Euler angles with modified coordinate system.
@@ -362,17 +449,17 @@ def live_plot():
     (ax1, ax2, ax3, ax4) = axs
     ax1.set_title('Raw Magnetometer (uT)')
     ax2.set_title('Lock-in AC Amplitude (uT)')
-    ax3.set_title('AC mag (uT)')
-    ax4.set_title('DC mag (uT)')
+    ax3.set_title('Low pass mag (uT)')
+    ax4.set_title('High pass mag (uT)')
     ax4.set_xlabel('Time (s)')
     lines1 = [ax1.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines2 = [ax2.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines3 = [ax3.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines4 = [ax4.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
-    ax1.set_ylim(-3000, 3000)
+    ax1.set_ylim(-10000, 10000)
     ax2.set_ylim(-300, 300)
-    ax3.set_ylim(-500, 500)
-    ax4.set_ylim(-3000, 3000)  # Adjust based on expected omega range
+    ax3.set_ylim(-5000, 5000)
+    ax4.set_ylim(-400, 400)  # Adjust based on expected omega range
     ax1.legend()
     ax2.legend()
     ax3.legend()
@@ -390,8 +477,8 @@ def live_plot():
         t = t - t[0]
         data1 = [np.array(plot_mag_x), np.array(plot_mag_y), np.array(plot_mag_z)]
         data2 = [np.array(plot_amp_x), np.array(plot_amp_y), np.array(plot_amp_z)]
-        data3 = [np.array(plot_ac_x), np.array(plot_ac_y), np.array(plot_ac_z)]
-        data4 = [np.array(plot_dc_x), np.array(plot_dc_y), np.array(plot_dc_z)]
+        data3 = [np.array(plot_lp_x), np.array(plot_lp_y), np.array(plot_lp_z)]
+        data4 = [np.array(plot_hp_x), np.array(plot_hp_y), np.array(plot_hp_z)]
         for i in range(3):
             lines1[i].set_data(t, data1[i])
             lines2[i].set_data(t, data2[i])
@@ -439,7 +526,7 @@ def rotate_quaternion_z_neg90_manual(q):
 filter = MadgwickFilter()# Using Madgwick instead of Mahony
 q = filter.init()
 
-lockin = LockInAmplifier()
+lockin = LockInAmplifier(target_freq=10.0, alpha=0.03 , hp_alpha=0.01)
 
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
@@ -449,7 +536,7 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
         lockin.calibrate(mag_uT, current_time)
         calibration_trigger.clear()
     
-    mag_amplitudes, mag_phases , filtered_mag = lockin.update(mag_uT, current_time)
+    mag_amplitudes, mag_phases , highpass_mag_uT = lockin.update(mag_uT, current_time)
     
     # Use raw magnetometer data for Madgwick filter, not lock-in amplitudes
     q, error, omega_corrected = filter.update(
@@ -459,16 +546,14 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
         current_time=current_time
     )
 
-    return q, error, omega_corrected, mag_amplitudes, mag_phases, filtered_mag
+    return q, error, omega_corrected, mag_amplitudes, mag_phases , highpass_mag_uT
 
 def processing_thread():
     loop_timestamps = deque(maxlen=10)
     
     # Low-pass filter parameters for magnetometer data
-    lpf_alpha = 0.07  # Smoothing factor (0.0 to 1.0), lower = more smoothing
-    lpf_mag_x = 0.0
-    lpf_mag_y = 0.0
-    lpf_mag_z = 0.0
+    alpha = 0.03  # Smoothing factor (0 = no smoothing, 1 = no filtering)
+    lowpass_mag_uT = None  # Initialize filtered value
     
     with ThreadPoolExecutor(max_workers=2) as executor:
         while True:
@@ -479,19 +564,21 @@ def processing_thread():
                     current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get_nowait()
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                q, error, omega_corrected, mag_amplitudes, mag_phases , filtered_mag = future.result()
+                q, error, omega_corrected, mag_amplitudes, mag_phases, highpass_mag_uT = future.result()
 
-                # Apply low-pass filter to remove AC component from magnetometer data
-                lpf_mag_x = (1 - lpf_alpha) * lpf_mag_x + lpf_alpha * mag_uT[0]
-                lpf_mag_y = (1 - lpf_alpha) * lpf_mag_y + lpf_alpha * mag_uT[1]
-                lpf_mag_z = (1 - lpf_alpha) * lpf_mag_z + lpf_alpha * mag_uT[2]
+                # Convert mag_uT to numpy array for element-wise operations
+                mag_uT_array = np.array(mag_uT)
                 
-                dc_mag_uT = np.array([lpf_mag_x, lpf_mag_y, lpf_mag_z])
+                # Apply low-pass filter to magnetometer data
+                if lowpass_mag_uT is None:
+                    lowpass_mag_uT = mag_uT_array  # Initialize with first reading
+                else:
+                    lowpass_mag_uT = alpha * mag_uT_array + (1 - alpha) * lowpass_mag_uT
 
                 mod_q = rotate_quaternion_z_neg90_manual(q)
                 mod_q = quaternion_a_to_b(mod_q)
 
-                pitch , roll,  yaw = quaternion_to_euler(mod_q)
+                pitch, roll, yaw = quaternion_to_euler(mod_q)
 
                 loop_timestamps.append(loop_start_time)
                 loop_freq_hz = 0.0
@@ -500,26 +587,33 @@ def processing_thread():
                     if elapsed_time > 0:
                         loop_freq_hz = 9 / elapsed_time
 
-                accel_mag = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
+                accel_amp = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
+                lowpass_mag_uT_amp = np.sqrt(lowpass_mag_uT[0]**2 + lowpass_mag_uT[1]**2 + lowpass_mag_uT[2]**2)
+
+                # Earth mag field removal
+
+                earth_mag_global = np.array([-4 , -34 , -42])
+
+                earth_mag_sensor = quaternion_to_rotation_matrix(mod_q).T@earth_mag_global
+                earth_mag_sensor = np.array([-earth_mag_sensor[1],-earth_mag_sensor[0],-earth_mag_sensor[2]])
+
+
+                adjusted_mag_uT = lowpass_mag_uT - earth_mag_sensor
+                adjusted_mag_uT_mag = np.sqrt(adjusted_mag_uT[0]**2 + adjusted_mag_uT[1]**2 + adjusted_mag_uT[2]**2)                
+
+
 
                 print(
-                    f"Yaw: {yaw:.1f}°\t "
-                    f"Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
-                    f"Accel (g): [X: {accel_g[0]:.2f}, Y: {accel_g[1]:.2f}, Z: {accel_g[2]:.2f}]\t "
-                    f"Raw Mag (uT): [X: {mag_uT[0]:.1f}, Y: {mag_uT[1]:.1f}, Z: {mag_uT[2]:.1f}]\t "
+                    # f"Yaw: {yaw:.1f}°\t "
+                    # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
                     f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
-                    f"LPF Mag (uT): [X: {dc_mag_uT[0]:.1f}, Y: {dc_mag_uT[1]:.1f}, Z: {dc_mag_uT[2]:.1f}]\t "
+                    f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f}, Y: {lowpass_mag_uT[1]:.1f},\t Z: {lowpass_mag_uT[2]:.1f} , mag:{lowpass_mag_uT_amp:.1f}]\t "
+                    f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
+                    f"Adj Mag (uT): [X: {adjusted_mag_uT[0]:.1f}, Y: {adjusted_mag_uT[1]:.1f}, \tZ: {adjusted_mag_uT[2]:.1f} , mag:{adjusted_mag_uT_mag:.1f}]\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
                     f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
                 )
-                
-                #removing geomagnetic influence on dc_mag_uT
-                geomag_uT = np.array([13.0, -18.0, -35.0])
-
-                # transform dc_mag_uT vector to world frame
-
-
-                send_to_tcp_clients(mod_q, dc_mag_uT)
+                send_to_tcp_clients(mod_q, adjusted_mag_uT)
 
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
@@ -528,19 +622,19 @@ def processing_thread():
                 plot_amp_x.append(mag_amplitudes[0])
                 plot_amp_y.append(mag_amplitudes[1])
                 plot_amp_z.append(mag_amplitudes[2])
-                plot_ac_x.append(filtered_mag[0])
-                plot_ac_y.append(filtered_mag[1])
-                plot_ac_z.append(filtered_mag[2])
-                plot_pitch.append(pitch)
-                plot_yaw.append(yaw)
-                plot_dc_x.append(dc_mag_uT[0])
-                plot_dc_y.append(dc_mag_uT[1])
-                plot_dc_z.append(dc_mag_uT[2])
+                plot_lp_x.append(lowpass_mag_uT[0])
+                plot_lp_y.append(lowpass_mag_uT[1])
+                plot_lp_z.append(lowpass_mag_uT[2])
+                plot_hp_x.append(highpass_mag_uT[0])
+                plot_hp_y.append(highpass_mag_uT[1])
+                plot_hp_z.append(highpass_mag_uT[2])
                 data_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Processing thread error: {e}")
+
+
 
 def rotate_quaternion_scipy(q, angle_degrees, axis='z'):
     """
@@ -584,23 +678,60 @@ def notification_handler(sender, data):
         accel_g[0] = accel_g[1]
         accel_g[1] = temp
 
-
         temp = -gyro_dps[0]
         gyro_dps[0] = -gyro_dps[1]
         gyro_dps[1] = temp
         gyro_dps[2] = -gyro_dps[2]
-        
 
         temp = mag_uT[0]
         mag_uT[0] = -mag_uT[2]
         mag_uT[2] = temp
         mag_uT[1] = -mag_uT[1]
 
+        # Calibrate magnetometer data
+        mag_uT_calibrated = calibrate_magnetometer(mag_uT)
 
+        # Log magnetometer data if logging is enabled
+        if logging_enabled:
+            log_magnetometer_data(mag_uT)
 
+        data_queue.put((current_time, accel_g, gyro_dps, mag_uT_calibrated, running_freq_hz))
 
-
-        data_queue.put((current_time, accel_g, gyro_dps, mag_uT, running_freq_hz))
+def calibrate_magnetometer(mag_raw):
+    # Hard iron bias parameters
+    hard_iron_bias_x = -22.105616
+    hard_iron_bias_y = -28.343595
+    hard_iron_bias_z = 6.451873
+    
+    # Soft iron bias matrix parameters (these are likely the inverse matrix)
+    soft_iron_bias_xx = 22.052792
+    soft_iron_bias_xy = -0.208071
+    soft_iron_bias_xz = 0.104460
+    
+    soft_iron_bias_yx = -0.208071
+    soft_iron_bias_yy = 23.190581
+    soft_iron_bias_yz = -0.186571
+    
+    soft_iron_bias_zx = 0.104460
+    soft_iron_bias_zy = -0.186571
+    soft_iron_bias_zz = 21.728060
+    
+    # Apply hard iron calibration (subtract bias)
+    mag_corrected = [
+        mag_raw[0] - hard_iron_bias_x,
+        mag_raw[1] - hard_iron_bias_y,
+        mag_raw[2] - hard_iron_bias_z
+    ]
+    
+    # Apply only hard iron calibration first
+    mag_calibrated = [
+        mag_raw[0] - hard_iron_bias_x,
+        mag_raw[1] - hard_iron_bias_y,
+        mag_raw[2] - hard_iron_bias_z
+    ]
+    
+    return mag_calibrated
+        
 
 def send_to_tcp_clients(q, mag_uT):
     """Send quaternion and magnetometer data to connected TCP clients."""
@@ -668,14 +799,25 @@ def tcp_server_thread():
     tcp_server_socket.close()
 
 def keyboard_listener():
-    """Listen for keyboard input to trigger calibration."""
+    """Listen for keyboard input to trigger calibration and logging."""
     print("Press 'c' to calibrate the sensor's phase angles when in known orientation.")
+    print("Press 'l' to start/stop logging magnetometer data.")
     while True:
         if keyboard.is_pressed('c'):
             print("Calibration triggered. Ensure sensor is in known orientation.")
             calibration_trigger.set()
             time.sleep(0.5)  # Debounce to prevent multiple triggers
+        
+        if keyboard.is_pressed('l'):
+            global logging_enabled
+            if not logging_enabled:
+                start_logging()
+            else:
+                stop_logging()
+            time.sleep(0.5)  # Debounce to prevent multiple triggers
+        
         time.sleep(0.1)
+
 
 async def connect_and_receive(device_name):
     global connection_active
