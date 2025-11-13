@@ -552,7 +552,7 @@ def processing_thread():
     loop_timestamps = deque(maxlen=10)
     
     # Low-pass filter parameters for magnetometer data
-    alpha = 0.03  # Smoothing factor (0 = no smoothing, 1 = no filtering)
+    alpha = 0.03  # Smoothing factor (0 = no smoothing, 1 = no filtering)  5,Nov: 0.03 is good
     lowpass_mag_uT = None  # Initialize filtered value
     
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -591,8 +591,8 @@ def processing_thread():
                 lowpass_mag_uT_amp = np.sqrt(lowpass_mag_uT[0]**2 + lowpass_mag_uT[1]**2 + lowpass_mag_uT[2]**2)
 
                 # Earth mag field removal
-
-                earth_mag_global = np.array([-4 , -34 , -42])
+                #Earth field measured in global frame, NOT capsule sensor axis, NEED to convert sensor reading to global
+                earth_mag_global = np.array([-11,-23,-22])
 
                 earth_mag_sensor = quaternion_to_rotation_matrix(mod_q).T@earth_mag_global
                 earth_mag_sensor = np.array([-earth_mag_sensor[1],-earth_mag_sensor[0],-earth_mag_sensor[2]])
@@ -606,12 +606,13 @@ def processing_thread():
                 print(
                     # f"Yaw: {yaw:.1f}°\t "
                     # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
                     f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
-                    f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f}, Y: {lowpass_mag_uT[1]:.1f},\t Z: {lowpass_mag_uT[2]:.1f} , mag:{lowpass_mag_uT_amp:.1f}]\t "
-                    f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
-                    f"Adj Mag (uT): [X: {adjusted_mag_uT[0]:.1f}, Y: {adjusted_mag_uT[1]:.1f}, \tZ: {adjusted_mag_uT[2]:.1f} , mag:{adjusted_mag_uT_mag:.1f}]\t "
                     f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
-                    f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
+                    f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f}, Y: {lowpass_mag_uT[1]:.1f}, \t Z: {lowpass_mag_uT[2]:.1f} , mag:{lowpass_mag_uT_amp:.1f}]\t "
+                    f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
+                    f"Adj Mag (uT): [X: {adjusted_mag_uT[0]:.1f}, Y: {adjusted_mag_uT[1]:.1f},  \tZ: {adjusted_mag_uT[2]:.1f} , mag:{adjusted_mag_uT_mag:.1f}]\t "
+                    # f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
                 )
                 send_to_tcp_clients(mod_q, adjusted_mag_uT)
 

@@ -26,17 +26,17 @@ CHECKERBOARD_SQUARE_SIZE = 0.025
 CALIBRATION_FILE = "VidAprilTagCalibration.npz"
 AXIS_LENGTH = TAG_SIZE
 DISPLAY_WIDTH = 1920
-DISPLAY_HEIGHT = 1200  # Total height: 600 for text, 600 for camera
-TEXT_FRAME_WIDTH = 1920
+DISPLAY_HEIGHT = 1080  # Total height: 600 for text, 600 for camera
+TEXT_FRAME_WIDTH = 1720
 TEXT_FRAME_HEIGHT = 600
-CAMERA_FRAME_HEIGHT = 600
-NUM_CALIBRATION_FRAMES = 30
+CAMERA_FRAME_HEIGHT = 500
+NUM_CALIBRATION_FRAMES = 50
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
-cube2MagOffset_X = 0.0
+cube2MagOffset_X = -0.007
 cube2MagOffset_Y = 0.0
-cube2MagOffset_Z = 0.112
+cube2MagOffset_Z = 0.120
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
 MOTOR_SERVER_PORT = 12345
@@ -308,7 +308,7 @@ def position_estimation_worker():
             try:
                 if pending_request is None:
                     pending_request = position_request_queue.get_nowait()
-                    print("Got new position estimation request from queue")
+                    # print("Got new position estimation request from queue")
             except queue.Empty:
                 pass  # No new requests
             
@@ -328,7 +328,7 @@ def position_estimation_worker():
                 success = send_position_request(position_socket, magX, magY, magZ, 
                                               quat_w, quat_x, quat_y, quat_z)
                 if success:
-                    print(f"Sent position request - Mag: ({magX:.2f}, {magY:.2f}, {magZ:.2f})")
+                    # print(f"Sent position request - Mag: ({magX:.2f}, {magY:.2f}, {magZ:.2f})")
                     pending_request = None  # Request sent, wait for response
                 else:
                     print("Failed to send position request, will retry")
@@ -345,7 +345,7 @@ def position_estimation_worker():
             if position_socket:
                 response = receive_position_response(position_socket)
                 if response:
-                    print(f"Received position response: {response}")
+                    # print(f"Received position response: {response}")
                     
                     if 'error' in response:
                         print(f"Server error: {response['error']}")
@@ -354,7 +354,7 @@ def position_estimation_worker():
                         estX = response['estX']
                         estY = response['estY']
                         estZ = response['estZ']
-                        print(f"Updated position: ({estX:.3f}, {estY:.3f}, {estZ:.3f})")
+                        # print(f"Updated position: ({estX:.3f}, {estY:.3f}, {estZ:.3f})")
                     
                     # Put response in queue for main thread (if needed)
                     try:
@@ -449,6 +449,10 @@ def calibrate_camera():
     if camera_matrix is not None and dist_coeffs is not None:
         user_input = input("Use existing calibration data? (y/n): ").strip().lower()
         if user_input == 'y':
+            # Display existing calibration parameters
+            print("\n=== EXISTING CALIBRATION PARAMETERS ===")
+            print(f"Camera Matrix:\n{camera_matrix}")
+            print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
             return camera_matrix, dist_coeffs
     cap = cv2.VideoCapture(1)
     if not cap.isOpened():
@@ -480,6 +484,7 @@ def calibrate_camera():
             objpoints.append(objp)
             imgpoints.append(corners2)
             count += 1
+            print("Captured")
         elif key == ord('q'):
             break
     cap.release()
@@ -488,6 +493,9 @@ def calibrate_camera():
         print("Insufficient frames for calibration.")
         return None, None
     ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+
+
+
     if ret:
         mean_error = 0
         for i in range(len(objpoints)):
@@ -495,8 +503,18 @@ def calibrate_camera():
             error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
             mean_error += error
         mean_error /= len(objpoints)
+        
+        # Display calibration results
+        print("\n=== CALIBRATION RESULTS ===")
+        print(f"Camera Matrix:\n{camera_matrix}")
+        print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
+        print(f"Reprojection Error: {mean_error:.4f} pixels")
+        print(f"Focal Length (fx, fy): ({camera_matrix[0,0]:.2f}, {camera_matrix[1,1]:.2f})")
+        print(f"Principal Point (cx, cy): ({camera_matrix[0,2]:.2f}, {camera_matrix[1,2]:.2f})")
+        
         if mean_error > 0.5:
-            print("High reprojection error.")
+            print("WARNING: High reprojection error - consider recalibrating")
+        
         save_calibration(camera_matrix, dist_coeffs)
         return camera_matrix, dist_coeffs
     else:
@@ -601,7 +619,6 @@ def refine_pose(corners, camera_matrix, dist_coeffs):
 def compute_cube_center(tags, cube_size, tag_ids, reference_tag_id=None):
     cube_tags = [tag for tag in tags if tag['tag_id'] in tag_ids]
     if len(cube_tags) == 0:
-        print(tag_ids)
         return None, None
     cube_center_positions = []
     reference_tag = None
@@ -847,6 +864,15 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     bt_receiver_thread = threading.Thread(target=run_bt_data_receiver, args=('localhost', BT_ANGLE_EST_PORT, stop_event))
     bt_receiver_thread.daemon = True
     bt_receiver_thread.start()
+
+    capture_time = None
+
+    map1, map2 = cv2.initUndistortRectifyMap(
+    camera_matrix, dist_coeffs, None, 
+    camera_matrix, 
+    (DISPLAY_WIDTH, DISPLAY_HEIGHT),  # Use your camera resolution
+    cv2.CV_16SC2
+    )
     
     cv2.namedWindow("AprilTag Localization", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("AprilTag Localization", DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -856,24 +882,33 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     try:
         with open(LOG_FILE, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['Order', 'Rel_Xm', 'Rel_Ym', 'Rel_Zm', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_PitchDeg', 'Cube2_RollDeg', 'Cube2_YawDeg',
-                             'Mag_XuT', 'Mag_YuT', 'Mag_ZuT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
+            writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_Pitch_deg', 'Cube2_Roll_deg', 'Cube2_Yaw_deg',
+                             'Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
             while not stop_event.is_set():
                 start_time = time.time()
                 ret, frame = cap.read()
+
+                capture_time = time.time()
+
                 if not ret:
                     print("Failed to capture frame.")
                     break
-                frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
-                
+                # frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
+                frame_undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+                undistort_time = time.time()
+              
                 text_frame[:] = 0  # Reset to black
                 
                 gray = cv2.cvtColor(frame_undistorted, cv2.COLOR_BGR2GRAY)
+                convert_time = time.time()
+   
+
                 detections = detector.detect(gray, estimate_tag_pose=True,
                                             camera_params=(camera_matrix[0, 0], camera_matrix[1, 1],
                                                            camera_matrix[0, 2], camera_matrix[1, 2]),
                                             tag_size=TAG_SIZE)
-                
+                detection_time = time.time()
+           
                 tags = []
                 worldCube_center_camera = None
                 R_cube1_camera = None
@@ -885,7 +920,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 R_btcap_cube2 = None
                 R_cap_global = None
                 R_cap_mag = None
-                R_btcap_mag = None
+                R_btcap_mag = np.eye(3)
 
                 est_pos_ref = None
                 t_cube1_cube2_tag = None
@@ -896,6 +931,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 magX = 0.0
                 magY = 0.0
                 magZ = 0.0
+
 
                
                 for det in detections:
@@ -910,13 +946,15 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         R, _ = cv2.Rodrigues(rvec)
                         tag_data = {'tag_id': det.tag_id, 'tvec': tvec.flatten(), 'R': R, 'center': np.mean(corners, axis=0)}
                         tags.append(tag_data)
+                processing_time = time.time()
+ 
 
 
                 if len(tags)>0: 
                         
                     worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
                     if worldCube_center_camera is not None:
-                        print(f"World Cube Center Camera: {worldCube_center_camera}")
+                        # print(f"World Cube Center Camera: {worldCube_center_camera}")
                         worldCube_center_z_buffer.append(worldCube_center_camera[2])
                         if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             worldCube_center_z_buffer.pop(0)
@@ -933,11 +971,13 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         worldCube_rvec, _ = cv2.Rodrigues(R_worldCube_camera)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
                     
-                    
-                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1, 2], reference_tag_id=4)
+                    ## CUBE 1
+
+
+                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1,2], reference_tag_id=1)
                     cube1_center_text = "Cube 1 Center: Not detected"
                     if cube1_center_camera is not None:
-                        print(f"Cube 1 Center Camera: {cube1_center_camera}")
+                        # print(f"Cube 1 Center Camera: {cube1_center_camera}")
                         cube1_center_z_buffer.append(cube1_center_camera[2])
                         if len(cube1_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             cube1_center_z_buffer.pop(0)
@@ -949,18 +989,21 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_cube1_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube1_center), 8, (255, 255, 0), -1)
 
-                        R_cube1_camera = compute_cube_orientation(tags, [1, 2])
+                        R_cube1_camera = compute_cube_orientation(tags, [1,2])
                         cube1_rvec_camera, _ = cv2.Rodrigues(R_cube1_camera)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube1_rvec_camera, cube1_center_camera_smoothed, AXIS_LENGTH, img_cube1_center)
                         draw_text_with_background(frame_undistorted, "CAP", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                         cube1_center_text = f"Cube 1 Center: x={cube1_center_camera_smoothed[0]:.3f} m, y={cube1_center_camera_smoothed[1]:.3f} m, z={cube1_center_camera_smoothed[2]:.3f} m"
                     
-                    cube2_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[3, 4, 5], reference_tag_id=1)
+                    ## CUBE 2
+
+
+                    cube2_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[3,4,5], reference_tag_id=5)
 
                     cube2_center_text = "Cube 2 Center: Not detected"
                     cube2_orient_text = "Cube 2 Orient: Not detected"
                     if cube2_center_camera is not None:
-                        print(f"Cube 2 Center Camera: {cube2_center_camera}")
+                        # print(f"Cube 2 Center Camera: {cube2_center_camera}")
                         cube2_center_z_buffer.append(cube2_center_camera[2])
                         if len(cube2_center_z_buffer) > Z_SMOOTHING_WINDOW:
                             cube2_center_z_buffer.pop(0)
@@ -971,7 +1014,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_points, _ = cv2.projectPoints(cube2_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_cube2_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube2_center), 8, (0, 255, 255), -1)
-                        R_cube2_camera = compute_cube_orientation(tags, [3, 4, 5])
+                        R_cube2_camera = compute_cube_orientation(tags, [3,4,5])
                         cube2_rvec_camera, _ = cv2.Rodrigues(R_cube2_camera)
                         draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec_camera, cube2_center_camera_smoothed, AXIS_LENGTH, img_cube2_center)
@@ -1007,22 +1050,22 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         t_cube1_cube2_tag[1] += cube2MagOffset_Y
                         t_cube1_cube2_tag[2] += cube2MagOffset_Z
                         cube2_center_text = f"t_Cap_Mag_tag: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m"
+
                         
                     ## Calculating relative orientation of Cap and Mag using TAG
                     if R_cube2_camera is not None and R_cube1_camera is not None:
                         R_cap_mag = R_cube2_camera.T @ R_cube1_camera
-                        R_cube2_cube1 = R_cube1_camera.T @ R_cube2_camera
-                        rel_Rsensor = R_cube2_cube1
-                        cube2_euler = rotation_matrix_to_euler(R_cube2_cube1)
+                        cube2_euler = rotation_matrix_to_euler(R_cap_mag)
                         cube2_orient_text = f"Euler: Pitch={cube2_euler[0]:.1f}deg, Roll={cube2_euler[1]:.1f}deg, Yaw={cube2_euler[2]:.1f}deg"
 
                     ## Calculating Mag global orientation using TAG
                     ## And Cap relative orientation to Mag  using BT data 
                     if R_cube2_camera is not None and R_worldCube_camera is not None:
                         R_cube2_global = R_worldCube_camera.T @ R_cube2_camera
-                        if btcap_global is not None:
-                            R_btcap_global = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
-                            R_btcap_mag =  R_cube2_global.T @ R_btcap_global
+                      
+                    if btcap_global is not None and R_cube2_global is not None:
+                        R_btcap_global = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
+                        R_btcap_mag =  R_cube2_global.T @ R_btcap_global
 
                     ## Cap Global orientation
                     if R_cube1_camera is not None and R_worldCube_camera is not None:
@@ -1035,7 +1078,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         last_position_update = current_time
 
                     # Draw estimated position and axes
-                    if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and btcap_global is not None:
+                    if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and btcap_global is not None and R_worldCube_camera is not None:
                         est_pos_ref = np.array([estX - cube2MagOffset_X, estY - cube2MagOffset_Y, estZ - cube2MagOffset_Z], dtype=np.float32)
                         est_pos_camera = R_cube2_camera @ est_pos_ref + cube2_center_camera_smoothed
                         est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
@@ -1050,8 +1093,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
                     q_btcap_mag = rotation_matrix_to_quaternion(R_btcap_mag) if R_btcap_mag is not None else [1.0, 0.0, 0.0, 0.0]
                     q_cap_global = rotation_matrix_to_quaternion(R_cap_global) if R_cap_global is not None else [1.0, 0.0, 0.0, 0.0]
-                    cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
+                    cube2_quat = rotation_matrix_to_quaternion(R_cap_mag)
                     q_cap_mag = rotation_matrix_to_quaternion(R_cap_mag) if R_cap_mag is not None else None
+
+                    calculation_time = time.time()
 
                     # Draw text on text_frame with semi-transparent backgrounds
                     mag_text = f"Mag: X={magX:.2f} uT, Y={magY:.2f} uT, Z={magZ:.2f} uT"
@@ -1063,6 +1108,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
                     pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
                     
+
+
                     intervalOffset = 1.4
                     FONT_SCALE = 1.6
                     draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
@@ -1076,26 +1123,40 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
                     # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
                     # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+
+    
                     
                     if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
                         with position_data_lock:
                             if latest_position_data:
                                 motor_data = latest_position_data.copy()
                         last_motor_update = time.time()
+
+                    drawtext_time = time.time()
+
+                    print(f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
+                    f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
+                    f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
+                    f"Detection: {(detection_time-convert_time)*1000:.1f}ms, "
+                    f"Processing: {(processing_time-detection_time)*1000:.1f}ms, "
+                    f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
+                    f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
+                    f"Total: {(time.time()-start_time)*1000:.1f}ms")                              
+
                     
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('t') or auto_record_flag:
                         if magX is not None and magY is not None and magZ is not None and cube2_quat is not None:
                             measurement_order += 1
-                            cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
+                            # cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
                             errorX = estX - t_cube1_cube2_tag[0]
                             errorY = estY - t_cube1_cube2_tag[1]
                             errorZ = estZ - t_cube1_cube2_tag[2]
                             writer.writerow([
                                 measurement_order,
                                 f'{t_cube1_cube2_tag[0]:.6f}', f'{t_cube1_cube2_tag[1]:.6f}', f'{t_cube1_cube2_tag[2]:.6f}',
-                                f'{cube2_quat[0]:.4f}', f'{cube2_quat[1]:.4f}', f'{cube2_quat[2]:.4f}', f'{cube2_quat[3]:.3f}',
-                                f'{cube2_euler[0]:.2f}', f'{cube2_euler[1]:.2f}', f'{cube2_euler[2]:.2f}',
+                                f'{cube2_quat[0]:.5f}', f'{cube2_quat[1]:.5f}', f'{cube2_quat[2]:.5f}', f'{cube2_quat[3]:.5f}',
+                                f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
                                 f'{magX:.3f}', f'{magY:.3f}', f'{magZ:.3f}',
                                 f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
                                 f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
@@ -1104,13 +1165,18 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                             draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                             time.sleep(0.2)
                             auto_record_flag = False
+
+                    
                     
                 text_frame_resized = cv2.resize(text_frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
                 camera_frame_resized = resize_frame(frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
                 combined_frame = np.vstack((text_frame_resized, camera_frame_resized))
                 
+ 
+                
                 cv2.imshow("AprilTag Localization", combined_frame)
-                    
+
+
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     stop_event.set()
                     break
@@ -1128,6 +1194,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
 if __name__ == "__main__":
     try:
+        
         camera_matrix, dist_coeffs = calibrate_camera()
         if camera_matrix is not None and dist_coeffs is not None:
             detect_apriltags(camera_matrix, dist_coeffs)

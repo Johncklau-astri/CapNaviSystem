@@ -187,145 +187,167 @@ def vertPreMove(dev, motors):
 def automated_movement(dev,motors):
     global worldX, worldY, worldZ # Assume actual_pos tracks motor positions
     global rollAngle, pitchAngle, yawAngle
-    interval = 1    ## in cm
-    x_range = 10    ## in cm
-    y_range = 1    ## in cm
-    z_range = 30   ## in cm
+    interval = 2    ## in cm
+    x_number = 5    ## in quantity
+    y_number = 4    ## in quantity
+    z_number = 14   ## in quantity
+    pitch_iteration = 3
 
-    speed = 60
-    acc= 200
-    dec = 200
+    speed = 65
+    acc= 250
+    dec = 250
     print("Magnet should be at middle height of test range")
 
-    small_timeout = 0.3
-    mid_timeout = 0.4
+    small_timeout = 1.3 ##1.3
+    mid_timeout = 0.5   ##0.5
     big_timeout = 5
 
-    
-    for y in range(0, y_range, interval):
-        if( y != 0):
-            if(x_range % 2 == 0):
-                setUpHoriMotorMove(dev, hori1, -x_range, 30, acc, dec)
-                setUpHoriMotorMove(dev, hori2, -x_range, 30, acc, dec)
-                setUpVertMotorMove(dev, vert1, -z_range, 30, acc, dec)
-                setUpVertMotorMove(dev, vert2, -z_range, 30, acc, dec)
-                launchMoveCommand(dev, motors)
-            else:
-                setUpHoriMotorMove(dev, hori1, -x_range, 30, acc, dec)
-                setUpHoriMotorMove(dev, hori2, -x_range, 30, acc, dec)
+    for x in range(0,x_number):
+        # Returning pitch to zero
+        if (x != 0):
+            setUpPitchMotorMove(dev, pitch, 30, speed, acc, dec)    
+        for p in range(0, pitch_iteration):
 
-                launchMoveCommand(dev, motors)
-        else:
+            ## Adjust pitch to +30deg
+            if(p == 1):
+                setUpPitchMotorMove(dev, pitch, 30, speed, acc, dec)
+            ## Adjust pitch to +30deg
+            if(p == 2):
+                setUpPitchMotorMove(dev, pitch, -60, speed, acc, dec)
 
-            ## Start at lowest point
-            setUpVertMotorMove(dev, vert1, -z_range/2, 30, acc, dec)
-            setUpVertMotorMove(dev, vert2, -z_range/2, 30, acc, dec)
+            if( p != 0):
+                # if(y_number % 2 == 0):
+                    setUpHoriMotorMove(dev, hori1, -y_number*interval, 30, acc, dec)
+                    setUpHoriMotorMove(dev, hori2, -y_number*interval, 30, acc, dec)
+                    setUpVertMotorMove(dev, vert1, -z_number*interval, 30, acc, dec)
+                    setUpVertMotorMove(dev, vert2, -z_number*interval, 30, acc, dec)
+                # else:
+                #     setUpHoriMotorMove(dev, hori1, -y_number*interval, 30, acc, dec)
+                #     setUpHoriMotorMove(dev, hori2, -y_number*interval, 30, acc, dec)
+
+            elif( p == 0 and x != 0):
+                    setUpHoriMotorMove(dev, hori1, -y_number*interval, 30, acc, dec)
+                    setUpHoriMotorMove(dev, hori2, -y_number*interval, 30, acc, dec)
+                    setUpVertMotorMove(dev, vert1, -z_number*interval, 30, acc, dec)
+                    setUpVertMotorMove(dev, vert2, -z_number*interval, 30, acc, dec)                
+                    print("Press S to start the automated movement at this y-plane")
+
+            elif ( p == 0 and x == 0):
+
+                ## Start at lowest point
+                setUpHoriMotorMove(dev, hori1, -y_number*interval, 30, acc, dec)
+                setUpHoriMotorMove(dev, hori2, -y_number*interval, 30, acc, dec)            
+                setUpVertMotorMove(dev, vert1, -z_number*interval/2, 30, acc, dec)
+                setUpVertMotorMove(dev, vert2, -z_number*interval/2, 30, acc, dec)
+                print("Press S to start the automated movement at this y-plane")
+
             launchMoveCommand(dev, motors)
-            print("Press S to start the automated movement at this y-plane")
-
-
-        while True:
-            if msvcrt.kbhit():
-                key = msvcrt.getch().decode('utf-8').lower()
-                if key == 's':
-                    print(f"Starting movement for y={y} cm")
-                    break
-                elif key == 'q':
-                    print("\nEmergency stop triggered.")
-                    for motor in motors:
-                        quick_stop_frame = GsUsbFrame(
-                            can_id=0x600 + motor.node_id,
-                            data=bytes.fromhex("2B4060000B000000")  # Quick Stop
-                        )
-                        try:
-                            dev.send(quick_stop_frame)
-                            print(f"Emergency stop: Quick Stop sent to Motor {motor.node_id} ({motor.name})")
-                        except Exception as e:
-                            print(f"Failed to send Quick Stop to Motor {motor.node_id}: {e}")
-                        reset_frame = GsUsbFrame(
-                            can_id=0x600 + motor.node_id,
-                            data=bytes.fromhex("2B40600006000000")  # Switch On Disabled
-                        )
-                        try:
-                            dev.send(reset_frame)
-                            print(f"Reset: Motor {motor.node_id} ({motor.name}) set to Switch On Disabled")
-                        except Exception as e:
-                            print(f"Failed to reset Motor {motor.node_id}: {e}")
-                    print("Exiting...")
-                    return
-            time.sleep(0.1)  # Prevent CPU overuse
-
-
-        for x in range(0, x_range, interval):
-            if(x != 0):
-                setUpHoriMotorMove(dev, hori1, interval, speed, acc, dec)
-                setUpHoriMotorMove(dev, hori2, interval, speed, acc, dec)
-                launchMoveCommand(dev, motors)
-                time.sleep(small_timeout)  # Wait for the move to complete
-            for z in range(0, z_range, interval):
-                if(z != 0):
-                    if( x % 2 == 0):
-                        setUpVertMotorMove(dev, vert1, interval, speed, acc, dec)
-                        setUpVertMotorMove(dev, vert2, interval, speed, acc, dec)
-                        launchMoveCommand(dev, motors)
-                    else:
-                        setUpVertMotorMove(dev, vert1, -interval, speed, acc, dec)
-                        setUpVertMotorMove(dev, vert2, -interval, speed, acc, dec)
-                        launchMoveCommand(dev, motors)
-                time.sleep(small_timeout)  # Wait for the move to complete        
-                q = euler_to_quaternion(0, 0, 0) ## dummy value as they are not used in optimization because its the aprilTag orientation that matters
-                worldX =0
-                worldY = 0
-                worldZ = 0
-                # Send TCP signal with record_data=True
-                # Prepare data to send
-                data_to_send = {
-                    "x": float(0),  # Convert to float for JSON serialization
-                    "y": float(0),
-                    "z": float(0),
-                    "qw": float(1),
-                    "qx": float(0),
-                    "qy": float(0),
-                    "qz": float(0),
-                    "record_data": True
-                }
-                send_data_to_arduino(data_dict=data_to_send)
-                time.sleep(mid_timeout)  # Brief pause
-                print(f"x: {x}, y: {y}, z: {z}")
-                print("Sent signal to Arduino to record data.")
-                
-                if msvcrt.kbhit():
-                    key = msvcrt.getch().decode('utf-8').lower()
-                    if key == 'q':
-                        print("\nEmergency stop triggered.")
-                        # Stop the listener thread before quitting
-                        for motor in motors:
-                            quick_stop_frame = GsUsbFrame(
-                                can_id=0x600 + motor.node_id,
-                                data=bytes.fromhex("2B4060000B000000")  # Quick Stop
-                            )
-                            try:
-                                dev.send(quick_stop_frame)
-                                print(f"Emergency stop: Quick Stop sent to Motor {motor.node_id} ({motor.name})")
-                            except Exception as e:
-                                print(f"Failed to send Quick Stop to Motor {motor.node_id}: {e}")
-                        
-                        # Reset to Switch On Disabled state
-                        for motor in motors:
-                            reset_frame = GsUsbFrame(
-                                can_id=0x600 + motor.node_id,
-                                data=bytes.fromhex("2B40600006000000")  # Controlword 0x0006: Switch On Disabled
-                            )
-                            try:
-                                dev.send(reset_frame)
-                                print(f"Reset: Motor {motor.node_id} ({motor.name}) set to Switch On Disabled")
-                            except Exception as e:
-                                print(f"Failed to reset Motor {motor.node_id}: {e}")
-                                
-                        print("Exiting...")
+    
+            if (p == 0):
+                while True:
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch().decode('utf-8').lower()
+                        if key == 's':
+                            print(f"Starting movement for x={x} cm")
+                            break
+                        elif key == 'q':
+                            print("\nEmergency stop triggered.")
+                            for motor in motors:
+                                quick_stop_frame = GsUsbFrame(
+                                    can_id=0x600 + motor.node_id,
+                                    data=bytes.fromhex("2B4060000B000000")  # Quick Stop
+                                )
+                                try:
+                                    dev.send(quick_stop_frame)
+                                    print(f"Emergency stop: Quick Stop sent to Motor {motor.node_id} ({motor.name})")
+                                except Exception as e:
+                                    print(f"Failed to send Quick Stop to Motor {motor.node_id}: {e}")
+                                reset_frame = GsUsbFrame(
+                                    can_id=0x600 + motor.node_id,
+                                    data=bytes.fromhex("2B40600006000000")  # Switch On Disabled
+                                )
+                                try:
+                                    dev.send(reset_frame)
+                                    print(f"Reset: Motor {motor.node_id} ({motor.name}) set to Switch On Disabled")
+                                except Exception as e:
+                                    print(f"Failed to reset Motor {motor.node_id}: {e}")
+                            print("Exiting...")
+                            return
+                    time.sleep(0.1)  # Prevent CPU overuse
             else:
-                continue
-            break
+                time.sleep(13)   
+
+
+            for y in range(0, y_number+1):
+                if(y != 0):
+                    setUpHoriMotorMove(dev, hori1, interval, speed, acc, dec)
+                    setUpHoriMotorMove(dev, hori2, interval, speed, acc, dec)
+                    launchMoveCommand(dev, motors)
+                    time.sleep(small_timeout)  # Wait for the move to complete
+                for z in range(0, z_number+1):
+                    if(z != 0):
+                        if( y % 2 == 0):
+                            setUpVertMotorMove(dev, vert1, interval, speed, acc, dec)
+                            setUpVertMotorMove(dev, vert2, interval, speed, acc, dec)
+                            launchMoveCommand(dev, motors)
+                        else:
+                            setUpVertMotorMove(dev, vert1, -interval, speed, acc, dec)
+                            setUpVertMotorMove(dev, vert2, -interval, speed, acc, dec)
+                            launchMoveCommand(dev, motors)
+                    time.sleep(small_timeout)  # Wait for the move to complete        
+                    q = euler_to_quaternion(0, 0, 0) ## dummy value as they are not used in optimization because its the aprilTag orientation that matters
+                    worldX =0
+                    worldY = 0
+                    worldZ = 0
+                    # Send TCP signal with record_data=True
+                    # Prepare data to send
+                    data_to_send = {
+                        "x": float(0),  # Convert to float for JSON serialization
+                        "y": float(0),
+                        "z": float(0),
+                        "qw": float(1),
+                        "qx": float(0),
+                        "qy": float(0),
+                        "qz": float(0),
+                        "record_data": True
+                    }
+                    send_data_to_arduino(data_dict=data_to_send)
+                    time.sleep(mid_timeout)  # Brief pause
+                    print(f"x: {x}, y: {y}, z: {z}")
+                    print("Sent signal to Arduino to record data.")
+                    
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch().decode('utf-8').lower()
+                        if key == 'q':
+                            print("\nEmergency stop triggered.")
+                            # Stop the listener thread before quitting
+                            for motor in motors:
+                                quick_stop_frame = GsUsbFrame(
+                                    can_id=0x600 + motor.node_id,
+                                    data=bytes.fromhex("2B4060000B000000")  # Quick Stop
+                                )
+                                try:
+                                    dev.send(quick_stop_frame)
+                                    print(f"Emergency stop: Quick Stop sent to Motor {motor.node_id} ({motor.name})")
+                                except Exception as e:
+                                    print(f"Failed to send Quick Stop to Motor {motor.node_id}: {e}")
+                            
+                            # Reset to Switch On Disabled state
+                            for motor in motors:
+                                reset_frame = GsUsbFrame(
+                                    can_id=0x600 + motor.node_id,
+                                    data=bytes.fromhex("2B40600006000000")  # Controlword 0x0006: Switch On Disabled
+                                )
+                                try:
+                                    dev.send(reset_frame)
+                                    print(f"Reset: Motor {motor.node_id} ({motor.name}) set to Switch On Disabled")
+                                except Exception as e:
+                                    print(f"Failed to reset Motor {motor.node_id}: {e}")
+                                    
+                            print("Exiting...")
+                else:
+                    continue
+                break
     print("Automated movement completed.")
 
 
@@ -1291,9 +1313,14 @@ press q to quit
             global rotaryDisplacement, vertDisplacement, horiDisplacement, pitchAngle, rollAngle , yawAngle
             # Predefined travel amounts
             rotary_travel = 10.0    # degrees (positive/negative)
-            vert_travel = 2      # cm (positive/negative, for vert1 and vert2)
+            vert_travel = 5      # cm (positive/negative, for vert1 and vert2)
             hori_travel = 2      # cm (positive/negative, for hori1 and hori2)
-            pitch_travel = 1.0     # degrees (positive/negative)
+            pitch_travel = 5.0     # degrees (positive/negative)
+
+            vert_travel_fine = 0.1  # cm for fine control
+            pitch_travel_fine = 0.5  # degrees for fine control
+
+            vert_travel_super_fine = 0.1  # cm for super fine control
 
             # Fixed speed, acceleration, deceleration
             speed = 50  # RPM or steps/s (adjust as needed)
@@ -1355,6 +1382,16 @@ press q to quit
                         break
                     elif key == 's':  # 's' to reselect motor
                         selected_option = None
+                        print("Available options:")
+                        print("  1: Rotary (h: CW, j: CCW)")
+                        print("  2: Vert1+Vert2 (h: UP, j: DOWN)")
+                        print("  3: Hori1+Hori2 (h: UP, j: DOWN)")
+                        print("  4: Pitch (h: +5°, j: -5°)")
+                        print("  5: Vert1 (h: UP, j: DOWN)")
+                        print("  6: Vert2 (h: UP, j: DOWN)")
+                        print("  7: Hori1 (h: UP, j: DOWN)")
+                        print("  8: Hori2 (h: UP, j: DOWN)")
+                        print("Press 'q' to exit manual mode.")                        
                         print("Returning to motor selection.")
                         continue
 
@@ -1381,6 +1418,18 @@ press q to quit
                             print(f"Vert1 and Vert2 moved by {'+' if travel > 0 else ''}{travel} cm")
                             print(f"Current Vert Displacement: {vertDisplacement} cm")
 
+                        # Verti1 and Vert2 in unison fine control with "n,m" keys
+                        elif selected_option == 2 and key in ('n', 'm'):
+                            travel = vert_travel_fine if key == 'n' else -vert_travel_fine
+                            setUpVertMotorMove(dev, vert1, travel, speed, acc, dec)
+                            setUpVertMotorMove(dev, vert2, travel, speed, acc, dec)
+                            launchMoveCommand(dev, motors)
+
+                            vertDisplacement = vertDisplacement + vert_travel_fine if key == 'n' else vertDisplacement - vert_travel_fine
+                            print(f"Vert1 and Vert2 moved by {'+' if travel > 0 else ''}{travel} cm (fine control)")
+                            print(f"Current Vert Displacement: {vertDisplacement} cm")
+
+
                         # Hori1 and Hori2 in unison (Option 3)
                         elif selected_option == 3 and key in ('h', 'j'):
                             travel = hori_travel if key == 'h' else -hori_travel
@@ -1400,34 +1449,45 @@ press q to quit
 
                             print(f"Pitch moved by {'+' if travel > 0 else ''}{travel} degrees")
                             print(f"Current Pitch Angle: {pitchAngle} degrees")
+                        # Pitch fine control with "n,m" keys
+                        elif selected_option == 4 and key in ('n', 'm'):
+                            travel = pitch_travel_fine if key == 'n' else -pitch_travel_fine
+                            setUpPitchMotorMove(dev, pitch, travel, speed, acc, dec)
+                            launchMoveCommand(dev, motors)
+                            pitchAngle = pitchAngle + pitch_travel_fine if key == 'n' else pitchAngle - pitch_travel_fine
+
+                            print(f"Pitch moved by {'+' if travel > 0 else ''}{travel} degrees (fine control)")
+                            print(f"Current Pitch Angle: {pitchAngle} degrees")
 
                         # Vert1 individually (Option 5)
                         elif selected_option == 5 and key in ('h', 'j'):
-                            travel = vert_travel if key == 'h' else -vert_travel
+                            travel = vert_travel_super_fine if key == 'h' else -vert_travel_super_fine
                             setUpVertMotorMove(dev, vert1, travel, speed, acc, dec)
                             launchMoveCommand(dev, motors)
                             print(f"Vert1 moved by {'+' if travel > 0 else ''}{travel} cm")
 
                         # Vert2 individually (Option 6)
                         elif selected_option == 6 and key in ('h', 'j'):
-                            travel = vert_travel if key == 'h' else -vert_travel
+                            travel = vert_travel_super_fine if key == 'h' else -vert_travel_super_fine
                             setUpVertMotorMove(dev, vert2, travel, speed, acc, dec)
                             launchMoveCommand(dev, motors)
                             print(f"Vert2 moved by {'+' if travel > 0 else ''}{travel} cm")
 
                         # Hori1 individually (Option 7)
                         elif selected_option == 7 and key in ('h', 'j'):
-                            travel = hori_travel if key == 'h' else -hori_travel
+                            travel = vert_travel_super_fine if key == 'h' else -vert_travel_super_fine
                             setUpHoriMotorMove(dev, hori1, travel, speed, acc, dec)
                             launchMoveCommand(dev, motors)
                             print(f"Hori1 moved by {'+' if travel > 0 else ''}{travel} cm")
 
                         # Hori2 individually (Option 8)
                         elif selected_option == 8 and key in ('h', 'j'):
-                            travel = hori_travel if key == 'h' else -hori_travel
+                            travel = vert_travel_super_fine if key == 'h' else -vert_travel_super_fine
                             setUpHoriMotorMove(dev, hori2, travel, speed, acc, dec)
                             launchMoveCommand(dev, motors)
                             print(f"Hori2 moved by {'+' if travel > 0 else ''}{travel} cm")
+
+
                         
                         
                         print("Rotary Displacement:", rotaryDisplacement)

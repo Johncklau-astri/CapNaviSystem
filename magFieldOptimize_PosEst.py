@@ -18,11 +18,11 @@ import argparse
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
-CSV_FILE = 'Allpoints.csv'
+CSV_FILE = 'nov11Mag.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
-max_Bfield = 8000  # Maximum magnetic field in µT
+max_Bfield = 12000  # Maximum magnetic field in µT
 
 # Constants
 mu_0 = 4 * np.pi * 1e-7
@@ -229,13 +229,45 @@ def initial_position_guess(B_measured, m, R_sensor, pos_bounds):
     B_global = R_sensor @ B_measured
     B_mag = np.linalg.norm(B_global)
     m_mag = np.linalg.norm(m)
+    
     if B_mag < 1e-10 or m_mag < 1e-10:
         return np.mean(pos_bounds, axis=0)
+    
+    # Use multiple initial guesses including bounds and center
+    guesses = []
+    
+    # Traditional dipole estimate
     r_est = ((mu_0 / (4 * np.pi)) * (2 * m_mag) / B_mag) ** (1/3)
-    B_unit = B_global / B_mag if B_mag > 0 else np.array([1, 0, 0])
-    r_guess = r_est * B_unit
-    r_guess = np.clip(r_guess, pos_bounds[0], pos_bounds[1])
-    return r_guess
+    B_unit = B_global / B_mag
+    guesses.append(r_est * B_unit)
+    
+    # Add center point
+    guesses.append(np.mean(pos_bounds, axis=0))
+    
+    # Add points near bounds (but not exactly at bounds)
+    bounds_center = np.mean(pos_bounds, axis=0)
+    for i in range(3):
+        point = bounds_center.copy()
+        point[i] = pos_bounds[0][i] + 0.1 * (pos_bounds[1][i] - pos_bounds[0][i])
+        guesses.append(point)
+        
+        point = bounds_center.copy()
+        point[i] = pos_bounds[1][i] - 0.1 * (pos_bounds[1][i] - pos_bounds[0][i])
+        guesses.append(point)
+    
+    # Evaluate which guess has smallest residual
+    best_guess = None
+    best_residual = np.inf
+    
+    for guess in guesses:
+        guess_clipped = np.clip(guess, pos_bounds[0], pos_bounds[1])
+        residual = np.linalg.norm(residuals_position(guess_clipped, B_measured, m, R_sensor, 
+                                                   1,0,1,0,1,0))
+        if residual < best_residual:
+            best_residual = residual
+            best_guess = guess_clipped
+            
+    return best_guess
 
 def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
     B_pred = np.array([
@@ -316,8 +348,10 @@ def train_correction_model(data_df):
     
     X = valid_data[features].values
     y_x = valid_data['Error_Xm'].values
-    y_y = data_df['Error_Ym'].values
-    y_z = data_df['Error_Zm'].values
+    y_y = valid_data['Error_Ym'].values  # ← FIXED: Use valid_data instead of data_df
+    y_z = valid_data['Error_Zm'].values  # ← FIXED: Use valid_data instead of data_df
+    
+    print(f"Training data shapes - X: {X.shape}, y_x: {y_x.shape}, y_y: {y_y.shape}, y_z: {y_z.shape}")
     
     X_train, X_val, y_x_train, y_x_val = train_test_split(X, y_x, test_size=0.2, random_state=42)
     _, _, y_y_train, y_y_val = train_test_split(X, y_y, test_size=0.2, random_state=42)
@@ -559,7 +593,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
                                         dipole_params['a_x'], dipole_params['b_x'],
                                         dipole_params['a_y'], dipole_params['b_y'],
                                         dipole_params['a_z'], dipole_params['b_z']),
-                                  bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
+                                  bounds=pos_bounds, method='dogbox', ftol=1e-8, xtol=1e-8)
             if not result.success or np.any(np.isnan(result.x)):
                 print(f"Optimization failed for point {i}: B={B / muT_to_T}")
                 r_estimated[i] = r_init
@@ -567,7 +601,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
             else:
                 r_estimated[i] = result.x
                 pos_errors[i] = result.x - positions_data[i]
-            print(f"Point {i}: Est_Xm={r_estimated[i,0]:.6f}, Est_Ym={r_estimated[i,1]:.6f}, Est_Zm={r_estimated[i,2]:.6f}")
+            print(f"Point {i}: Est_Xm={r_estimated[i,0]:.6f}, Est_Ym={r_estimated[i,1]:.6f}, Est_Zm={r_estimated[i,2]:.6f}\t\t Initial Guess: x={r_init[0]:.6f}, y={r_init[1]:.6f}, z={r_init[2]:.6f}\t\t Est-Init: x={r_estimated[i,0]-r_init[0]:.6f}, y={r_estimated[i,1]-r_init[1]:.6f}, z={r_estimated[i,2]-r_init[2]:.6f}")
         except Exception as e:
             print(f"Error estimating position for point {i}: {str(e)}")
             r_estimated[i] = positions_data[i]
