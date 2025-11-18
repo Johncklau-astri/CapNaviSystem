@@ -18,11 +18,11 @@ import argparse
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
-CSV_FILE = 'nov11Mag.csv'
+CSV_FILE = 'trainingSetNoPitch.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
-max_Bfield = 12000  # Maximum magnetic field in µT
+max_Bfield = 20000  # Maximum magnetic field in µT
 
 # Constants
 mu_0 = 4 * np.pi * 1e-7
@@ -93,9 +93,9 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models):
                     start_time = time.time()
                     r_est, r_init = estimate_position_custom(
                         B_custom, quat_sensor, dipole_params['m'], pos_bounds,
-                        dipole_params['a_x'], dipole_params['b_x'],
-                        dipole_params['a_y'], dipole_params['b_y'],
-                        dipole_params['a_z'], dipole_params['b_z'],
+                        dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+                        dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+                        dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
                         xgb_models
                     )
                     estimation_time = time.time() - start_time
@@ -124,32 +124,50 @@ def load_dipole_params():
     try:
         with open(param_file, 'r') as f:
             params = json.load(f)
-        required_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'a_y', 'b_y', 'a_z', 'b_z']
+        # Check for enhanced parameters first, fall back to linear
+        enhanced_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'c_x', 'a_y', 'b_y', 'c_y', 'a_z', 'b_z', 'c_z']
+        linear_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'a_y', 'b_y', 'a_z', 'b_z']
+        
+        if all(key in params for key in enhanced_keys):
+            # Enhanced parameters with quadratic terms
+            required_keys = enhanced_keys
+            is_enhanced = True
+        elif all(key in params for key in linear_keys):
+            # Linear parameters, set quadratic terms to zero
+            required_keys = linear_keys
+            is_enhanced = False
+        else:
+            missing_enhanced = [key for key in enhanced_keys if key not in params]
+            missing_linear = [key for key in linear_keys if key not in params]
+            print(f"Missing keys in {param_file}: Enhanced: {missing_enhanced}, Linear: {missing_linear}")
+            return None
+        
         missing_keys = [key for key in required_keys if key not in params]
         if missing_keys:
             print(f"Missing keys in {param_file}: {missing_keys}")
             return None
+        
         m = np.array([params['m_x'], params['m_y'], params['m_z']])
         if np.linalg.norm(m) > 1000:
             print(f"Dipole moment norm ({np.linalg.norm(m):.3f} A·m²) is too large.")
             return None
-        for key in ['a_x', 'a_y', 'a_z']:
-            if not 0.1 <= params[key] <= 10:
-                print(f"{key} ({params[key]:.3f}) out of valid range [0.1, 10].")
-                return None
-        for key in ['b_x', 'b_y', 'b_z']:
-            if not -1 <= params[key] <= 1:
-                print(f"{key} ({params[key]:.3f}) out of valid range [-1, 1].")
-                return None
-        return {
-            'm': m,
-            'a_x': params['a_x'],
-            'b_x': params['b_x'],
-            'a_y': params['a_y'],
-            'b_y': params['b_y'],
-            'a_z': params['a_z'],
-            'b_z': params['b_z']
-        }
+        
+        if is_enhanced:
+            return {
+                'm': m,
+                'a_x': params['a_x'], 'b_x': params['b_x'], 'c_x': params['c_x'],
+                'a_y': params['a_y'], 'b_y': params['b_y'], 'c_y': params['c_y'],
+                'a_z': params['a_z'], 'b_z': params['b_z'], 'c_z': params['c_z']
+            }
+        else:
+            # Linear parameters - set quadratic terms to zero
+            return {
+                'm': m,
+                'a_x': 0.0, 'b_x': params['a_x'], 'c_x': params['b_x'],  # Map a_x->b_x, b_x->c_x
+                'a_y': 0.0, 'b_y': params['a_y'], 'c_y': params['b_y'],
+                'a_z': 0.0, 'b_z': params['a_z'], 'c_z': params['b_z']
+            }
+            
     except json.JSONDecodeError as e:
         print(f"Failed to decode {param_file}: {e}")
         return None
@@ -173,32 +191,59 @@ def quaternion_to_rotation_matrix(q):
     ])
     return R
 
-def dipole_field(r, m, R_sensor=None, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
+def dipole_field_enhanced(r, m, R_sensor=None, a_x=0.0, b_x=1.0, c_x=0.0, a_y=0.0, b_y=1.0, c_y=0.0, a_z=0.0, b_z=1.0, c_z=0.0):
+    """
+    Enhanced magnetic field model with quadratic position corrections
+    r: position vector [x, y, z] in meters
+    m: dipole moment vector [mx, my, mz] in A·m²
+    a_x, b_x, c_x: quadratic coefficients for x-coordinate transformation: p_x = a_x * x^2 + b_x * x + c_x
+    """
     x, y, z = r
-    p_x = a_x * x + b_x
-    p_y = a_y * y + b_y
-    p_z = a_z * z + b_z
+    
+    # Apply quadratic corrections to position
+    p_x = a_x * x**2 + b_x * x + c_x
+    p_y = a_y * y**2 + b_y * y + c_y
+    p_z = a_z * z**2 + b_z * z + c_z
     p = [p_x, p_y, p_z]
+    
     m_x, m_y, m_z = m
     r2 = p_x**2 + p_y**2 + p_z**2
-    if r2 < 1e-6:
+    
+    if r2 < 1e-12:
         return np.zeros(3)
+    
+    r_mag = np.sqrt(r2)
     r5 = r2**2.5
+    
+    # Dipole field
     r_dot_m = p_x * m_x + p_y * m_y + p_z * m_z
-    B_x = factor * (3 * p_x * r_dot_m / r5 - m_x / r2)
-    B_y = factor * (3 * p_y * r_dot_m / r5 - m_y / r2)
-    B_z = factor * (3 * p_z * r_dot_m / r5 - m_z / r2)
-    B_global = np.array([B_x, B_y, B_z]) * muT_to_T
+    
+    B_x = factor * (3 * p_x * r_dot_m / r5 - m_x / (r2 * r_mag))
+    B_y = factor * (3 * p_y * r_dot_m / r5 - m_y / (r2 * r_mag))
+    B_z = factor * (3 * p_z * r_dot_m / r5 - m_z / (r2 * r_mag))
+    
+    B_global = np.array([B_x, B_y, B_z])
+    B_global *= muT_to_T
+    
     if R_sensor is None:
         R_sensor = np.eye(3)
+    
     B_local = R_sensor.T @ B_global
     return B_local
 
-def residuals_m(m, positions, B_measured, quaternions):
+# For backward compatibility
+def dipole_field(r, m, R_sensor=None, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
+    """Wrapper for linear model - maps to quadratic with a_x=0"""
+    return dipole_field_enhanced(r, m, R_sensor, 0.0, a_x, b_x, 0.0, a_y, b_y, 0.0, a_z, b_z)
+
+def residuals_m(params, positions, B_measured, quaternions):
+    """Residuals for dipole moment optimization using enhanced model"""
+    m = params
     residuals = []
     for r, B_meas, quat in zip(positions, B_measured, quaternions):
         R_sensor = quaternion_to_rotation_matrix(quat)
-        B_pred = dipole_field(r, m, R_sensor)
+        # Use enhanced model with default quadratic coefficients (linear transformation)
+        B_pred = dipole_field_enhanced(r, m, R_sensor, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0)
         residuals.append(B_pred - B_meas)
     return np.ravel(residuals)
 
@@ -206,23 +251,30 @@ def objective_m(m, positions, B_measured, quaternions):
     res = residuals_m(m, positions, B_measured, quaternions)
     return np.sum(res**2)
 
-def residuals_ab(params, m_fixed, positions, B_measured, quaternions):
-    a_x, b_x, a_y, b_y, a_z, b_z = params
+def residuals_abc(params, m_fixed, positions, B_measured, quaternions):
+    """Residuals for quadratic coefficients optimization"""
+    a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z = params
     residuals = []
     for r, B_meas, quat in zip(positions, B_measured, quaternions):
         R_sensor = quaternion_to_rotation_matrix(quat)
-        B_pred = dipole_field(r, m_fixed, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z)
+        B_pred = dipole_field_enhanced(r, m_fixed, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
         residuals.append(B_pred - B_meas)
     return np.ravel(residuals)
 
-def objective_ab(params, m_fixed, positions, B_measured, quaternions, lambda_reg=1e-3):
-    a_x, b_x, a_y, b_y, a_z, b_z = params
-    res = residuals_ab(params, m_fixed, positions, B_measured, quaternions)
-    reg = lambda_reg * ((a_x - 1.0)**2 + (a_y - 1.0)**2 + (a_z - 1.0)**2)
+def objective_abc(params, m_fixed, positions, B_measured, quaternions, lambda_reg=1e-3):
+    a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z = params
+    res = residuals_abc(params, m_fixed, positions, B_measured, quaternions)
+    # Regularization to prefer simpler models (closer to identity transformation)
+    reg = lambda_reg * (
+        (a_x - 0.0)**2 + (b_x - 1.0)**2 + (c_x - 0.0)**2 +
+        (a_y - 0.0)**2 + (b_y - 1.0)**2 + (c_y - 0.0)**2 +
+        (a_z - 0.0)**2 + (b_z - 1.0)**2 + (c_z - 0.0)**2
+    )
     return np.sum(res**2) + reg
 
-def residuals_position(r, B_measured, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z):
-    B_pred = dipole_field(r, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z)
+def residuals_position_enhanced(r, B_measured, m, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z):
+    """Residuals for position estimation using enhanced model"""
+    B_pred = dipole_field_enhanced(r, m, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
     return B_pred - B_measured
 
 def initial_position_guess(B_measured, m, R_sensor, pos_bounds):
@@ -261,24 +313,30 @@ def initial_position_guess(B_measured, m, R_sensor, pos_bounds):
     
     for guess in guesses:
         guess_clipped = np.clip(guess, pos_bounds[0], pos_bounds[1])
-        residual = np.linalg.norm(residuals_position(guess_clipped, B_measured, m, R_sensor, 
-                                                   1,0,1,0,1,0))
+        # Use enhanced model with default coefficients for initial guess
+        residual = np.linalg.norm(residuals_position_enhanced(guess_clipped, B_measured, m, R_sensor, 
+                                                             0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0))
         if residual < best_residual:
             best_residual = residual
             best_guess = guess_clipped
             
     return best_guess
 
-def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
+def compute_metrics_enhanced(m, positions, B_measured, quaternions, 
+                           a_x=0.0, b_x=1.0, c_x=0.0, 
+                           a_y=0.0, b_y=1.0, c_y=0.0, 
+                           a_z=0.0, b_z=1.0, c_z=0.0):
+    """Compute metrics using enhanced dipole field model"""
     B_pred = np.array([
-        dipole_field(r, m, quaternion_to_rotation_matrix(quat), a_x, b_x, a_y, b_y, a_z, b_z)
+        dipole_field_enhanced(r, m, quaternion_to_rotation_matrix(quat), 
+                            a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
         for r, quat in zip(positions, quaternions)
     ])
     errors = B_pred - B_measured
     rmse = np.sqrt(np.mean(errors**2)) * 1e6
     angular_errors = []
     for b_p, b_m in zip(B_pred, B_measured):
-        if np.linalg.norm(b_m) > 1e-10:
+        if np.linalg.norm(b_m) > 1e-10 and np.linalg.norm(b_p) > 1e-10:
             cos_theta = np.dot(b_p, b_m) / (np.linalg.norm(b_p) * np.linalg.norm(b_m))
             cos_theta = np.clip(cos_theta, -1, 1)
             theta = np.arccos(cos_theta) * 180 / np.pi
@@ -288,7 +346,12 @@ def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y
     mean_angular_error = np.nanmean(angular_errors) if angular_errors else np.nan
     return rmse, mean_angular_error, angular_errors, B_pred * 1e6
 
-def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, xgb_models=None):
+# For backward compatibility
+def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
+    return compute_metrics_enhanced(m, positions, B_measured, quaternions, 
+                                  0.0, a_x, b_x, 0.0, a_y, b_y, 0.0, a_z, b_z)
+
+def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z, xgb_models=None):
     if any(np.isnan(B_custom)) or any(np.isnan(quat_sensor)) or any(abs(b) > max_Bfield for b in B_custom):
         print(f"Invalid input: B_custom={B_custom}, quat_sensor={quat_sensor}")
         return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
@@ -296,8 +359,8 @@ def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y
     R_sensor = quaternion_to_rotation_matrix(quat_sensor)
     r_init = initial_position_guess(B_custom_T, m, R_sensor, pos_bounds)
     try:
-        result = least_squares(residuals_position, r_init,
-                              args=(B_custom_T, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z),
+        result = least_squares(residuals_position_enhanced, r_init,
+                              args=(B_custom_T, m, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z),
                               bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
         if not result.success or np.any(np.isnan(result.x)):
             print(f"Optimization failed or returned NaN for B_custom={B_custom}")
@@ -348,8 +411,8 @@ def train_correction_model(data_df):
     
     X = valid_data[features].values
     y_x = valid_data['Error_Xm'].values
-    y_y = valid_data['Error_Ym'].values  # ← FIXED: Use valid_data instead of data_df
-    y_z = valid_data['Error_Zm'].values  # ← FIXED: Use valid_data instead of data_df
+    y_y = valid_data['Error_Ym'].values
+    y_z = valid_data['Error_Zm'].values
     
     print(f"Training data shapes - X: {X.shape}, y_x: {y_x.shape}, y_y: {y_y.shape}, y_z: {y_z.shape}")
     
@@ -411,7 +474,7 @@ def apply_correction_model(data_df, xgb_x, xgb_y, xgb_z):
     
     return data_df
 
-def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z, true_positions=None):
+def interactive_position_estimation(m, pos_bounds, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z, true_positions=None):
     print("\nInteractive Position Estimation")
     print("Enter magnetic field in µT (e.g., 10.5,-5.2,3.1) and quaternion (e.g., 1,0,0,0)")
     print("Enter 'quit' to exit")
@@ -450,7 +513,7 @@ def interactive_position_estimation(m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z,
             print("Error: Invalid input. Use format like '1,0,0,0'")
             continue
         start_time = time.time()
-        r_est, r_init = estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, a_y, b_y, a_z, b_z)
+        r_est, r_init = estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
         estimation_time = time.time() - start_time
         print(f"\nInput: B = {B_custom} µT, Quaternion = {quat_sensor}")
         print(f"Initial Guess: x={r_init[0]:.6f}, y={r_init[1]:.6f}, z={r_init[2]:.6f} m")
@@ -588,11 +651,11 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
             R_sensor = quaternion_to_rotation_matrix(quat)
             r_init = initial_position_guess(B, dipole_params['m'], R_sensor, pos_bounds)
             r_initial[i] = r_init
-            result = least_squares(residuals_position, r_init,
+            result = least_squares(residuals_position_enhanced, r_init,
                                   args=(B, dipole_params['m'], R_sensor,
-                                        dipole_params['a_x'], dipole_params['b_x'],
-                                        dipole_params['a_y'], dipole_params['b_y'],
-                                        dipole_params['a_z'], dipole_params['b_z']),
+                                        dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+                                        dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+                                        dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z']),
                                   bounds=pos_bounds, method='dogbox', ftol=1e-8, xtol=1e-8)
             if not result.success or np.any(np.isnan(result.x)):
                 print(f"Optimization failed for point {i}: B={B / muT_to_T}")
@@ -689,7 +752,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
     plt.savefig('positional_errors_histogram_csv.png')
     plt.close()
 
-def run_optimization():
+def run_optimization_enhanced():
     positions, B_measured, quaternions, data_df = load_and_filter_data()
     if positions is None:
         print("Failed to load data for optimization.")
@@ -700,6 +763,7 @@ def run_optimization():
         print(f"Too few measurements ({N}). At least 5 are recommended.")
         return None, None, None, None, None, None, None, None
 
+    # First stage: optimize dipole moment m with simple model
     m0 = np.array([-0.1, 0, 0])
     for i, r in enumerate(positions):
         x, y, z = r
@@ -778,78 +842,103 @@ def run_optimization():
     B_pred_best = best_result['B_pred']
     best_method = best_result['Method']
 
+    # Second stage: optimize quadratic coefficients with fixed dipole moment
     start_time = time.time()
-    ab0 = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    abc0 = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]  # [a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z]
+    
+    # Set bounds for quadratic coefficients
+    abc_bounds = [
+        (-10, 10), (-10, 10), (-1, 1),  # x coefficients
+        (-10, 10), (-10, 10), (-1, 1),  # y coefficients  
+        (-10, 10), (-10, 10), (-1, 1)   # z coefficients
+    ]
+    
     try:
-        result_ab = minimize(objective_ab, ab0, args=(m_best, positions, B_measured, quaternions, 1e-3),
+        result_abc = minimize(objective_abc, abc0, args=(m_best, positions, B_measured, quaternions, 1e-3),
                             method='Nelder-Mead',
-                            bounds=[(0.1, 10), (-1, 1), (0.1, 10), (-1, 1), (0.1, 10), (-1, 1)],
-                            options={'xatol': 1e-6, 'fatol': 1e-6})
-        a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best = result_ab.x
+                            bounds=abc_bounds,
+                            options={'xatol': 1e-6, 'fatol': 1e-6, 'maxiter': 1000})
+        
+        a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best = result_abc.x
         time_taken = time.time() - start_time
-        rmse_final, ang_err_final, ang_errs_final, B_pred_final = compute_metrics(
-            m_best, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
+        
+        rmse_final, ang_err_final, ang_errs_final, B_pred_final = compute_metrics_enhanced(
+            m_best, positions, B_measured, quaternions, 
+            a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best
+        )
+        
+        print(f"Quadratic optimization completed in {time_taken:.2f}s")
+        print(f"X transformation: {a_x_best:.6f}*x² + {b_x_best:.6f}*x + {c_x_best:.6f}")
+        print(f"Y transformation: {a_y_best:.6f}*y² + {b_y_best:.6f}*y + {c_y_best:.6f}")  
+        print(f"Z transformation: {a_z_best:.6f}*z² + {b_z_best:.6f}*z + {c_z_best:.6f}")
+        
     except Exception as e:
-        print(f"Error in Second Stage (Nelder-Mead): {str(e)}")
-        a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best = 1.0, 0.0, 1.0, 0.0, 1.0, 0.0
+        print(f"Error in Quadratic Stage (Nelder-Mead): {str(e)}")
+        # Fall back to linear model
+        a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best = 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0
         rmse_final, ang_err_final, ang_errs_final, B_pred_final = rmse_best, ang_err_best, ang_errs_best, B_pred_best
 
+    # Third stage: re-optimize dipole moment with fixed quadratic coefficients
     start_time = time.time()
     try:
-        def residuals_m_third(m, positions, B_measured, quaternions, a_x, b_x, a_y, b_y, a_z, b_z):
+        def residuals_m_third_enhanced(m, positions, B_measured, quaternions, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z):
             residuals = []
             for r, B_meas, quat in zip(positions, B_measured, quaternions):
                 R_sensor = quaternion_to_rotation_matrix(quat)
-                B_pred = dipole_field(r, m, R_sensor, a_x, b_x, a_y, b_y, a_z, b_z)
+                B_pred = dipole_field_enhanced(r, m, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
                 residuals.append(B_pred - B_meas)
             return np.ravel(residuals)
         
-        result_m_third = least_squares(residuals_m_third, m_best,
-                                      args=(positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best),
+        result_m_third = least_squares(residuals_m_third_enhanced, m_best,
+                                      args=(positions, B_measured, quaternions, 
+                                            a_x_best, b_x_best, c_x_best, 
+                                            a_y_best, b_y_best, c_y_best, 
+                                            a_z_best, b_z_best, c_z_best),
                                       bounds=bounds_m, method='trf', ftol=1e-8, xtol=1e-8)
         m_third = result_m_third.x
         time_taken = time.time() - start_time
-        rmse_third, ang_err_third, ang_errs_third, B_pred_third = compute_metrics(
-            m_third, positions, B_measured, quaternions, a_x_best, b_x_best, a_y_best, b_y_best, a_z_best, b_z_best)
+        
+        rmse_third, ang_err_third, ang_errs_third, B_pred_third = compute_metrics_enhanced(
+            m_third, positions, B_measured, quaternions,
+            a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best
+        )
+        
     except Exception as e:
         print(f"Error in Third Stage (TRF): {str(e)}")
         m_third = m_best
-        rmse_third, ang_err_final, ang_errs_third, B_pred_third = rmse_final, ang_err_final, ang_errs_final, B_pred_final
+        rmse_third, ang_err_third, ang_errs_third, B_pred_third = rmse_final, ang_err_final, ang_errs_final, B_pred_final
 
+    # Choose the best result
     if rmse_third < rmse_final:
         m_final = m_third
         rmse_final = rmse_third
         ang_err_final = ang_err_third
         ang_errs_final = ang_errs_third
         B_pred_final = B_pred_third
-        best_stage = "Third Stage (TRF)"
+        best_stage = "Third Stage (TRF with Quadratic)"
     else:
         m_final = m_best
-        best_stage = f"Second Stage ({best_method})"
+        best_stage = f"Quadratic Stage ({best_method})"
 
     dipole_params = {
         'm': m_final,
-        'a_x': a_x_best,
-        'b_x': b_x_best,
-        'a_y': a_y_best,
-        'b_y': b_y_best,
-        'a_z': a_z_best,
-        'b_z': b_z_best
+        'a_x': a_x_best, 'b_x': b_x_best, 'c_x': c_x_best,
+        'a_y': a_y_best, 'b_y': b_y_best, 'c_y': c_y_best,
+        'a_z': a_z_best, 'b_z': b_z_best, 'c_z': c_z_best
     }
 
+    # Save parameters
     params = {
         'm_x': float(m_final[0]),
         'm_y': float(m_final[1]),
         'm_z': float(m_final[2]),
-        'a_x': float(a_x_best),
-        'b_x': float(b_x_best),
-        'a_y': float(a_y_best),
-        'b_y': float(b_y_best),
-        'a_z': float(a_z_best),
-        'b_z': float(b_z_best),
+        'a_x': float(a_x_best), 'b_x': float(b_x_best), 'c_x': float(c_x_best),
+        'a_y': float(a_y_best), 'b_y': float(b_y_best), 'c_y': float(c_y_best),
+        'a_z': float(a_z_best), 'b_z': float(b_z_best), 'c_z': float(c_z_best),
         'rmse': float(rmse_final),
         'angular_error': float(ang_err_final)
     }
+    
     with open('dipole_model_params.json', 'w') as f:
         json.dump(params, f, indent=4)
 
@@ -857,6 +946,7 @@ def run_optimization():
         [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
         [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
     )
+    
     return dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage
 
 def generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final):
@@ -870,11 +960,12 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
 
     for i, (r, B_m, quat) in enumerate(zip(positions, B_measured, quaternions)):
         R_sensor = quaternion_to_rotation_matrix(quat)
-        B_theo = dipole_field(r, np.array([-0.1, 0, 0]), R_sensor) * 1e6
-        B_opt = dipole_field(r, dipole_params['m'], R_sensor,
-                             dipole_params['a_x'], dipole_params['b_x'],
-                             dipole_params['a_y'], dipole_params['b_y'],
-                             dipole_params['a_z'], dipole_params['b_z']) * 1e6
+        # Use enhanced model for all calculations
+        B_theo = dipole_field_enhanced(r, np.array([-0.1, 0, 0]), R_sensor) * 1e6
+        B_opt = dipole_field_enhanced(r, dipole_params['m'], R_sensor,
+                                     dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+                                     dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+                                     dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z']) * 1e6
         U_meas[i], V_meas[i], W_meas[i] = B_m[0] * 1e6, B_m[1] * 1e6, B_m[2] * 1e6
         U_theo[i], V_theo[i], W_theo[i] = B_theo[0], B_theo[1], B_theo[2]
         U_opt[i], V_opt[i], W_opt[i] = B_opt[0], B_opt[1], B_opt[2]
@@ -1011,7 +1102,7 @@ if __name__ == "__main__":
             xgb_models = train_correction_model(data_df)
 
     if args.optimize:
-        result = run_optimization()
+        result = run_optimization_enhanced()
         if result is None or len(result) < 8:
             print("Optimization failed.")
             exit(1)
@@ -1031,9 +1122,9 @@ if __name__ == "__main__":
         server_thread.start()
         interactive_position_estimation(
             dipole_params['m'], pos_bounds,
-            dipole_params['a_x'], dipole_params['b_x'],
-            dipole_params['a_y'], dipole_params['b_y'],
-            dipole_params['a_z'], dipole_params['b_z'],
+            dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+            dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+            dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
             positions
         )
     elif args.interactive:
