@@ -19,6 +19,7 @@ import asyncio
 import select
 
 # --- Configuration ---
+camera_id = 0
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
 CHECKERBOARD = (6, 8)
@@ -34,7 +35,7 @@ NUM_CALIBRATION_FRAMES = 50
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
-cube2MagOffset_X = -0.007
+cube2MagOffset_X = 0.000
 cube2MagOffset_Y = 0.0
 cube2MagOffset_Z = 0.120
 POSITION_SERVER_HOST = 'localhost'
@@ -226,7 +227,7 @@ def position_estimation_worker():
             print(f"Connected to position server at {POSITION_SERVER_HOST}:{POSITION_SERVER_PORT}")
             return socket_obj
         except Exception as e:
-            print(f"Failed to connect to position server: {e}")
+            # print(f"Failed to connect to position server: {e}")
             return None
     
     def send_position_request(socket_obj, magX, magY, magZ, quat_w, quat_x, quat_y, quat_z):
@@ -255,7 +256,7 @@ def position_estimation_worker():
             
             return True
         except Exception as e:
-            print(f"Error sending position request: {e}")
+            # print(f"Error sending position request: {e}")
             return False
     
     def receive_position_response(socket_obj):
@@ -392,7 +393,7 @@ def request_position_estimation(magX, magY, magZ, quat_w, quat_x, quat_y, quat_z
         position_request_queue.put_nowait((magX, magY, magZ, quat_w, quat_x, quat_y, quat_z))
         return True
     except queue.Full:
-        print("Position request queue full, dropping request")
+        # print("Position request queue full, dropping request")
         return False
 
 def get_latest_position_estimate():
@@ -416,8 +417,7 @@ def update_position_estimation(q,magX, magY, magZ):
                                             q[2], q[3])
     if success:
         return True
-    else:
-        print("Failed to queue position request")
+   
 
 def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
     h, w = frame.shape[:2]
@@ -454,9 +454,13 @@ def calibrate_camera():
             print(f"Camera Matrix:\n{camera_matrix}")
             print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
             return camera_matrix, dist_coeffs
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(camera_id)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
     if not cap.isOpened():
-        print("Could not open camera with index 1.")
+        print(f"Could not open camera with index {camera_id}.")
         return None, None
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001)
     objp = np.zeros((CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
@@ -477,7 +481,7 @@ def calibrate_camera():
         if ret:
             corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             cv2.drawChessboardCorners(frame, CHECKERBOARD, corners2, ret)
-        frame_display = cv2.resize(frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+        frame_display = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
         cv2.imshow("Checkerboard Calibration", frame_display)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('c') and ret:
@@ -830,9 +834,9 @@ def average_quaternions(quaternions):
 
 def detect_apriltags(camera_matrix, dist_coeffs):
     global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
-        print("Could not open camera with index 1.")
+        print(f"Could not open camera with index {camera_id}.")
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
@@ -1014,7 +1018,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_points, _ = cv2.projectPoints(cube2_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_cube2_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube2_center), 8, (0, 255, 255), -1)
-                        R_cube2_camera = compute_cube_orientation(tags, [3,4,5])
+                        R_cube2_camera = compute_cube_orientation(tags, [5])
                         cube2_rvec_camera, _ = cv2.Rodrigues(R_cube2_camera)
                         draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec_camera, cube2_center_camera_smoothed, AXIS_LENGTH, img_cube2_center)
@@ -1098,8 +1102,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
                     calculation_time = time.time()
 
+                    mag_magnitude = np.sqrt(magX**2 + magY**2 + magZ**2)
+
                     # Draw text on text_frame with semi-transparent backgrounds
-                    mag_text = f"Mag: X={magX:.2f} uT, Y={magY:.2f} uT, Z={magZ:.2f} uT"
+                    mag_text = f"Mag: X={magX:.2f} uT Y={magY:.2f} uT Z={magZ:.2f} uT M={mag_magnitude:.2f} uT"
                     q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
                     q_Cap_global_text =     f"q_Cap_global: [{q_cap_global[0]:.3f}, {q_cap_global[1]:.3f}, {q_cap_global[2]:.3f}, {q_cap_global[3]:.3f}]" if q_cap_global is not None else "Cube2 Quat Cap: N/A"
                     q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{cube2_quat[0]:.3f}, {cube2_quat[1]:.3f}, {cube2_quat[2]:.3f}, {cube2_quat[3]:.3f}]" if cube2_quat is not None else "Rel Relsensor: N/A"
@@ -1108,7 +1114,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
                     pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
                     
-
+                    tag_euler = rotation_matrix_to_euler(R_cap_mag) if R_cap_mag is not None else [0.0, 0.0, 0.0]
+                    bt_euler = rotation_matrix_to_euler(R_btcap_mag) if R_btcap_mag is not None else [0.0, 0.0, 0.0]
+                    diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
+                    diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
 
                     intervalOffset = 1.4
                     FONT_SCALE = 1.6
@@ -1121,6 +1130,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
                     draw_text_with_background(text_frame, cube2_center_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                     draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
+                    draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                     # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
                     # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
 
@@ -1134,13 +1144,13 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
                     drawtext_time = time.time()
 
-                    print(f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
-                    f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
-                    f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
-                    f"Detection: {(detection_time-convert_time)*1000:.1f}ms, "
-                    f"Processing: {(processing_time-detection_time)*1000:.1f}ms, "
-                    f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
-                    f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
+                    print(
+                        # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
+                    # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
+                    # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
+                    # f"Detection: {(detection_time-convert_time)*1000:.1f}mS1f}ms, "
+                    # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
+                    # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
                     f"Total: {(time.time()-start_time)*1000:.1f}ms")                              
 
                     
