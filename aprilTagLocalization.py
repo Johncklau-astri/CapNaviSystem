@@ -19,6 +19,8 @@ import asyncio
 import select
 
 # --- Configuration ---
+## side camera id is 0
+## top camera id is 3
 camera_id = 0
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
@@ -26,8 +28,8 @@ CHECKERBOARD = (6, 8)
 CHECKERBOARD_SQUARE_SIZE = 0.025
 CALIBRATION_FILE = "VidAprilTagCalibration.npz"
 AXIS_LENGTH = TAG_SIZE
-DISPLAY_WIDTH = 1920
-DISPLAY_HEIGHT = 1080  # Total height: 600 for text, 600 for camera
+DISPLAY_WIDTH = 1600
+DISPLAY_HEIGHT = 900  # Total height: 600 for text, 600 for camera
 TEXT_FRAME_WIDTH = 1720
 TEXT_FRAME_HEIGHT = 600
 CAMERA_FRAME_HEIGHT = 500
@@ -37,7 +39,7 @@ TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
 cube2MagOffset_X = 0.000
 cube2MagOffset_Y = 0.0
-cube2MagOffset_Z = 0.120
+cube2MagOffset_Z = -0.1 
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
 MOTOR_SERVER_PORT = 12345
@@ -56,6 +58,8 @@ bt_quat_global = [1.0, 0.0, 0.0, 0.0]  # Quaternion from bt_angleEst
 bt_data_queue = queue.Queue(maxsize=100)  # Buffer up to 100 samples
 position_request_queue = queue.Queue(maxsize=10)  # Position estimation requests
 position_response_queue = queue.Queue(maxsize=10)  # Position estimation responses
+
+R_worldCube_camera = None
 
 auto_record_flag = False
 rel_Rsensor = np.eye(3)
@@ -833,14 +837,27 @@ def average_quaternions(quaternions):
 
 
 def detect_apriltags(camera_matrix, dist_coeffs):
-    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running
+    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera
     cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
         print(f"Could not open camera with index {camera_id}.")
         return
+    
+
+
+    # # Just read what the camera gives us
+    # actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    # actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    # actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    # print(f"Camera default: {actual_width}x{actual_height} @ {actual_fps}fps")
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    print(f"Camera set to: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} @ 30fps")
+
+
+
     detector = Detector(families="tag36h11", nthreads=1, quad_decimate=2.0, quad_sigma=0.0, refine_edges=1, decode_sharpening=0.5)
     cube1_center_z_buffer = []
     cube2_center_z_buffer = []
@@ -917,7 +934,6 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 worldCube_center_camera = None
                 R_cube1_camera = None
                 R_cube2_camera = None
-                R_worldCube_camera = None
                 btcap_global = None
                 R_cube2_global = None
                 R_cap_cube2 = None
@@ -1046,16 +1062,44 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                                 latest_bt_data.get('qz', 0.0)
                             ]
 
-                    
-                    ## Calculating relative position of Cap and Mag using TAG
-                    if cube1_center_camera is not None and cube2_center_camera is not None:
-                        t_cube1_cube2_tag = transform_to_ref_cube_frame(cube1_center_camera_smoothed, cube2_center_camera_smoothed,  R_cube2_camera)
-                        t_cube1_cube2_tag[0] += cube2MagOffset_X
-                        t_cube1_cube2_tag[1] += cube2MagOffset_Y
-                        t_cube1_cube2_tag[2] += cube2MagOffset_Z
-                        cube2_center_text = f"t_Cap_Mag_tag: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m"
+
+                    # Configuration - adjust these based on your calibration
+                    MAG_OFFSET_FROM_CUBE = np.array([cube2MagOffset_X, cube2MagOffset_Y, cube2MagOffset_Z])
+
+                    # Later, in the detection loop:
+                    if cube2_center_camera is not None and R_cube2_camera is not None:
+                        # Compute magnet position in camera frame
+                        magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                        
+                        # Optional: visualize magnet position
+                        magnet_point = np.array([[magnet_position_camera]], dtype=np.float32)
+                        img_magnet, _ = cv2.projectPoints(magnet_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_magnet_center = img_magnet[0][0].astype(int)
+                        cv2.circle(frame_undistorted, tuple(img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
+
+                    # When computing relative position (for logging/ground truth):
+                    if cube1_center_camera is not None and cube2_center_camera is not None and R_cube2_camera is not None:
+                        # Get magnet position
+                        # magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                        magnet_position_camera = cube2_center_camera_smoothed 
 
                         
+                        # Get sensor (Cube 1) position relative to magnet
+                        t_cube1_cube2_tag = transform_to_ref_cube_frame(
+                            cube1_center_camera_smoothed,
+                            magnet_position_camera,
+                            R_cube2_camera
+                        )
+                        
+
+                        # # This is the true relative position (what estX/Y/Z should match)
+                        # cube2_center_text = f"True rel pos: x={t_sensor_rel_to_magnet[0]:.3f} m, y={t_sensor_rel_to_magnet[1]:.3f} m, z={t_sensor_rel_to_magnet[2]:.3f} m"
+                        
+                        # # When logging, use t_sensor_rel_to_magnet as the true position
+                        # # (not t_cube1_cube2_tag with manually added offset)
+
+                    
+  
                     ## Calculating relative orientation of Cap and Mag using TAG
                     if R_cube2_camera is not None and R_cube1_camera is not None:
                         R_cap_mag = R_cube2_camera.T @ R_cube1_camera
@@ -1083,16 +1127,32 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
                     # Draw estimated position and axes
                     if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and btcap_global is not None and R_worldCube_camera is not None:
-                        est_pos_ref = np.array([estX - cube2MagOffset_X, estY - cube2MagOffset_Y, estZ - cube2MagOffset_Z], dtype=np.float32)
-                        est_pos_camera = R_cube2_camera @ est_pos_ref + cube2_center_camera_smoothed
+                        
+                        # Step 1: Get magnet position in camera frame
+                        magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                        
+                        # Step 2: estX, estY, estZ are in magnet's coordinate frame
+                        # Transform this vector to camera frame
+                        est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
+                        
+                        # Step 3: Estimated position in camera frame = magnet position + transformed vector
+                        est_pos_camera = magnet_position_camera + est_vector_camera
+                        
+                        # Project to image coordinates
                         est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
                         img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_est_pos = img_points[0][0].astype(int)
-                        cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)  # Red circle for estimated position
-                        R_bt = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
-                        R_btcap_cam = R_worldCube_camera @R_bt  # Cap orientation in camera frame
-                        # Draw axes with the relative orientation
-                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                        
+                        # Draw if within bounds
+                        if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
+                            0 <= img_est_pos[1] < frame_undistorted.shape[0]):
+                            cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
+                            
+                            R_bt = quaternion_to_rotation_matrix(btcap_global)
+                            R_btcap_cam = R_worldCube_camera @ R_bt
+                            draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                        else:
+                            print(f"Estimated position projected outside image: {img_est_pos}")
 
                     q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
                     q_btcap_mag = rotation_matrix_to_quaternion(R_btcap_mag) if R_btcap_mag is not None else [1.0, 0.0, 0.0, 0.0]
@@ -1113,7 +1173,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     q_btCap_Global_text =   f"q_btCap_Global: [{btcap_global[0]:.3f}, {btcap_global[1]:.3f}, {btcap_global[2]:.3f}, {btcap_global[3]:.3f}]" if btcap_global is not None else "BT Quat Global: N/A"
                     est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
                     pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
-                    
+                    t_cube1_cube2_text =     f"True rel pos: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "True rel pos: N/A"
                     tag_euler = rotation_matrix_to_euler(R_cap_mag) if R_cap_mag is not None else [0.0, 0.0, 0.0]
                     bt_euler = rotation_matrix_to_euler(R_btcap_mag) if R_btcap_mag is not None else [0.0, 0.0, 0.0]
                     diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
@@ -1128,7 +1188,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                     draw_text_with_background(text_frame, q_btCap_Global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                     draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
-                    draw_text_with_background(text_frame, cube2_center_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, t_cube1_cube2_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                     draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
                     draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                     # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
@@ -1175,6 +1235,11 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                             draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                             time.sleep(0.2)
                             auto_record_flag = False
+
+                    elif key == ord ('c'):
+                        if (R_cube1_camera is not None):
+                            R_worldCube_camera = R_cube1_camera
+                            print("Manually set worldCube reference to Cube 1")
 
                     
                     
