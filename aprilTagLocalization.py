@@ -21,15 +21,20 @@ import select
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 3
-camera_id = 0
+camera_id = 3
+top_camera_id = 0
+
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
 CHECKERBOARD = (6, 8)
 CHECKERBOARD_SQUARE_SIZE = 0.025
+
 CALIBRATION_FILE = "VidAprilTagCalibration.npz"
+TOP_CALIBRATION_FILE = "VidAprilTagCalibration.npz"
+
 AXIS_LENGTH = TAG_SIZE
-DISPLAY_WIDTH = 1600
-DISPLAY_HEIGHT = 900  # Total height: 600 for text, 600 for camera
+DISPLAY_WIDTH = 1920    
+DISPLAY_HEIGHT = 1080  # Total height: 600 for text, 600 for camera
 TEXT_FRAME_WIDTH = 1720
 TEXT_FRAME_HEIGHT = 600
 CAMERA_FRAME_HEIGHT = 500
@@ -37,9 +42,41 @@ NUM_CALIBRATION_FRAMES = 50
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
+
 cube2MagOffset_X = 0.000
 cube2MagOffset_Y = 0.0
 cube2MagOffset_Z = -0.1 
+
+top_R_1000_cube1_camera = None
+R_1000_cube1_camera = None
+
+
+##### Position weights
+SIDE_POS_WEIGHTS = {
+    'x': 0.05,  # Side camera is bad at X
+    'y': 0.5,  # Side camera is okay at Y  
+    'z': 0.95   # Side camera is good at Z
+}
+
+TOP_POS_WEIGHTS = {
+    'x': 0.95,  # Top camera is good at X
+    'y': 0.5,  # Top camera is good at Y
+    'z': 0.05   # Top camera is bad at Z
+}
+
+# Orientation weights
+SIDE_ORI_WEIGHTS = {
+    'roll': 0.5,   # Side camera good at roll (X rotation)
+    'pitch': 0.9,  # Side camera good at pitch (Y rotation)
+    'yaw': 0.1     # Side camera bad at yaw (Z rotation)
+}
+
+TOP_ORI_WEIGHTS = {
+    'roll': 0.5,   # Top camera bad at roll
+    'pitch': 0.1,  # Top camera bad at pitch
+    'yaw': 0.9     # Top camera good at yaw
+}
+
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
 MOTOR_SERVER_PORT = 12345
@@ -54,12 +91,14 @@ estY = 0.0
 estZ = 0.0
 bt_quat_global = [1.0, 0.0, 0.0, 0.0]  # Quaternion from bt_angleEst
 
+
 # Thread-safe queues
 bt_data_queue = queue.Queue(maxsize=100)  # Buffer up to 100 samples
 position_request_queue = queue.Queue(maxsize=10)  # Position estimation requests
 position_response_queue = queue.Queue(maxsize=10)  # Position estimation responses
 
 R_worldCube_camera = None
+top_R_worldCube_camera = None
 
 auto_record_flag = False
 rel_Rsensor = np.eye(3)
@@ -833,35 +872,132 @@ def average_quaternions(quaternions):
         avg_quat = avg_quat / norm
     
     return avg_quat.tolist()
+def simple_position_fusion(side_pos, top_pos):
+    """
+    Fuse position with simple weights
+    side_pos, top_pos: [x, y, z] arrays or None
+    """
+    # If only one camera has data, use that
+    if side_pos is None and top_pos is None:
+        return None
+    if side_pos is None:
+        return top_pos
+    if top_pos is None:
+        return side_pos
+    
+    # Weighted average per axis
+    fused_x = (side_pos[0] * SIDE_POS_WEIGHTS['x'] + top_pos[0] * TOP_POS_WEIGHTS['x']) / \
+              (SIDE_POS_WEIGHTS['x'] + TOP_POS_WEIGHTS['x'])
+    
+    fused_y = (side_pos[1] * SIDE_POS_WEIGHTS['y'] + top_pos[1] * TOP_POS_WEIGHTS['y']) / \
+              (SIDE_POS_WEIGHTS['y'] + TOP_POS_WEIGHTS['y'])
+    
+    fused_z = (side_pos[2] * SIDE_POS_WEIGHTS['z'] + top_pos[2] * TOP_POS_WEIGHTS['z']) / \
+              (SIDE_POS_WEIGHTS['z'] + TOP_POS_WEIGHTS['z'])
+    
+    return np.array([fused_x, fused_y, fused_z])
 
+def simple_orientation_fusion(side_q, top_q, side_R, top_R):
+    """
+    Fuse orientation with simple weights
+    Converts to Euler angles for component-wise fusion
+    """
+    # If only one camera has data, use that
+    if (side_q is None or side_R is None) and (top_q is None or top_R is None):
+        return None
+    if side_q is None or side_R is None:
+        return top_q
+    if top_q is None or top_R is None:
+        return side_q
+    
+    # Convert quaternions to Euler angles
+    side_euler = rotation_matrix_to_euler(side_R)
+    top_euler = rotation_matrix_to_euler(top_R)
+    
+    # Weighted average per angle
+    fused_roll = (side_euler[0] * SIDE_ORI_WEIGHTS['roll'] + top_euler[0] * TOP_ORI_WEIGHTS['roll']) / \
+                 (SIDE_ORI_WEIGHTS['roll'] + TOP_ORI_WEIGHTS['roll'])
+    
+    fused_pitch = (side_euler[1] * SIDE_ORI_WEIGHTS['pitch'] + top_euler[1] * TOP_ORI_WEIGHTS['pitch']) / \
+                  (SIDE_ORI_WEIGHTS['pitch'] + TOP_ORI_WEIGHTS['pitch'])
+    
+    # For yaw, handle angle wrapping (0/360 boundary)
+    side_yaw = side_euler[2]
+    top_yaw = top_euler[2]
+    
+    # Adjust if angles cross 0/360 boundary
+    if abs(side_yaw - top_yaw) > 180:
+        if side_yaw > top_yaw:
+            top_yaw += 360
+        else:
+            side_yaw += 360
+    
+    fused_yaw = (side_yaw * SIDE_ORI_WEIGHTS['yaw'] + top_yaw * TOP_ORI_WEIGHTS['yaw']) / \
+                (SIDE_ORI_WEIGHTS['yaw'] + TOP_ORI_WEIGHTS['yaw'])
+    
+    # Normalize back to -180 to 180
+    fused_yaw = ((fused_yaw + 180) % 360) - 180
+    
+    # Convert back to quaternion
+    return euler_to_quaternion_simple(fused_roll, fused_pitch, fused_yaw)
+
+def euler_to_quaternion_simple(roll, pitch, yaw):
+    """Simple Euler to quaternion conversion"""
+    roll_rad = np.radians(roll)
+    pitch_rad = np.radians(pitch)
+    yaw_rad = np.radians(yaw)
+    
+    cy = np.cos(yaw_rad * 0.5)
+    sy = np.sin(yaw_rad * 0.5)
+    cp = np.cos(pitch_rad * 0.5)
+    sp = np.sin(pitch_rad * 0.5)
+    cr = np.cos(roll_rad * 0.5)
+    sr = np.sin(roll_rad * 0.5)
+    
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    
+    # Normalize
+    norm = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+    return [qw/norm, qx/norm, qy/norm, qz/norm]
 
 
 def detect_apriltags(camera_matrix, dist_coeffs):
-    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera
+    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera
     cap = cv2.VideoCapture(camera_id)
+    top_cap = cv2.VideoCapture(top_camera_id)
     if not cap.isOpened():
         print(f"Could not open camera with index {camera_id}.")
         return
-    
+    if not top_cap.isOpened():
+        print(f"Could not open top camera with index {top_camera_id}.")
+        return
 
-
-    # # Just read what the camera gives us
-    # actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    # actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    # actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    # print(f"Camera default: {actual_width}x{actual_height} @ {actual_fps}fps")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, 30)
     print(f"Camera set to: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} @ 30fps")
 
-
+    top_cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+    top_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+    top_cap.set(cv2.CAP_PROP_FPS, 30)
+    print(f"Top camera set to: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} @ 30fps")
 
     detector = Detector(families="tag36h11", nthreads=1, quad_decimate=2.0, quad_sigma=0.0, refine_edges=1, decode_sharpening=0.5)
+
     cube1_center_z_buffer = []
     cube2_center_z_buffer = []
     worldCube_center_z_buffer = []
+
+    top_cube1_center_z_buffer = []
+    top_cube2_center_z_buffer = []
+    top_worldCube_center_z_buffer = []
+
+    MAG_OFFSET_FROM_CUBE = np.array([cube2MagOffset_X, cube2MagOffset_Y, cube2MagOffset_Z])
+
     measurement_order = 0
     motor_data = None
     last_motor_update = 0
@@ -908,19 +1044,23 @@ def detect_apriltags(camera_matrix, dist_coeffs):
             while not stop_event.is_set():
                 start_time = time.time()
                 ret, frame = cap.read()
+                top_ret, top_frame = top_cap.read()
 
                 capture_time = time.time()
 
-                if not ret:
-                    print("Failed to capture frame.")
+                if not ret and not top_ret:
+                    print("Failed to capture frame from all camera.")
                     break
+
                 # frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
                 frame_undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+                top_frame_undistorted = cv2.remap(top_frame, map1, map2, cv2.INTER_LINEAR)
                 undistort_time = time.time()
               
                 text_frame[:] = 0  # Reset to black
                 
                 gray = cv2.cvtColor(frame_undistorted, cv2.COLOR_BGR2GRAY)
+                top_gray = cv2.cvtColor(top_frame_undistorted, cv2.COLOR_BGR2GRAY)
                 convert_time = time.time()
    
 
@@ -930,29 +1070,63 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                                             tag_size=TAG_SIZE)
                 detection_time = time.time()
            
+                top_detections = detector.detect(top_gray, estimate_tag_pose=True,
+                                                 camera_params=(camera_matrix[0, 0], camera_matrix[1, 1],
+                                                                camera_matrix[0, 2], camera_matrix[1, 2]),
+                                                 tag_size=TAG_SIZE)
+                top_detection_time = time.time()
+
+                # side cam data
                 tags = []
                 worldCube_center_camera = None
                 R_cube1_camera = None
                 R_cube2_camera = None
-                btcap_global = None
+                
                 R_cube2_global = None
-                R_cap_cube2 = None
-                R_btcap_cube2 = None
-                R_cap_global = None
-                R_cap_mag = None
-                R_btcap_mag = np.eye(3)
-
-                est_pos_ref = None
-                t_cube1_cube2_tag = None
+                R_cube1_global = None
+                R_cube1_cube2 = None
 
                 worldCube_center_camera = None
                 cube1_center_camera = None
                 cube2_center_camera = None
+
+                magnet_position_camera = None
+                t_cube1_cube2_tag = None
+
+
+                # top cam data
+                top_tags = []
+                top_worldCube_center_camera = None
+
+                top_R_cube1_camera = None
+                top_R_cube2_camera = None
+                
+                top_R_cube2_global = None
+                top_R_cube1_global = None
+                top_R_cube1_cube2 = None
+
+                top_worldCube_center_camera = None
+                top_cube1_center_camera = None
+                top_cube2_center_camera = None
+
+                top_magnet_position_camera = None
+                top_t_cube1_cube2_tag = None
+
+                # Fused data
+                fused_t_cube1_cube2_tag = None
+                fused_q_cube1_cube2 = None
+
+                # Non-camera specific data
                 magX = 0.0
                 magY = 0.0
                 magZ = 0.0
-
-
+                q_btcap_global = None
+                R_btcap_cube2 = np.eye(3)
+                est_pos_ref = None
+                q_cube2_global = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion as default
+                q_btcap_cube2 = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion as default
+                q_cube1_global = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion as default
+                q_cube1_cube2 = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion as default                
                
                 for det in detections:
                     if det.tag_id in TAG_IDS:
@@ -966,10 +1140,40 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         R, _ = cv2.Rodrigues(rvec)
                         tag_data = {'tag_id': det.tag_id, 'tvec': tvec.flatten(), 'R': R, 'center': np.mean(corners, axis=0)}
                         tags.append(tag_data)
+
+
+                for det in top_detections:
+                    if det.tag_id in TAG_IDS:
+                        corners = det.corners
+                        for i in range(4):
+                            cv2.line(top_frame_undistorted, tuple(corners[i].astype(int)), tuple(corners[(i+1)%4].astype(int)), (0, 255, 0), 2)
+                        rvec, tvec = refine_pose(corners, camera_matrix, dist_coeffs)
+                        if rvec is None or tvec is None:
+                            print(f"Pose refinement failed for top tag {det.tag_id}")
+                            continue
+                        R, _ = cv2.Rodrigues(rvec)
+                        tag_data = {'tag_id': det.tag_id, 'tvec': tvec.flatten(), 'R': R, 'center': np.mean(corners, axis=0)}
+                        top_tags.append(tag_data)
+
                 processing_time = time.time()
  
+                # Get latest BT data
+                latest_bt_data = get_latest_bt_data()
+                if latest_bt_data:
+                    with bt_data_lock:
+                        magX = -latest_bt_data.get('magY', 0.0)
+                        magY = -latest_bt_data.get('magX', 0.0)
+                        magZ = -latest_bt_data.get('magZ', 0.0)
+                        q_btcap_global = [
+                            latest_bt_data.get('qw', 1.0),
+                            latest_bt_data.get('qx', 0.0),
+                            latest_bt_data.get('qy', 0.0),
+                            latest_bt_data.get('qz', 0.0)
+                        ]
 
-
+                ################################################################################################################################
+                ###################                     side Cam cube Extraction                 #########################################
+                ################################################################################################################################
                 if len(tags)>0: 
                         
                     worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
@@ -992,7 +1196,6 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
                     
                     ## CUBE 1
-
 
                     cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1,2], reference_tag_id=1)
                     cube1_center_text = "Cube 1 Center: Not detected"
@@ -1017,7 +1220,6 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     
                     ## CUBE 2
 
-
                     cube2_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[3,4,5], reference_tag_id=5)
 
                     cube2_center_text = "Cube 2 Center: Not detected"
@@ -1034,7 +1236,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         img_points, _ = cv2.projectPoints(cube2_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
                         img_cube2_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube2_center), 8, (0, 255, 255), -1)
-                        R_cube2_camera = compute_cube_orientation(tags, [5])
+                        R_cube2_camera = compute_cube_orientation(tags, [3,4,5])
                         cube2_rvec_camera, _ = cv2.Rodrigues(R_cube2_camera)
                         draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec_camera, cube2_center_camera_smoothed, AXIS_LENGTH, img_cube2_center)
@@ -1046,209 +1248,358 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                             print(f"Cube centers too close in image: {distance:.2f} pixels")
                         
 
-                    # Get latest BT data
-                    latest_bt_data = get_latest_bt_data()
-                    if latest_bt_data:
-                        with bt_data_lock:
+                ################################################################################################################################
+                ###################                     top Cam cube Extraction                 #########################################
+                ################################################################################################################################
+                ## Extract cube positions and orientations from top cam
+                if len(top_tags) > 0:
+
+                    top_worldCube_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
+                    if top_worldCube_center_camera is not None:
+                        # print(f"World Cube Center Camera: {top_worldCube_center_camera}")
+                        top_worldCube_center_z_buffer.append(top_worldCube_center_camera[2])
+                        if len(top_worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                            top_worldCube_center_z_buffer.pop(0)
+                        smoothed_z_world = np.mean(top_worldCube_center_z_buffer)
+                        top_worldCube_center_camera_smoothed = top_worldCube_center_camera.copy()
+                        top_worldCube_center_camera_smoothed[2] = smoothed_z_world
+                        top_worldCube_center_point = np.array([[top_worldCube_center_camera_smoothed]], dtype=np.float32)
+                        img_points, _ = cv2.projectPoints(top_worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_top_worldCube_center = img_points[0][0].astype(int)
+                        cv2.circle(top_frame_undistorted, tuple(img_top_worldCube_center), 8, (255, 0, 255), -1)
+                        draw_text_with_background(top_frame_undistorted, "W.C.", (img_top_worldCube_center[0]+10, img_top_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+                        top_R_worldCube_camera = compute_cube_orientation(top_tags, [7, 8, 9])
+                        top_worldCube_rvec, _ = cv2.Rodrigues(top_R_worldCube_camera)
+                        draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_worldCube_rvec, top_worldCube_center_camera_smoothed, AXIS_LENGTH, img_top_worldCube_center)
+                    
+                    ## CUBE 1
+
+                    top_cube1_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[0,1,2], reference_tag_id=1)
+                    if top_cube1_center_camera is not None:
+                        # print(f"Cube 1 Center Camera: {cube1_center_camera}")
+                        top_cube1_center_z_buffer.append(top_cube1_center_camera[2])
+                        if len(top_cube1_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                            top_cube1_center_z_buffer.pop(0)
+                        smoothed_z1 = np.mean(top_cube1_center_z_buffer)
+                        top_cube1_center_camera_smoothed = top_cube1_center_camera.copy()
+                        top_cube1_center_camera_smoothed[2] = smoothed_z1
+                        top_cube1_center_point = np.array([[top_cube1_center_camera_smoothed]], dtype=np.float32)
+                        img_points, _ = cv2.projectPoints(top_cube1_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_top_cube1_center = img_points[0][0].astype(int)
+                        cv2.circle(top_frame_undistorted, tuple(img_top_cube1_center), 8, (255, 255, 0), -1)
+
+                        top_R_cube1_camera = compute_cube_orientation(top_tags, [0,1,2])
+                        top_cube1_rvec_camera, _ = cv2.Rodrigues(top_R_cube1_camera)
+                        draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_cube1_rvec_camera, top_cube1_center_camera_smoothed, AXIS_LENGTH, img_top_cube1_center)
+                        draw_text_with_background(top_frame_undistorted, "CAP", (img_top_cube1_center[0]+10, img_top_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        top_cube1_center_text = f"Cube 1 Center: x={top_cube1_center_camera_smoothed[0]:.3f} m, y={top_cube1_center_camera_smoothed[1]:.3f} m, z={top_cube1_center_camera_smoothed[2]:.3f} m"
+
+                    ## CUBE 2
+
+                    top_cube2_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[3,4,5], reference_tag_id=5)
+
+                    top_cube2_center_text = "Cube 2 Center: Not detected"
+                    top_cube2_orient_text = "Cube 2 Orient: Not detected"
+                    if top_cube2_center_camera is not None:
+                        # print(f"Cube 2 Center Camera: {cube2_center_camera}")
+                        top_cube2_center_z_buffer.append(top_cube2_center_camera[2])
+                        if len(top_cube2_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                            top_cube2_center_z_buffer.pop(0)
+                        smoothed_z2 = np.mean(top_cube2_center_z_buffer)
+                        top_cube2_center_camera_smoothed = top_cube2_center_camera.copy()
+                        top_cube2_center_camera_smoothed[2] = smoothed_z2
+                        top_cube2_center_point = np.array([[top_cube2_center_camera_smoothed]], dtype=np.float32)
+                        img_points, _ = cv2.projectPoints(top_cube2_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_top_cube2_center = img_points[0][0].astype(int)
+                        cv2.circle(top_frame_undistorted, tuple(img_top_cube2_center), 8, (0, 255, 255), -1)
+                        top_R_cube2_camera = compute_cube_orientation(top_tags, [3,4,5])
+                        top_cube2_rvec_camera, _ = cv2.Rodrigues(top_R_cube2_camera)
+                        draw_text_with_background(top_frame_undistorted, "MAG", (img_top_cube2_center[0]+10, img_top_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_cube2_rvec_camera, top_cube2_center_camera_smoothed, AXIS_LENGTH, img_top_cube2_center)
+
+                    ## Safety check: Ensure cube centers are not too close in image
+                    if(top_cube1_center_camera is not None and top_cube2_center_camera is not None):
+                        distance = np.linalg.norm(img_top_cube1_center - img_top_cube2_center)
+                        if distance < 20:
+                            print(f"Cube centers too close in image: {distance:.2f} pixels")
+
+                
 
 
-                            magX = -latest_bt_data.get('magY', 0.0)
-                            magY = -latest_bt_data.get('magX', 0.0)
-                            magZ = -latest_bt_data.get('magZ', 0.0)
-                            btcap_global = [
-                                latest_bt_data.get('qw', 1.0),
-                                latest_bt_data.get('qx', 0.0),
-                                latest_bt_data.get('qy', 0.0),
-                                latest_bt_data.get('qz', 0.0)
-                            ]
 
 
-                    # Configuration - adjust these based on your calibration
-                    MAG_OFFSET_FROM_CUBE = np.array([cube2MagOffset_X, cube2MagOffset_Y, cube2MagOffset_Z])
+                ################################################################################################################################
+                ###################                     side Cam cube calculations                     #########################################
+                ################################################################################################################################
+                # Calculate magnet position in camera frame by applying offset
+                if cube2_center_camera is not None and R_cube2_camera is not None:
+                    magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                    # visualize magnet position
+                    magnet_point = np.array([[magnet_position_camera]], dtype=np.float32)
+                    img_magnet, _ = cv2.projectPoints(magnet_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    img_magnet_center = img_magnet[0][0].astype(int)
+                    cv2.circle(frame_undistorted, tuple(img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
 
-                    # Later, in the detection loop:
-                    if cube2_center_camera is not None and R_cube2_camera is not None:
-                        # Compute magnet position in camera frame
-                        magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
-                        
-                        # Optional: visualize magnet position
-                        magnet_point = np.array([[magnet_position_camera]], dtype=np.float32)
-                        img_magnet, _ = cv2.projectPoints(magnet_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                        img_magnet_center = img_magnet[0][0].astype(int)
-                        cv2.circle(frame_undistorted, tuple(img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
+                # Calculate relative position and orientation of cube 1 relative to cube 2:
+                if cube1_center_camera is not None and cube2_center_camera is not None and R_cube2_camera is not None:
+                    # Get sensor (Cube 1) position relative to magnet
+                    t_cube1_cube2_tag = transform_to_ref_cube_frame(
+                        cube1_center_camera_smoothed,
+                        magnet_position_camera,
+                        R_cube2_camera
+                    )
+                    R_cube1_cube2 = R_cube2_camera.T @ R_cube1_camera
+                    cube2_euler = rotation_matrix_to_euler(R_cube1_cube2)
+                    q_cube1_cube2 = rotation_matrix_to_quaternion(R_cube1_cube2) if R_cube1_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
 
-                    # When computing relative position (for logging/ground truth):
-                    if cube1_center_camera is not None and cube2_center_camera is not None and R_cube2_camera is not None:
-                        # Get magnet position
-                        # magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
-                        magnet_position_camera = cube2_center_camera_smoothed 
 
-                        
-                        # Get sensor (Cube 1) position relative to magnet
-                        t_cube1_cube2_tag = transform_to_ref_cube_frame(
-                            cube1_center_camera_smoothed,
-                            magnet_position_camera,
-                            R_cube2_camera
-                        )
-                        
+                #Calcuate global orientation of cube 2 using world cube as reference
+                if R_cube2_camera is not None and R_worldCube_camera is not None:
+                    R_cube2_global = R_worldCube_camera.T @ R_cube2_camera
+                    q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
 
-                        # # This is the true relative position (what estX/Y/Z should match)
-                        # cube2_center_text = f"True rel pos: x={t_sensor_rel_to_magnet[0]:.3f} m, y={t_sensor_rel_to_magnet[1]:.3f} m, z={t_sensor_rel_to_magnet[2]:.3f} m"
-                        
-                        # # When logging, use t_sensor_rel_to_magnet as the true position
-                        # # (not t_cube1_cube2_tag with manually added offset)
+                ## Cap Global orientation
+                if R_cube1_camera is not None and R_worldCube_camera is not None:
+                    R_cube1_global = R_worldCube_camera.T @ R_cube1_camera    
+                    q_cube1_global = rotation_matrix_to_quaternion(R_cube1_global) if R_cube1_global is not None else [1.0, 0.0, 0.0, 0.0]
+
+
+
+
+                ################################################################################################################################
+                ###################                     top Cam cube calculations                     #########################################
+                ################################################################################################################################
+                # Calculate magnet position in camera frame by applying offset
+                if top_cube2_center_camera is not None and top_R_cube2_camera is not None:
+                    top_magnet_position_camera = top_cube2_center_camera + top_R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                    # visualize magnet position
+                    top_magnet_point = np.array([[top_magnet_position_camera]], dtype=np.float32)
+                    top_img_magnet, _ = cv2.projectPoints(top_magnet_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    top_img_magnet_center = top_img_magnet[0][0].astype(int)
+                    cv2.circle(top_frame_undistorted, tuple(top_img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
+
+                # Calculate relative position and orientation of cube 1 relative to cube 2:
+                if top_cube1_center_camera is not None and top_cube2_center_camera is not None and top_R_cube2_camera is not None:
+                    # Get sensor (Cube 1) position relative to magnet
+                    top_t_cube1_cube2_tag = transform_to_ref_cube_frame(
+                        top_cube1_center_camera_smoothed,
+                        top_magnet_position_camera,
+                        top_R_cube2_camera
+                    )
+                    top_R_cube1_cube2 = top_R_cube2_camera.T @ top_R_cube1_camera
+                    top_cube2_euler = rotation_matrix_to_euler(top_R_cube1_cube2)
+                    top_q_cube1_cube2 = rotation_matrix_to_quaternion(top_R_cube1_cube2) if top_R_cube1_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
+
+
+                #Calcuate global orientation of cube 2 using world cube as reference
+                if top_R_cube2_camera is not None and top_R_worldCube_camera is not None:
+                    top_R_cube2_global = top_R_worldCube_camera.T @ top_R_cube2_camera
+                    top_q_cube2_global = rotation_matrix_to_quaternion(top_R_cube2_global) if top_R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
+
+                ## Cap Global orientation
+                if top_R_cube1_camera is not None and top_R_worldCube_camera is not None:
+                    top_R_cube1_global = top_R_worldCube_camera.T @ top_R_cube1_camera    
+                    top_q_cube1_global = rotation_matrix_to_quaternion(top_R_cube1_global) if top_R_cube1_global is not None else [1.0, 0.0, 0.0, 0.0]
+
+
+
+                if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None):
+                    print(f"top cam x:{top_t_cube1_cube2_tag[0]:.3f}\ty:{top_t_cube1_cube2_tag[1]:.3f}\tz:{top_t_cube1_cube2_tag[2]:.3f}\t\tSide cam x:{t_cube1_cube2_tag[0]:.3f}\ty:{t_cube1_cube2_tag[1]:.3f}\tz:{t_cube1_cube2_tag[2]:.3f}")
+                if(top_q_cube1_cube2 is not None and q_cube1_cube2 is not None):
+                    print(f"top cam qx:{top_q_cube1_cube2[0]:.3f}\tqy:{top_q_cube1_cube2[1]:.3f}\tqz:{top_q_cube1_cube2[2]:.3f}\tqw:{top_q_cube1_cube2[3]:.3f}\t\tSide cam qx:{q_cube1_cube2[0]:.3f}\tqy:{q_cube1_cube2[1]:.3f}\tqz:{q_cube1_cube2[2]:.3f}\tqw:{q_cube1_cube2[3]:.3f}")
+
+
+                ################################################################################################################################
+                ###### Data fusing  to calculate relative position and orientation of cube 1 relative to cube 2           ######################
+                ################################################################################################################################
+
+                if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None and
+                   top_q_cube1_cube2 is not None and q_cube1_cube2 is not None):
+                    fused_t_cube1_cube2_tag = simple_position_fusion(t_cube1_cube2_tag, top_t_cube1_cube2_tag)
+                    fused_q_cube1_cube2 = simple_orientation_fusion(q_cube1_cube2, top_q_cube1_cube2, 
+                                                                    R_cube1_cube2, top_R_cube1_cube2)
+                    
+
+
+                # Print for debugging
+                if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
+                    print(f"Fused pos: x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f}")
+                    print(f"Fused ori: qx={fused_q_cube1_cube2[0]:.3f}, qy={fused_q_cube1_cube2[1]:.3f}, qz={fused_q_cube1_cube2[2]:.3f}, qw={fused_q_cube1_cube2[3]:.3f}")
+
+
+
+
+
+
+
+
+
+                ################################################################################################################################
+                #################################################### handling BT DATA      #####################################################
+                ################################################################################################################################
+
 
                     
-  
-                    ## Calculating relative orientation of Cap and Mag using TAG
-                    if R_cube2_camera is not None and R_cube1_camera is not None:
-                        R_cap_mag = R_cube2_camera.T @ R_cube1_camera
-                        cube2_euler = rotation_matrix_to_euler(R_cap_mag)
-                        cube2_orient_text = f"Euler: Pitch={cube2_euler[0]:.1f}deg, Roll={cube2_euler[1]:.1f}deg, Yaw={cube2_euler[2]:.1f}deg"
-
-                    ## Calculating Mag global orientation using TAG
-                    ## And Cap relative orientation to Mag  using BT data 
-                    if R_cube2_camera is not None and R_worldCube_camera is not None:
-                        R_cube2_global = R_worldCube_camera.T @ R_cube2_camera
-                      
-                    if btcap_global is not None and R_cube2_global is not None:
-                        R_btcap_global = quaternion_to_rotation_matrix(btcap_global)  # Convert bt quat to rotation matrix
-                        R_btcap_mag =  R_cube2_global.T @ R_btcap_global
-
-                    ## Cap Global orientation
-                    if R_cube1_camera is not None and R_worldCube_camera is not None:
-                        R_cap_global = R_worldCube_camera.T @ R_cube1_camera        
-
-                    # Update position estimation at controlled rate (NON-BLOCKING)
-                    current_time = time.time()
-                    if current_time - last_position_update > POSITION_UPDATE_INTERVAL:
-                        update_position_estimation(rotation_matrix_to_quaternion(R_btcap_mag),magX,magY,magZ)  # This is now non-blocking
-                        last_position_update = current_time
-
-                    # Draw estimated position and axes
-                    if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and btcap_global is not None and R_worldCube_camera is not None:
-                        
-                        # Step 1: Get magnet position in camera frame
-                        magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
-                        
-                        # Step 2: estX, estY, estZ are in magnet's coordinate frame
-                        # Transform this vector to camera frame
-                        est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
-                        
-                        # Step 3: Estimated position in camera frame = magnet position + transformed vector
-                        est_pos_camera = magnet_position_camera + est_vector_camera
-                        
-                        # Project to image coordinates
-                        est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
-                        img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                        img_est_pos = img_points[0][0].astype(int)
-                        
-                        # Draw if within bounds
-                        if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
-                            0 <= img_est_pos[1] < frame_undistorted.shape[0]):
-                            cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
-                            
-                            R_bt = quaternion_to_rotation_matrix(btcap_global)
-                            R_btcap_cam = R_worldCube_camera @ R_bt
-                            draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
-                        else:
-                            print(f"Estimated position projected outside image: {img_est_pos}")
-
-                    q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
-                    q_btcap_mag = rotation_matrix_to_quaternion(R_btcap_mag) if R_btcap_mag is not None else [1.0, 0.0, 0.0, 0.0]
-                    q_cap_global = rotation_matrix_to_quaternion(R_cap_global) if R_cap_global is not None else [1.0, 0.0, 0.0, 0.0]
-                    cube2_quat = rotation_matrix_to_quaternion(R_cap_mag)
-                    q_cap_mag = rotation_matrix_to_quaternion(R_cap_mag) if R_cap_mag is not None else None
-
-                    calculation_time = time.time()
-
-                    mag_magnitude = np.sqrt(magX**2 + magY**2 + magZ**2)
-
-                    # Draw text on text_frame with semi-transparent backgrounds
-                    mag_text = f"Mag: X={magX:.2f} uT Y={magY:.2f} uT Z={magZ:.2f} uT M={mag_magnitude:.2f} uT"
-                    q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
-                    q_Cap_global_text =     f"q_Cap_global: [{q_cap_global[0]:.3f}, {q_cap_global[1]:.3f}, {q_cap_global[2]:.3f}, {q_cap_global[3]:.3f}]" if q_cap_global is not None else "Cube2 Quat Cap: N/A"
-                    q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{cube2_quat[0]:.3f}, {cube2_quat[1]:.3f}, {cube2_quat[2]:.3f}, {cube2_quat[3]:.3f}]" if cube2_quat is not None else "Rel Relsensor: N/A"
-                    q_cap_Mag_text =        f"q_btcap_Mag: [{q_btcap_mag[0]:.3f}, {q_btcap_mag[1]:.3f}, {q_btcap_mag[2]:.3f}, {q_btcap_mag[3]:.3f}]" if q_btcap_mag is not None else "Cube2 Quat Cap: N/A"
-                    q_btCap_Global_text =   f"q_btCap_Global: [{btcap_global[0]:.3f}, {btcap_global[1]:.3f}, {btcap_global[2]:.3f}, {btcap_global[3]:.3f}]" if btcap_global is not None else "BT Quat Global: N/A"
-                    est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
-                    pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
-                    t_cube1_cube2_text =     f"True rel pos: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "True rel pos: N/A"
-                    tag_euler = rotation_matrix_to_euler(R_cap_mag) if R_cap_mag is not None else [0.0, 0.0, 0.0]
-                    bt_euler = rotation_matrix_to_euler(R_btcap_mag) if R_btcap_mag is not None else [0.0, 0.0, 0.0]
-                    diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
-                    diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
-
-                    intervalOffset = 1.4
-                    FONT_SCALE = 1.6
-                    draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                    draw_text_with_background(text_frame, q_Mag_global_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, q_Cap_global_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, q_TAG_Cap_Mag_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                    draw_text_with_background(text_frame, q_btCap_Global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                    draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
-                    draw_text_with_background(text_frame, t_cube1_cube2_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
-                    draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                    # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
-                    # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+                if q_btcap_global is not None and R_cube2_global is not None:
+                    R_btcap_global = quaternion_to_rotation_matrix(q_btcap_global)  # Convert bt quat to rotation matrix
+                    R_btcap_cube2 =  R_cube2_global.T @ R_btcap_global
+                    q_btcap_cube2 = rotation_matrix_to_quaternion(R_btcap_cube2) if R_btcap_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
 
     
+
+
+
+
+
+
+
+
+                # Update position estimation at controlled rate (NON-BLOCKING)
+                current_time = time.time()
+                if current_time - last_position_update > POSITION_UPDATE_INTERVAL:
+                    update_position_estimation(q_btcap_cube2, magX, magY, magZ)  # This is now non-blocking
+                    last_position_update = current_time
+
+                # Draw estimated position and axes
+                if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and q_btcap_global is not None and R_worldCube_camera is not None:
                     
-                    if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
-                        with position_data_lock:
-                            if latest_position_data:
-                                motor_data = latest_position_data.copy()
-                        last_motor_update = time.time()
+                    # Step 1: Get magnet position in camera frames
+                    magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                    
+                    # Step 2: estX, estY, estZ are in magnet's coordinate frame
+                    # Transform this vector to camera frame
+                    est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
+                    
+                    # Step 3: Estimated position in camera frame = magnet position + transformed vector
+                    est_pos_camera = magnet_position_camera + est_vector_camera
+                    
+                    # Project to image coordinates
+                    est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
+                    img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    img_est_pos = img_points[0][0].astype(int)
+                    
+                    # Draw if within bounds
+                    if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
+                        0 <= img_est_pos[1] < frame_undistorted.shape[0]):
+                        cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
+                        
+                        R_bt = quaternion_to_rotation_matrix(q_btcap_global)
+                        R_btcap_cam = R_worldCube_camera @ R_bt
+                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                    else:
+                        print(f"Estimated position projected outside image: {img_est_pos}")
 
-                    drawtext_time = time.time()
 
-                    print(
-                        # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
-                    # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
-                    # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
-                    # f"Detection: {(detection_time-convert_time)*1000:.1f}mS1f}ms, "
-                    # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
-                    # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
-                    f"Total: {(time.time()-start_time)*1000:.1f}ms")                              
+                calculation_time = time.time()
+
+                mag_magnitude = np.sqrt(magX**2 + magY**2 + magZ**2)
+                tag_euler = rotation_matrix_to_euler(quaternion_to_rotation_matrix(fused_q_cube1_cube2)) if fused_q_cube1_cube2 is not None else [0.0, 0.0, 0.0]
+                bt_euler = rotation_matrix_to_euler(R_btcap_cube2) if R_btcap_cube2 is not None else [0.0, 0.0, 0.0]
+
+                # Draw text on text_frame with semi-transparent backgrounds
+                mag_text = f"Mag: X={magX:.2f} uT Y={magY:.2f} uT Z={magZ:.2f} uT M={mag_magnitude:.2f} uT"
+                q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
+                q_cube1_global_text =     f"q_Cap_global: [{q_cube1_global[0]:.3f}, {q_cube1_global[1]:.3f}, {q_cube1_global[2]:.3f}, {q_cube1_global[3]:.3f}]" if q_cube1_global is not None else "Cube2 Quat Cap: N/A"
+                q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{q_cube1_cube2[0]:.3f}, {q_cube1_cube2[1]:.3f}, {q_cube1_cube2[2]:.3f}, {q_cube1_cube2[3]:.3f}]" if q_cube1_cube2 is not None else "Rel Relsensor: N/A"
+                q_cap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
+                q_q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
+                est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
+                pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
+                t_cube1_cube2_text =     f"True rel pos: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "True rel pos: N/A"
+                diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
+                diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
+                side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
+                top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f}" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
+                fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f}" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
+                intervalOffset = 1
+                FONT_SCALE = 1
+                draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, side_cam_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, top_cam_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, q_q_btcap_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
+                draw_text_with_background(text_frame, t_cube1_cube2_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
+                draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
+                # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+
+
+                
+                if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
+                    with position_data_lock:
+                        if latest_position_data:
+                            motor_data = latest_position_data.copy()
+                    last_motor_update = time.time()
+
+                drawtext_time = time.time()
+
+                # print(
+                #     # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
+                # # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
+                # # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
+                # # f"Detection: {(detection_time-convert_time)*1000:.1f}mS1f}ms, "
+                # # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
+                # # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
+                # f"Total: {(time.time()-start_time)*1000:.1f}ms")                              
+
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('t') or auto_record_flag:
+                    if magX is not None and magY is not None and magZ is not None and q_cube1_cube2 is not None:
+                        measurement_order += 1
+                        # q_cube1_cube2 = rotation_matrix_to_quaternion(rel_Rsensor)
+                        errorX = estX - t_cube1_cube2_tag[0]
+                        errorY = estY - t_cube1_cube2_tag[1]
+                        errorZ = estZ - t_cube1_cube2_tag[2]
+                        writer.writerow([
+                            measurement_order,
+                            f'{t_cube1_cube2_tag[0]:.6f}', f'{t_cube1_cube2_tag[1]:.6f}', f'{t_cube1_cube2_tag[2]:.6f}',
+                            f'{q_cube1_cube2[0]:.5f}', f'{q_cube1_cube2[1]:.5f}', f'{q_cube1_cube2[2]:.5f}', f'{q_cube1_cube2[3]:.5f}',
+                            f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
+                            f'{magX:.3f}', f'{magY:.3f}', f'{magZ:.3f}',
+                            f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
+                            f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
+                        ])
+                        csvfile.flush()
+                        draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        time.sleep(0.2)
+                        auto_record_flag = False
+
+                elif key == ord ('c'):
+                    if (R_cube1_camera is not None and top_R_cube1_camera):
+                        top_R_1000_cube1_camera = top_R_cube1_camera.copy()
+                        R_1000_cube1_camera = R_cube1_camera.copy()
+                        print("Manually set worldCube reference to Cube 1")
 
                     
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('t') or auto_record_flag:
-                        if magX is not None and magY is not None and magZ is not None and cube2_quat is not None:
-                            measurement_order += 1
-                            # cube2_quat = rotation_matrix_to_quaternion(rel_Rsensor)
-                            errorX = estX - t_cube1_cube2_tag[0]
-                            errorY = estY - t_cube1_cube2_tag[1]
-                            errorZ = estZ - t_cube1_cube2_tag[2]
-                            writer.writerow([
-                                measurement_order,
-                                f'{t_cube1_cube2_tag[0]:.6f}', f'{t_cube1_cube2_tag[1]:.6f}', f'{t_cube1_cube2_tag[2]:.6f}',
-                                f'{cube2_quat[0]:.5f}', f'{cube2_quat[1]:.5f}', f'{cube2_quat[2]:.5f}', f'{cube2_quat[3]:.5f}',
-                                f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
-                                f'{magX:.3f}', f'{magY:.3f}', f'{magZ:.3f}',
-                                f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
-                                f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
-                            ])
-                            csvfile.flush()
-                            draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                            time.sleep(0.2)
-                            auto_record_flag = False
-
-                    elif key == ord ('c'):
-                        if (R_cube1_camera is not None):
-                            R_worldCube_camera = R_cube1_camera
-                            print("Manually set worldCube reference to Cube 1")
-
                     
-                    
+                # text_frame_resized = cv2.resize(text_frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+                # camera_frame_resized = resize_frame(frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
+                # top_camera_frame_resized = resize_frame(top_frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
+                # combined_frame = np.vstack((text_frame_resized, camera_frame_resized, top_camera_frame_resized))
+
+
+                # Calculate half width based on text frame width
+                half_width = DISPLAY_WIDTH // 2
+
+                # Resize both camera frames to half width
+                camera_frame_resized = cv2.resize(frame_undistorted, (half_width, CAMERA_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+                top_camera_frame_resized = cv2.resize(top_frame_undistorted, (half_width, CAMERA_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+
+                # Stack horizontally - now combined width = half_width + half_width = DISPLAY_WIDTH
+                cameras_combined = np.hstack((camera_frame_resized, top_camera_frame_resized))
+
+                # Text frame already has DISPLAY_WIDTH
                 text_frame_resized = cv2.resize(text_frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
-                camera_frame_resized = resize_frame(frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
-                combined_frame = np.vstack((text_frame_resized, camera_frame_resized))
+
+                # Stack vertically
+                combined_frame = np.vstack((text_frame_resized, cameras_combined))
                 
- 
-                
+
                 cv2.imshow("AprilTag Localization", combined_frame)
 
 
