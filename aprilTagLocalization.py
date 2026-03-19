@@ -21,8 +21,8 @@ import select
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 3
-camera_id = 3
-top_camera_id = 0
+camera_id = 0
+top_camera_id = 3
 
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
@@ -90,6 +90,7 @@ estX = 0.0
 estY = 0.0
 estZ = 0.0
 bt_quat_global = [1.0, 0.0, 0.0, 0.0]  # Quaternion from bt_angleEst
+R_senToCube = np.eye(3)
 
 
 # Thread-safe queues
@@ -963,9 +964,82 @@ def euler_to_quaternion_simple(roll, pitch, yaw):
     norm = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
     return [qw/norm, qx/norm, qy/norm, qz/norm]
 
+from scipy.linalg import svd
+
+def calibrate_sensor_from_measurements(x_meas, y_meas, z_meas):
+    """
+    Compute sensor-to-cube calibration matrix from three measurements.
+    
+    Args:
+        x_meas: Sensor reading when cube's +X points to field
+        y_meas: Sensor reading when cube's +Y points to field
+        z_meas: Sensor reading when cube's +Z points to field
+    
+    Returns:
+        R_sensor_to_cube: 3x3 rotation matrix
+    """
+    # Normalize each measurement to unit vectors
+    u_x = x_meas / np.linalg.norm(x_meas)
+    u_y = y_meas / np.linalg.norm(y_meas)
+    u_z = z_meas / np.linalg.norm(z_meas)
+    
+    # Build matrix and orthogonalize
+    R_raw = np.column_stack([u_x, u_y, u_z])
+    U, _, Vt = svd(R_raw)
+    R_orth = U @ Vt
+    
+    # Return sensor→cube (transpose of cube→sensor)
+    return R_orth.T
+
+# Example usage
+x_meas = np.array([12.3, 45.6, -7.8])
+y_meas = np.array([-8.9, 52.1, 3.4])
+z_meas = np.array([5.6, -12.3, 48.7])
+
+R = calibrate_sensor_from_measurements(x_meas, y_meas, z_meas)
+print("Calibration Matrix:")
+print(R)
+
+# Save it
+np.save('sensor_cube_calibration.npy', R)
+
+
+
+def sensor_to_mounting_frame(sensor_reading):
+    """
+    Transform a single sensor reading from sensor frame to mounting frame
+    
+    Args:
+        sensor_reading: [x, y, z] in sensor's coordinate system
+    
+    Returns:
+        mounting_frame: [x, y, z] in mounting frame coordinate system
+    """
+
+    # Inverted matrix (flip Y and Z rows)
+    R_mc_inverted = np.array([
+    [0.99729097, -0.05141686, 0.05260256],
+    [0.04623249, 0.99436218, 0.09542749],
+    [-0.05721258, -0.09273703, 0.99404555]
+    ])
+    sensor_reading = np.array(sensor_reading)
+    # R_mc @ sensor_reading  (matrix multiplication)
+    mounting_frame = R_mc_inverted @ sensor_reading
+    return mounting_frame
+
 
 def detect_apriltags(camera_matrix, dist_coeffs):
-    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera
+    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera,R_senToCube
+    
+
+    ## Sen to cube Calibration
+    x_meas = np.array([12.3, 45.6, -7.8])
+    y_meas = np.array([-8.9, 52.1, 3.4])
+    z_meas = np.array([5.6, -12.3, 48.7])
+    R_senToCube = calibrate_sensor_from_measurements(x_meas, y_meas, z_meas)
+
+    
+
     cap = cv2.VideoCapture(camera_id)
     top_cap = cv2.VideoCapture(top_camera_id)
     if not cap.isOpened():
@@ -986,7 +1060,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     top_cap.set(cv2.CAP_PROP_FPS, 30)
     print(f"Top camera set to: {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} @ 30fps")
 
-    detector = Detector(families="tag36h11", nthreads=1, quad_decimate=2.0, quad_sigma=0.0, refine_edges=1, decode_sharpening=0.5)
+    detector = Detector(families="tag36h11", nthreads=8, quad_decimate=2.0, quad_sigma=0.0, refine_edges=1, decode_sharpening=0.5)
 
     cube1_center_z_buffer = []
     cube2_center_z_buffer = []
@@ -1085,6 +1159,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 R_cube2_global = None
                 R_cube1_global = None
                 R_cube1_cube2 = None
+                q_cube1_cube2 = None
 
                 worldCube_center_camera = None
                 cube1_center_camera = None
@@ -1104,6 +1179,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 top_R_cube2_global = None
                 top_R_cube1_global = None
                 top_R_cube1_cube2 = None
+                top_q_cube1_cube2 = None
 
                 top_worldCube_center_camera = None
                 top_cube1_center_camera = None
@@ -1537,15 +1613,15 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
                 drawtext_time = time.time()
 
-                # print(
-                #     # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms"
-                # # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
-                # # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
-                # # f"Detection: {(detection_time-convert_time)*1000:.1f}mS1f}ms, "
-                # # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
-                # # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
-                # f"Total: {(time.time()-start_time)*1000:.1f}ms")                              
-
+                print(
+                    # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms, "
+                    # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
+                    # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
+                    # f"Detection: {(detection_time-convert_time)*1000:.1f}ms, "
+                    # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
+                    # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
+                    f"Total: {(time.time()-start_time)*1000:.1f}ms"
+                )
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('t') or auto_record_flag:
