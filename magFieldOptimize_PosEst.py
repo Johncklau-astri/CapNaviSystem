@@ -14,34 +14,140 @@ import socket
 import struct
 import threading
 import argparse
+import joblib
+from datetime import datetime
+from mpl_toolkits.mplot3d import Axes3D
 
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
-CSV_FILE = 'trainingSetNoPitch.csv'
+CSV_FILE = 'twoCamMagField.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
 max_Bfield = 20000  # Maximum magnetic field in µT
+MODEL_FILE = 'correction_models.pkl'
+COMPARISON_LOG = 'ml_comparison_log.csv'
 
 # Constants
 mu_0 = 4 * np.pi * 1e-7
 muT_to_T = 1e-6
 factor = mu_0 / (4 * np.pi) * 1e6
 
+# --- Model Save/Load Functions ---
+def save_correction_models(xgb_x, xgb_y, xgb_z):
+    """Save ML correction models to file"""
+    if xgb_x is not None and xgb_y is not None and xgb_z is not None:
+        try:
+            joblib.dump({'x': xgb_x, 'y': xgb_y, 'z': xgb_z}, MODEL_FILE)
+            print(f"✅ ML models saved to {MODEL_FILE}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to save ML models: {e}")
+            return False
+    return False
+
+def load_correction_models():
+    """Load ML correction models from file"""
+    if os.path.exists(MODEL_FILE):
+        try:
+            models = joblib.load(MODEL_FILE)
+            print(f"✅ ML models loaded from {MODEL_FILE}")
+            return models['x'], models['y'], models['z']
+        except Exception as e:
+            print(f"❌ Failed to load ML models: {e}")
+    return None, None, None
+
+# --- Comparison Logging ---
+def init_comparison_log():
+    """Initialize or load comparison log"""
+    if not os.path.exists(COMPARISON_LOG):
+        df = pd.DataFrame(columns=[
+            'timestamp', 'Bx_uT', 'By_uT', 'Bz_uT',
+            'qw', 'qx', 'qy', 'qz',
+            'physics_x', 'physics_y', 'physics_z',
+            'ml_x', 'ml_y', 'ml_z',
+            'physics_error', 'ml_error',
+            'true_x', 'true_y', 'true_z'
+        ])
+        df.to_csv(COMPARISON_LOG, index=False)
+        print(f"✅ Created comparison log: {COMPARISON_LOG}")
+
+def log_comparison_result(B_custom, quat_sensor, r_physics, r_ml, true_pos=None):
+    """Log comparison between physics-only and ML-corrected estimates"""
+    try:
+        # Load existing log
+        if os.path.exists(COMPARISON_LOG):
+            df = pd.read_csv(COMPARISON_LOG)
+        else:
+            df = pd.DataFrame(columns=[
+                'timestamp', 'Bx_uT', 'By_uT', 'Bz_uT',
+                'qw', 'qx', 'qy', 'qz',
+                'physics_x', 'physics_y', 'physics_z',
+                'ml_x', 'ml_y', 'ml_z',
+                'physics_error', 'ml_error',
+                'true_x', 'true_y', 'true_z'
+            ])
+        
+        # Calculate errors if true position available
+        physics_error = np.linalg.norm(r_physics - true_pos) if true_pos is not None else np.nan
+        ml_error = np.linalg.norm(r_ml - true_pos) if true_pos is not None else np.nan
+        
+        # Create new row
+        new_row = {
+            'timestamp': datetime.now().isoformat(),
+            'Bx_uT': B_custom[0], 'By_uT': B_custom[1], 'Bz_uT': B_custom[2],
+            'qw': quat_sensor[0], 'qx': quat_sensor[1], 'qy': quat_sensor[2], 'qz': quat_sensor[3],
+            'physics_x': r_physics[0], 'physics_y': r_physics[1], 'physics_z': r_physics[2],
+            'ml_x': r_ml[0], 'ml_y': r_ml[1], 'ml_z': r_ml[2],
+            'physics_error': physics_error, 'ml_error': ml_error,
+            'true_x': true_pos[0] if true_pos is not None else np.nan,
+            'true_y': true_pos[1] if true_pos is not None else np.nan,
+            'true_z': true_pos[2] if true_pos is not None else np.nan
+        }
+        
+        # Append and save
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df.to_csv(COMPARISON_LOG, index=False)
+        
+        # Print comparison if true position available
+        if true_pos is not None:
+            improvement = ((physics_error - ml_error) / physics_error * 100) if physics_error > 0 else 0
+            print(f"\n📊 ML Comparison:")
+            print(f"   Physics error: {physics_error*1000:.2f} mm")
+            print(f"   ML error: {ml_error*1000:.2f} mm")
+            print(f"   Improvement: {improvement:.1f}%")
+            
+    except Exception as e:
+        print(f"❌ Failed to log comparison: {e}")
+
 # --- TCP Server for Position Estimation ---
-def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, dipole_params=None, pos_bounds=None, xgb_models=None):
+def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, 
+                       dipole_params=None, pos_bounds=None, xgb_models=None,
+                       enable_ml=True):
+    """Enhanced server with optional ML correction"""
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((host, port))
         server_socket.listen(5)
         server_socket.settimeout(0.1)
+        
+        print(f"\n🚀 Position Server Started on {host}:{port}")
+        print(f"   ML Correction: {'ENABLED' if enable_ml and xgb_models[0] is not None else 'DISABLED'}")
+        print(f"   Comparison logging: {COMPARISON_LOG}\n")
+        
         while not STOP_EVENT.is_set():
             try:
                 client_socket, addr = server_socket.accept()
                 client_socket.settimeout(2.0)
-                handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models)
+                # Pass enable_ml flag to client handler
+                client_thread = threading.Thread(
+                    target=handle_client,
+                    args=(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml)
+                )
+                client_thread.daemon = True
+                client_thread.start()
             except socket.timeout:
                 continue
             except Exception as e:
@@ -53,7 +159,8 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, di
         if 'server_socket' in locals():
             server_socket.close()
 
-def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models):
+def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml=True):
+    """Enhanced client handler with ML comparison"""
     try:
         while not STOP_EVENT.is_set():
             # Receive data length
@@ -80,35 +187,73 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models):
             
             # Validate inputs
             if any(abs(m) > max_Bfield for m in B_custom):
-                print(f"Invalid magnetic field values: {B_custom} µT exceed ±{max_Bfield} µT")
-                response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 'error': 'Invalid magnetic field values'}
+                print(f"⚠️ Invalid magnetic field values: {B_custom} µT")
+                response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 
+                           'mlX': 0.0, 'mlY': 0.0, 'mlZ': 0.0,
+                           'error': 'Invalid magnetic field values'}
             else:
                 quat_norm = np.sqrt(sum(x**2 for x in quat_sensor))
                 if not 0.99 <= quat_norm <= 1.01:
-                    print(f"Invalid quaternion norm: {quat_norm:.3f}")
-                    response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 'error': 'Invalid quaternion norm'}
+                    print(f"⚠️ Invalid quaternion norm: {quat_norm:.3f}")
+                    response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0,
+                               'mlX': 0.0, 'mlY': 0.0, 'mlZ': 0.0,
+                               'error': 'Invalid quaternion norm'}
                 else:
-                    quat_sensor = [x / quat_norm for x in quat_sensor]  # Normalize quaternion
-                    # Estimate position
+                    quat_sensor = [x / quat_norm for x in quat_sensor]
+                    
+                    # Estimate position with and without ML
                     start_time = time.time()
-                    r_est, r_init = estimate_position_custom(
+                    
+                    # Physics-only estimate
+                    r_physics, r_init = estimate_position_custom(
                         B_custom, quat_sensor, dipole_params['m'], pos_bounds,
                         dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
                         dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
                         dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
-                        xgb_models
+                        xgb_models=None  # Force physics-only
                     )
+                    
+                    # ML-corrected estimate (if enabled and models available)
+                    r_ml = r_physics.copy()
+                    if enable_ml and xgb_models[0] is not None:
+                        r_ml, _ = estimate_position_custom(
+                            B_custom, quat_sensor, dipole_params['m'], pos_bounds,
+                            dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+                            dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+                            dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
+                            xgb_models
+                        )
+                    
                     estimation_time = time.time() - start_time
-                    print(f"\nArduino Input: B = {B_custom} µT, Quaternion = {quat_sensor}")
-                    print(f"Initial Guess: x={r_init[0]:.6f}, y={r_init[1]:.6f}, z={r_init[2]:.6f} m")
-                    print(f"Corrected Estimated Position: x={r_est[0]:.6f}, y={r_est[1]:.6f}, z={r_est[2]:.6f} m")
-                    response = {'estX': float(r_est[0]), 'estY': float(r_est[1]), 'estZ': float(r_est[2])}
+                    
+                    # Log comparison
+                    log_comparison_result(B_custom, quat_sensor, r_physics, r_ml)
+                    
+                    print(f"\n📡 Client {addr}:")
+                    print(f"   Input: B = {B_custom} µT")
+                    print(f"   Physics: x={r_physics[0]:.6f}, y={r_physics[1]:.6f}, z={r_physics[2]:.6f} m")
+                    if enable_ml and xgb_models[0] is not None:
+                        print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")
+                        diff = r_ml - r_physics
+                        print(f"   Δ: {diff[0]*1000:.2f}, {diff[1]*1000:.2f}, {diff[2]*1000:.2f} mm")
+                    
+                    # Send both estimates back
+                    response = {
+                        'estX': float(r_ml[0]),  # Physics-only for backward compatibility
+                        'estY': float(r_ml[1]),
+                        'estZ': float(r_ml[2]),
+                        # 'mlX': float(r_ml[0]),        # ML-corrected
+                        # 'mlY': float(r_ml[1]),
+                        # 'mlZ': float(r_ml[2]),
+                        # 'ml_enabled': bool(enable_ml and xgb_models[0] is not None)
+                    }
             
-            # Send response back to client
+            # Send response
             response_str = json.dumps(response)
             response_bytes = response_str.encode('utf-8')
             client_socket.sendall(struct.pack('>I', len(response_bytes)))
             client_socket.sendall(response_bytes)
+            
     except (ConnectionError, socket.error, json.JSONDecodeError) as e:
         print(f"Client {addr} error: {e}")
     except Exception as e:
@@ -174,6 +319,216 @@ def load_dipole_params():
     except Exception as e:
         print(f"Unexpected error loading {param_file}: {e}")
         return None
+    
+def diagnose_pitch_misalignment(data_df):
+    """
+    Diagnostic focusing on pitch variation (since you have good pitch data)
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy.stats import pearsonr
+    from scipy.optimize import least_squares
+    
+    print("\n" + "="*60)
+    print("PITCH-BASED MAGNET ALIGNMENT DIAGNOSTIC")
+    print("="*60)
+    
+    # Extract data
+    positions = data_df[['Rel_X_m', 'Rel_Y_m', 'Rel_Z_m']].values
+    pitch = data_df['Cube2_Pitch_deg'].values
+    roll = data_df['Cube2_Roll_deg'].values
+    yaw = data_df['Cube2_Yaw_deg'].values
+    B_meas = data_df[['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT']].values
+    quats = data_df[['Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz']].values
+    
+    print(f"\nData Summary:")
+    print(f"  Pitch range: {pitch.min():.1f}° to {pitch.max():.1f}° (range: {pitch.max()-pitch.min():.1f}°)")
+    print(f"  Roll range: {roll.min():.1f}° to {roll.max():.1f}° (limited)")
+    print(f"  Yaw range: {yaw.min():.1f}° to {yaw.max():.1f}° (limited)")
+    
+    # Create diagnostic plots
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. Field magnitude vs pitch
+    ax = axes[0, 0]
+    B_mag = np.sqrt(B_meas[:,0]**2 + B_meas[:,1]**2 + B_meas[:,2]**2)
+    scatter = ax.scatter(pitch, B_mag, c=positions[:,0], cmap='viridis', alpha=0.5)
+    ax.set_xlabel('Pitch Angle (deg)')
+    ax.set_ylabel('Field Magnitude (µT)')
+    ax.set_title('Field Magnitude vs Pitch\n(colored by X position)')
+    ax.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=ax, label='X Position (m)')
+    
+    # Calculate correlation
+    corr_mag, p_mag = pearsonr(pitch, B_mag)
+    ax.text(0.05, 0.95, f'corr={corr_mag:.3f}\np={p_mag:.3f}', 
+           transform=ax.transAxes, fontsize=10,
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 2. Field components vs pitch
+    colors = ['red', 'green', 'blue']
+    labels = ['Bx', 'By', 'Bz']
+    
+    ax = axes[0, 1]
+    for i in range(3):
+        ax.scatter(pitch, B_meas[:, i], c=colors[i], alpha=0.3, s=10, label=labels[i])
+    ax.set_xlabel('Pitch Angle (deg)')
+    ax.set_ylabel('Field Component (µT)')
+    ax.set_title('Field Components vs Pitch')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Fit simple dipole model and analyze pitch-dependent residuals
+    ax = axes[0, 2]
+    
+    # Fit dipole model (assuming perfect alignment)
+    def simple_residuals(m, positions, B_meas, quats):
+        m_vec = m
+        residuals = []
+        for r, B, q in zip(positions, B_meas/1e6, quats):
+            R_sensor = quaternion_to_rotation_matrix(q)
+            B_pred_global = dipole_field_enhanced(r, m_vec, None)
+            B_pred_local = R_sensor.T @ B_pred_global
+            residuals.append(B_pred_local - B)
+        return np.ravel(residuals)
+    
+    m0 = np.array([-0.1, 0, 0])
+    result = least_squares(simple_residuals, m0, 
+                          args=(positions, B_meas/1e6, quats),
+                          bounds=([-1, -1, -1], [0, 1, 1]))
+    m_opt = result.x
+    
+    # Calculate residuals
+    residuals_list = []
+    for r, B, q in zip(positions, B_meas/1e6, quats):
+        R_sensor = quaternion_to_rotation_matrix(q)
+        B_pred_global = dipole_field_enhanced(r, m_opt, None)
+        B_pred_local = R_sensor.T @ B_pred_global
+        res = np.linalg.norm(B_pred_local - B) * 1e6
+        residuals_list.append(res)
+    
+    # Convert to numpy array for indexing
+    residuals = np.array(residuals_list)
+    
+    scatter = ax.scatter(pitch, residuals, c=positions[:,1], cmap='plasma', alpha=0.5)
+    ax.set_xlabel('Pitch Angle (deg)')
+    ax.set_ylabel('Residual Magnitude (µT)')
+    ax.set_title('Model Residuals vs Pitch\n(colored by Y position)')
+    ax.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=ax, label='Y Position (m)')
+    
+    corr_resid, p_resid = pearsonr(pitch, residuals)
+    ax.text(0.05, 0.95, f'corr={corr_resid:.3f}\np={p_resid:.3f}', 
+           transform=ax.transAxes, fontsize=10,
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 4. Check if pitch effect depends on X position
+    ax = axes[1, 0]
+    
+    # Split data by X position
+    x_median = np.median(positions[:,0])
+    mask_pos_x = positions[:,0] > x_median
+    mask_neg_x = positions[:,0] < x_median
+    
+    ax.scatter(pitch[mask_pos_x], residuals[mask_pos_x], 
+              c='red', alpha=0.5, s=10, label='X > median')
+    ax.scatter(pitch[mask_neg_x], residuals[mask_neg_x], 
+              c='blue', alpha=0.5, s=10, label='X < median')
+    ax.set_xlabel('Pitch Angle (deg)')
+    ax.set_ylabel('Residual Magnitude (µT)')
+    ax.set_title('Residuals vs Pitch\n(colored by X position)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 5. Fit a model with pitch-dependent correction
+    ax = axes[1, 1]
+    
+    # Try to estimate if magnet is tilted in pitch direction
+    # This would show up as Bx varying with pitch in a specific way
+    
+    # Normalize pitch to [-1, 1] range
+    pitch_norm = 2 * (pitch - pitch.min()) / (pitch.max() - pitch.min()) - 1
+    
+    # Look for quadratic relationship between Bx and pitch
+    from numpy.polynomial import Polynomial
+    
+    # Fit Bx vs pitch
+    p_x = Polynomial.fit(pitch_norm, B_meas[:,0], 2)
+    pitch_fit = np.linspace(-1, 1, 100)
+    Bx_fit = p_x(pitch_fit)
+    
+    ax.scatter(pitch_norm, B_meas[:,0], alpha=0.3, s=10, label='Data')
+    ax.plot(pitch_fit, Bx_fit, 'r-', linewidth=2, label='Quadratic fit')
+    ax.set_xlabel('Normalized Pitch')
+    ax.set_ylabel('Bx (µT)')
+    ax.set_title('Bx vs Pitch - looking for asymmetry')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # The quadratic coefficient tells us about misalignment
+    quad_coef = p_x.convert().coef[2] if len(p_x.convert().coef) > 2 else 0
+    ax.text(0.05, 0.95, f'Quadratic coef: {quad_coef:.3f}', 
+           transform=ax.transAxes, fontsize=10,
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 6. Simple misalignment estimate
+    ax = axes[1, 2]
+    
+    # If magnet is perfectly aligned along X, Bx should be symmetric with pitch
+    # Asymmetry suggests tilt
+    
+    # Split by pitch sign
+    pos_pitch = pitch > 0
+    neg_pitch = pitch < 0
+    
+    if np.sum(pos_pitch) > 10 and np.sum(neg_pitch) > 10:
+        Bx_pos = np.mean(B_meas[pos_pitch, 0])
+        Bx_neg = np.mean(B_meas[neg_pitch, 0])
+        
+        ax.bar(['Pitch < 0', 'Pitch > 0'], [Bx_neg, Bx_pos])
+        ax.set_ylabel('Mean Bx (µT)')
+        ax.set_title(f'Bx asymmetry: {Bx_pos/Bx_neg:.3f}')
+        ax.grid(True, alpha=0.3)
+        
+        # Estimate tilt angle
+        # This is a rough estimate - the actual relationship is more complex
+        if abs(Bx_pos - Bx_neg) > 1.0:
+            estimated_tilt = np.arctan(abs(Bx_pos - Bx_neg) / np.mean([abs(Bx_pos), abs(Bx_neg)])) * 180 / np.pi
+            ax.text(0.5, 0.8, f'Est. tilt: {estimated_tilt:.1f}°', 
+                   ha='center', transform=ax.transAxes,
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig('pitch_diagnostic.png', dpi=150)
+    plt.show()
+    
+    # Print summary
+    print("\n" + "-"*40)
+    print("DIAGNOSIS SUMMARY")
+    print("-"*40)
+    
+    print(f"\nPitch - Field Magnitude correlation: {corr_mag:.3f} (p={p_mag:.3f})")
+    print(f"Pitch - Residual correlation: {corr_resid:.3f} (p={p_resid:.3f})")
+    
+    if abs(corr_resid) > 0.2 and p_resid < 0.05:
+        print("\n⚠️  Significant pitch-dependent residuals detected!")
+        print("   This suggests the magnet may be tilted in the pitch direction.")
+        print("   Recommended: Add pitch tilt to your calibration model.")
+    elif abs(corr_resid) > 0.1:
+        print("\n⚠️  Weak pitch dependence detected - may need more data or wider range")
+    else:
+        print("\n✅ No significant pitch dependence - magnet appears well-aligned in pitch")
+    
+    if abs(quad_coef) > 0.1:
+        print(f"\n⚠️  Significant quadratic term ({quad_coef:.3f}) in Bx vs pitch")
+        print("   This also suggests misalignment in the pitch axis")
+    
+    return {
+        'pitch_range': [pitch.min(), pitch.max()],
+        'mag_correlation': corr_mag,
+        'residual_correlation': corr_resid,
+        'quadratic_coef': quad_coef
+    }
 
 def quaternion_to_rotation_matrix(q):
     q_w, q_x, q_y, q_z = q
@@ -351,47 +706,65 @@ def compute_metrics(m, positions, B_measured, quaternions, a_x=1.0, b_x=0.0, a_y
     return compute_metrics_enhanced(m, positions, B_measured, quaternions, 
                                   0.0, a_x, b_x, 0.0, a_y, b_y, 0.0, a_z, b_z)
 
-def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z, xgb_models=None):
+def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds, 
+                           a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z, 
+                           xgb_models=None):
+    """Enhanced position estimation with optional ML correction"""
     if any(np.isnan(B_custom)) or any(np.isnan(quat_sensor)) or any(abs(b) > max_Bfield for b in B_custom):
         print(f"Invalid input: B_custom={B_custom}, quat_sensor={quat_sensor}")
         return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
+    
     B_custom_T = np.array(B_custom) * muT_to_T
     R_sensor = quaternion_to_rotation_matrix(quat_sensor)
     r_init = initial_position_guess(B_custom_T, m, R_sensor, pos_bounds)
+    
     try:
+        # Physics-based optimization
         result = least_squares(residuals_position_enhanced, r_init,
-                              args=(B_custom_T, m, R_sensor, a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z),
+                              args=(B_custom_T, m, R_sensor, a_x, b_x, c_x, 
+                                   a_y, b_y, c_y, a_z, b_z, c_z),
                               bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
+        
         if not result.success or np.any(np.isnan(result.x)):
-            print(f"Optimization failed or returned NaN for B_custom={B_custom}")
+            print(f"Optimization failed for B_custom={B_custom}")
             return r_init, r_init
+        
         r_est = result.x
-        # Apply correction model if available
-        if xgb_models is not None:
+        
+        # Apply ML correction if models are provided
+        if xgb_models is not None and all(model is not None for model in xgb_models):
             xgb_x, xgb_y, xgb_z = xgb_models
+            
             # Prepare features for correction model
             features = np.array([[B_custom[0], B_custom[1], B_custom[2],
                                  quat_sensor[0], quat_sensor[1], quat_sensor[2], quat_sensor[3],
                                  r_est[0], r_est[1], r_est[2]]])
+            
             if np.any(np.isnan(features)):
                 print(f"NaN in features: {features}")
-                return r_init, r_init
+                return r_est, r_init
+            
             # Predict errors
             error_x_pred = xgb_x.predict(features)[0]
             error_y_pred = xgb_y.predict(features)[0]
             error_z_pred = xgb_z.predict(features)[0]
+            
             # Correct position
-            r_est = np.array([r_est[0] - error_x_pred, r_est[1] - error_y_pred, r_est[2] - error_z_pred])
+            r_ml = np.array([r_est[0] - error_x_pred, 
+                            r_est[1] - error_y_pred, 
+                            r_est[2] - error_z_pred])
+            
+            return r_ml, r_init
+        
         return r_est, r_init
+        
     except Exception as e:
-        print(f"Error estimating custom position for B_custom={B_custom}: {str(e)}")
+        print(f"Error estimating position: {str(e)}")
         return r_init, r_init
 
-def train_correction_model(data_df):
+def train_correction_model(data_df, save=True):
     """
-    Train XGBoost models to predict position errors (Error_Xm, Error_Ym, Error_Zm)
-    based on input features.
-    Returns three trained models for X, Y, Z error corrections.
+    Train XGBoost models and optionally save them
     """
     features = ['Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 
                 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz',
@@ -404,9 +777,10 @@ def train_correction_model(data_df):
         return None, None, None
     
     valid_data = data_df[features + targets].dropna()
-    print(f"Data shape after dropping NaN: {valid_data.shape}")
-    if len(valid_data) < 5:
-        print(f"Too few valid data points ({len(valid_data)}) for training correction model.")
+    print(f"Training data shape after dropping NaN: {valid_data.shape}")
+    
+    if len(valid_data) < 10:  # Increased minimum for better training
+        print(f"⚠️ Too few valid data points ({len(valid_data)}) for training. Need at least 10.")
         return None, None, None
     
     X = valid_data[features].values
@@ -414,25 +788,73 @@ def train_correction_model(data_df):
     y_y = valid_data['Error_Ym'].values
     y_z = valid_data['Error_Zm'].values
     
-    print(f"Training data shapes - X: {X.shape}, y_x: {y_x.shape}, y_y: {y_y.shape}, y_z: {y_z.shape}")
+    print(f"Training data shapes - X: {X.shape}")
+    print(f"Error ranges - X: [{y_x.min():.6f}, {y_x.max():.6f}] m")
+    print(f"               Y: [{y_y.min():.6f}, {y_y.max():.6f}] m")
+    print(f"               Z: [{y_z.min():.6f}, {y_z.max():.6f}] m")
     
+    # Split data
     X_train, X_val, y_x_train, y_x_val = train_test_split(X, y_x, test_size=0.2, random_state=42)
     _, _, y_y_train, y_y_val = train_test_split(X, y_y, test_size=0.2, random_state=42)
     _, _, y_z_train, y_z_val = train_test_split(X, y_z, test_size=0.2, random_state=42)
     
-    xgb_x = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
-    xgb_y = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
-    xgb_z = XGBRegressor(n_estimators=100, random_state=42, verbosity=0)
+    # Train models with better parameters
+    xgb_x = XGBRegressor(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    xgb_y = XGBRegressor(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    xgb_z = XGBRegressor(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
     
+    # Train
     xgb_x.fit(X_train, y_x_train)
     xgb_y.fit(X_train, y_y_train)
     xgb_z.fit(X_train, y_z_train)
     
+    # Evaluate
     mse_x = mean_squared_error(y_x_val, xgb_x.predict(X_val))
     mse_y = mean_squared_error(y_y_val, xgb_y.predict(X_val))
     mse_z = mean_squared_error(y_z_val, xgb_z.predict(X_val))
     
-    print(f"Correction Model MSE - X: {mse_x:.6f}, Y: {mse_y:.6f}, Z: {mse_z:.6f}")
+    rmse_x = np.sqrt(mse_x) * 1000  # Convert to mm
+    rmse_y = np.sqrt(mse_y) * 1000
+    rmse_z = np.sqrt(mse_z) * 1000
+    
+    print(f"\n📊 Correction Model Performance:")
+    print(f"   X: RMSE = {rmse_x:.2f} mm")
+    print(f"   Y: RMSE = {rmse_y:.2f} mm")
+    print(f"   Z: RMSE = {rmse_z:.2f} mm")
+    
+    # Feature importance
+    importance_x = xgb_x.feature_importances_
+    print(f"\n📈 Feature Importances:")
+    for name, imp in zip(features, importance_x):
+        print(f"   {name}: {imp:.3f}")
+    
+    # Save models if requested
+    if save:
+        save_correction_models(xgb_x, xgb_y, xgb_z)
     
     return xgb_x, xgb_y, xgb_z
 
@@ -1075,51 +1497,200 @@ def generate_vector_plots(positions, B_measured, quaternions, dipole_params, bes
     plt.savefig('angular_errors_histogram.png')
     plt.close()
 
+# --- New function to analyze comparison results ---
+def analyze_ml_performance():
+    """Analyze and plot ML vs Physics performance"""
+    if not os.path.exists(COMPARISON_LOG):
+        print("No comparison log found.")
+        return
+    
+    df = pd.read_csv(COMPARISON_LOG)
+    
+    if len(df) == 0:
+        print("No data in comparison log.")
+        return
+    
+    # Filter rows with valid errors
+    df_valid = df.dropna(subset=['physics_error', 'ml_error'])
+    
+    if len(df_valid) == 0:
+        print("No valid comparison data with ground truth.")
+        return
+    
+    # Calculate statistics
+    physics_errors = df_valid['physics_error'].values * 1000  # Convert to mm
+    ml_errors = df_valid['ml_error'].values * 1000
+    
+    physics_mean = np.mean(physics_errors)
+    physics_std = np.std(physics_errors)
+    ml_mean = np.mean(ml_errors)
+    ml_std = np.std(ml_errors)
+    
+    improvements = ((physics_errors - ml_errors) / physics_errors * 100)
+    avg_improvement = np.mean(improvements)
+    
+    print("\n" + "="*60)
+    print("📊 ML PERFORMANCE ANALYSIS")
+    print("="*60)
+    print(f"Total samples with ground truth: {len(df_valid)}")
+    print(f"\nPhysics-only:")
+    print(f"  Mean error: {physics_mean:.2f} mm")
+    print(f"  Std dev: {physics_std:.2f} mm")
+    print(f"\nML-corrected:")
+    print(f"  Mean error: {ml_mean:.2f} mm")
+    print(f"  Std dev: {ml_std:.2f} mm")
+    print(f"\nAverage improvement: {avg_improvement:.1f}%")
+    
+    # Create comparison plots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Histogram comparison
+    axes[0,0].hist(physics_errors, bins=20, alpha=0.5, label='Physics', color='red')
+    axes[0,0].hist(ml_errors, bins=20, alpha=0.5, label='ML', color='green')
+    axes[0,0].set_xlabel('Error (mm)')
+    axes[0,0].set_ylabel('Frequency')
+    axes[0,0].set_title('Error Distribution')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+    
+    # Scatter plot
+    axes[0,1].scatter(physics_errors, ml_errors, alpha=0.5)
+    max_err = max(physics_errors.max(), ml_errors.max())
+    axes[0,1].plot([0, max_err], [0, max_err], 'r--', label='Equal performance')
+    axes[0,1].plot([0, max_err], [0, max_err*0.5], 'g--', label='50% improvement')
+    axes[0,1].set_xlabel('Physics Error (mm)')
+    axes[0,1].set_ylabel('ML Error (mm)')
+    axes[0,1].set_title('Physics vs ML Error')
+    axes[0,1].legend()
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # Improvement histogram
+    axes[1,0].hist(improvements, bins=20, color='blue', alpha=0.7)
+    axes[1,0].axvline(x=0, color='red', linestyle='--', label='No improvement')
+    axes[1,0].set_xlabel('Improvement (%)')
+    axes[1,0].set_ylabel('Frequency')
+    axes[1,0].set_title('Improvement Distribution')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # Time series if timestamp available
+    if 'timestamp' in df_valid.columns:
+        times = pd.to_datetime(df_valid['timestamp'])
+        axes[1,1].plot(times, physics_errors, 'r-', label='Physics', alpha=0.7)
+        axes[1,1].plot(times, ml_errors, 'g-', label='ML', alpha=0.7)
+        axes[1,1].set_xlabel('Time')
+        axes[1,1].set_ylabel('Error (mm)')
+        axes[1,1].set_title('Error over Time')
+        axes[1,1].legend()
+        axes[1,1].grid(True, alpha=0.3)
+        plt.setp(axes[1,1].xaxis.get_majorticklabels(), rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig('ml_performance_analysis.png', dpi=150)
+    plt.show()
+    
+    return {
+        'physics_mean': physics_mean,
+        'physics_std': physics_std,
+        'ml_mean': ml_mean,
+        'ml_std': ml_std,
+        'avg_improvement': avg_improvement
+    }
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Position estimation server or interactive modes")
+    parser = argparse.ArgumentParser(description="Position estimation server with ML comparison")
     parser.add_argument('--optimize', action='store_true', help="Run optimization to generate dipole parameters")
     parser.add_argument('--interactive', action='store_true', help="Run CSV-based position estimation with plotting")
     parser.add_argument('--console', action='store_true', help="Run console-based interactive position estimation")
+    parser.add_argument('--diagnose', action='store_true', help="Run magnet alignment diagnostic on CSV data")
+    parser.add_argument('--analyze', action='store_true', help="Analyze ML performance from comparison log")
+    parser.add_argument('--no-ml', action='store_true', help="Disable ML correction in server mode")
+    parser.add_argument('--force-train', action='store_true', help="Force retraining of ML models")
+
     args = parser.parse_args()
 
+    # Initialize comparison log
+    init_comparison_log()
+
+    # Handle analysis mode
+    if args.analyze:
+        analyze_ml_performance()
+        exit(0)
+
+    # Load dipole parameters
     dipole_params = load_dipole_params()
+    if dipole_params is None and not args.optimize:
+        print("No valid dipole parameters. Run with --optimize to generate them.")
+        exit(1)
+
+    # Load data
     positions, B_measured, quaternions, data_df = load_and_filter_data()
     pos_bounds = None
-    best_stage = "Existing Parameters"
-    ang_errs_final = None
-    B_pred_final = None
-    xgb_models = None
-
+    
     if positions is not None:
         pos_bounds = (
             [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
             [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
         )
         print(f"Position bounds: {pos_bounds}")
-        # Train correction model if data is available
-        if args.interactive or args.console or not (args.interactive or args.console or args.optimize):
-            xgb_models = train_correction_model(data_df)
+
+    # Handle ML models
+    xgb_models = (None, None, None)
+    
+    if args.force_train or (args.optimize and args.interactive):
+        # Force retraining
+        if data_df is not None:
+            print("\n🔄 Force training ML models...")
+            xgb_models = train_correction_model(data_df, save=True)
+    elif not args.no_ml:
+        # Try to load existing models
+        xgb_models = load_correction_models()
+        
+        # If no models found and we have data, train new ones
+        if xgb_models[0] is None and data_df is not None:
+            print("\n🔄 No existing ML models found. Training new ones...")
+            xgb_models = train_correction_model(data_df, save=True)
+
+    if args.diagnose:
+        if data_df is not None:
+            print("\nRunning magnet alignment diagnostic...")
+            diagnostic_results = diagnose_pitch_misalignment(data_df)
+            print("\nDiagnostic complete. Check 'pitch_diagnostic.png'")
+            exit(0)
+        else:
+            print("Error: Could not load data for diagnostic")
+            exit(1)
 
     if args.optimize:
+        print("\n🔧 Running optimization...")
         result = run_optimization_enhanced()
         if result is None or len(result) < 8:
             print("Optimization failed.")
             exit(1)
         dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
+        
         if positions is not None:
             generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
-            # Retrain correction model after optimization
-            xgb_models = train_correction_model(data_df)
+            
+            # Retrain correction models with optimized results
+            if data_df is not None:
+                print("\n🔄 Retraining ML models with optimized parameters...")
+                xgb_models = train_correction_model(data_df, save=True)
 
     if dipole_params is None:
-        print("No valid dipole parameters. Run with --optimize to generate them or ensure 'dipole_model_params.json' exists.")
+        print("No valid dipole parameters. Run with --optimize to generate them.")
         exit(1)
 
+    # Start server with appropriate mode
     if args.console:
-        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models))
+        server_thread = threading.Thread(
+            target=run_position_server,
+            args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models, not args.no_ml)
+        )
         server_thread.daemon = True
         server_thread.start()
+        
         interactive_position_estimation(
             dipole_params['m'], pos_bounds,
             dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
@@ -1128,9 +1699,18 @@ if __name__ == "__main__":
             positions
         )
     elif args.interactive:
-        server_thread = threading.Thread(target=run_position_server, args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models))
+        server_thread = threading.Thread(
+            target=run_position_server,
+            args=(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models, not args.no_ml)
+        )
         server_thread.daemon = True
         server_thread.start()
+        
         run_csv_interactive(dipole_params, pos_bounds, positions)
     else:
-        run_position_server(POSITION_SERVER_HOST, POSITION_SERVER_PORT, dipole_params, pos_bounds, xgb_models)
+        # Normal server mode with ML enabled by default
+        run_position_server(
+            POSITION_SERVER_HOST, POSITION_SERVER_PORT, 
+            dipole_params, pos_bounds, xgb_models, 
+            enable_ml=not args.no_ml
+        )
