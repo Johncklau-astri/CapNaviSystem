@@ -29,8 +29,8 @@ CUBE_SIZE = 0.08
 CHECKERBOARD = (6, 8)
 CHECKERBOARD_SQUARE_SIZE = 0.025
 
-CALIBRATION_FILE = "VidAprilTagCalibration.npz"
-TOP_CALIBRATION_FILE = "VidAprilTagCalibration.npz"
+# CALIBRATION_FILE = "VidAprilTagCalibration.npz"
+# TOP_CALIBRATION_FILE = "VidAprilTagCalibration.npz"
 
 AXIS_LENGTH = TAG_SIZE
 DISPLAY_WIDTH = 1920    
@@ -43,9 +43,9 @@ Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
 
-cube2MagOffset_X = 0.000
+cube2MagOffset_X = 0.004
 cube2MagOffset_Y = 0.0
-cube2MagOffset_Z = -0.1 
+cube2MagOffset_Z = -0.105 
 
 top_R_1000_cube1_camera = None
 R_1000_cube1_camera = None
@@ -54,26 +54,26 @@ R_1000_cube1_camera = None
 ##### Position weights
 SIDE_POS_WEIGHTS = {
     'x': 0.05,  # Side camera is bad at X
-    'y': 0.5,  # Side camera is okay at Y  
+    'y': 0.9,  # Side camera is okay at Y  
     'z': 0.95   # Side camera is good at Z
 }
 
 TOP_POS_WEIGHTS = {
     'x': 0.95,  # Top camera is good at X
-    'y': 0.5,  # Top camera is good at Y
+    'y': 0.1,  # Top camera is good at Y
     'z': 0.05   # Top camera is bad at Z
 }
 
 # Orientation weights
 SIDE_ORI_WEIGHTS = {
-    'roll': 0.5,   # Side camera good at roll (X rotation)
-    'pitch': 0.9,  # Side camera good at pitch (Y rotation)
+    'roll': 0.9,   # Side camera good at roll (X rotation)
+    'pitch': 0.5,  # Side camera good at pitch (Y rotation)
     'yaw': 0.1     # Side camera bad at yaw (Z rotation)
 }
 
 TOP_ORI_WEIGHTS = {
-    'roll': 0.5,   # Top camera bad at roll
-    'pitch': 0.1,  # Top camera bad at pitch
+    'roll': 0.1,   # Top camera bad at roll
+    'pitch': 0.5,  # Top camera bad at pitch
     'yaw': 0.9     # Top camera good at yaw
 }
 
@@ -479,95 +479,230 @@ def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
         return padded_frame
     return resized_frame
 
-def load_calibration():
-    if os.path.exists(CALIBRATION_FILE):
-        data = np.load(CALIBRATION_FILE)
-        return data['camera_matrix'], data['dist_coeffs']
-    return None, None
+# def load_calibration():
+#     if os.path.exists(CALIBRATION_FILE):
+#         data = np.load(CALIBRATION_FILE)
+#         return data['camera_matrix'], data['dist_coeffs']
+#     return None, None
 
-def save_calibration(camera_matrix, dist_coeffs):
-    np.savez(CALIBRATION_FILE, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
-
+# def save_calibration(camera_matrix, dist_coeffs):
+#     np.savez(CALIBRATION_FILE, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
 def calibrate_camera():
-    camera_matrix, dist_coeffs = load_calibration()
-    if camera_matrix is not None and dist_coeffs is not None:
-        user_input = input("Use existing calibration data? (y/n): ").strip().lower()
-        if user_input == 'y':
-            # Display existing calibration parameters
-            print("\n=== EXISTING CALIBRATION PARAMETERS ===")
+    """
+    Calibrate both side and top cameras.
+    
+    Returns:
+        side_camera_matrix, side_dist_coeffs, top_camera_matrix, top_dist_coeffs
+    """
+    # Define calibration files for each camera
+    SIDE_CALIBRATION_FILE = "side_camera_calibration.npz"
+    TOP_CALIBRATION_FILE = "top_camera_calibration.npz"
+    
+    # Helper function to load calibration if exists
+    def load_camera_calibration(calib_file):
+        if os.path.exists(calib_file):
+            data = np.load(calib_file)
+            return data['camera_matrix'], data['dist_coeffs']
+        return None, None
+    
+    # Helper function to save calibration
+    def save_camera_calibration(calib_file, camera_matrix, dist_coeffs):
+        np.savez(calib_file, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
+    
+    # Helper function to perform actual calibration for a specific camera
+    def calibrate_specific_camera(cam_id, calib_file, camera_name):
+        print(f"\n=== CALIBRATING {camera_name.upper()} CAMERA (ID: {cam_id}) ===")
+        
+        # Check for existing calibration
+        existing_matrix, existing_dist = load_camera_calibration(calib_file)
+        if existing_matrix is not None and existing_dist is not None:
+            print(f"\nExisting calibration found for {camera_name} camera:")
+            print(f"Camera Matrix:\n{existing_matrix}")
+            print(f"Distortion Coefficients: {existing_dist.flatten()}")
+            
+            user_input = input(f"Use existing calibration data for {camera_name} camera? (y/n): ").strip().lower()
+            if user_input == 'y':
+                return existing_matrix, existing_dist
+        
+        # If no existing calibration or user wants to recalibrate
+        print(f"\nStarting new calibration for {camera_name} camera...")
+        print(f"Show a 6x8 checkerboard (25mm squares) to the {camera_name} camera.")
+        print(f"Press 'c' to capture, 'q' to finish (need at least 15 frames).")
+        
+        cap = cv2.VideoCapture(cam_id)
+        if not cap.isOpened():
+            print(f"Could not open {camera_name} camera with index {cam_id}.")
+            return None, None
+            
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001)
+        objp = np.zeros((CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
+        objp[:, :2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2) * CHECKERBOARD_SQUARE_SIZE
+        objpoints = []
+        imgpoints = []
+        
+        count = 0
+        cv2.namedWindow(f"{camera_name} Camera Calibration", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(f"{camera_name} Camera Calibration", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+        
+        while count < NUM_CALIBRATION_FRAMES:
+            ret, frame = cap.read()
+            if not ret:
+                print(f"Failed to capture frame from {camera_name} camera.")
+                break
+                
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, None)
+            
+            if ret:
+                corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+                cv2.drawChessboardCorners(frame, CHECKERBOARD, corners2, ret)
+                
+            frame_display = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
+            cv2.imshow(f"{camera_name} Camera Calibration", frame_display)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('c') and ret:
+                objpoints.append(objp)
+                imgpoints.append(corners2)
+                count += 1
+                print(f"Captured {count}/{NUM_CALIBRATION_FRAMES}")
+            elif key == ord('q'):
+                break
+                
+        cap.release()
+        cv2.destroyWindow(f"{camera_name} Camera Calibration")
+        
+        if len(objpoints) < 15:
+            print(f"Insufficient frames ({len(objpoints)}) for {camera_name} camera calibration.")
+            return None, None
+            
+        ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+            objpoints, imgpoints, gray.shape[::-1], None, None
+        )
+        
+        if ret:
+            # Calculate reprojection error
+            mean_error = 0
+            for i in range(len(objpoints)):
+                imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], 
+                                                 camera_matrix, dist_coeffs)
+                error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+                mean_error += error
+            mean_error /= len(objpoints)
+            
+            # Display calibration results
+            print(f"\n=== {camera_name.upper()} CAMERA CALIBRATION RESULTS ===")
             print(f"Camera Matrix:\n{camera_matrix}")
             print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
+            print(f"Reprojection Error: {mean_error:.4f} pixels")
+            print(f"Focal Length (fx, fy): ({camera_matrix[0,0]:.2f}, {camera_matrix[1,1]:.2f})")
+            print(f"Principal Point (cx, cy): ({camera_matrix[0,2]:.2f}, {camera_matrix[1,2]:.2f})")
+            
+            if mean_error > 0.5:
+                print(f"WARNING: High reprojection error - consider recalibrating {camera_name} camera")
+            
+            # Save calibration
+            save_camera_calibration(calib_file, camera_matrix, dist_coeffs)
+            print(f"Calibration saved to {calib_file}")
+            
             return camera_matrix, dist_coeffs
-    cap = cv2.VideoCapture(camera_id)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    if not cap.isOpened():
-        print(f"Could not open camera with index {camera_id}.")
-        return None, None
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001)
-    objp = np.zeros((CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2) * CHECKERBOARD_SQUARE_SIZE
-    objpoints = []
-    imgpoints = []
-    print(f"Show a 6x8 checkerboard (25mm squares). Press 'c' to capture, 'q' to finish (needs {NUM_CALIBRATION_FRAMES} frames).")
-    count = 0
-    cv2.namedWindow("Checkerboard Calibration", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Checkerboard Calibration", DISPLAY_WIDTH, DISPLAY_HEIGHT)
-    while count < NUM_CALIBRATION_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to capture frame.")
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, None)
-        if ret:
-            corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            cv2.drawChessboardCorners(frame, CHECKERBOARD, corners2, ret)
-        frame_display = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
-        cv2.imshow("Checkerboard Calibration", frame_display)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('c') and ret:
-            objpoints.append(objp)
-            imgpoints.append(corners2)
-            count += 1
-            print("Captured")
-        elif key == ord('q'):
-            break
-    cap.release()
-    cv2.destroyAllWindows()
-    if len(objpoints) < 15:
-        print("Insufficient frames for calibration.")
-        return None, None
-    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+        else:
+            print(f"Calibration failed for {camera_name} camera.")
+            return None, None
+    
+    # Calibrate side camera (ID: 0)
+    side_matrix, side_dist = calibrate_specific_camera(camera_id, SIDE_CALIBRATION_FILE, "side")
+    
+    # Calibrate top camera (ID: 3)
+    top_matrix, top_dist = calibrate_specific_camera(top_camera_id, TOP_CALIBRATION_FILE, "top")
+    
+    return side_matrix, side_dist, top_matrix, top_dist
 
 
+# def calibrate_camera():
+#     camera_matrix, dist_coeffs = load_calibration()
+#     if camera_matrix is not None and dist_coeffs is not None:
+#         user_input = input("Use existing calibration data? (y/n): ").strip().lower()
+#         if user_input == 'y':
+#             # Display existing calibration parameters
+#             print("\n=== EXISTING CALIBRATION PARAMETERS ===")
+#             print(f"Camera Matrix:\n{camera_matrix}")
+#             print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
+#             return camera_matrix, dist_coeffs
+#     cap = cv2.VideoCapture(camera_id)
+#     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+#     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+#     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    if ret:
-        mean_error = 0
-        for i in range(len(objpoints)):
-            imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
-            error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
-            mean_error += error
-        mean_error /= len(objpoints)
+#     if not cap.isOpened():
+#         print(f"Could not open camera with index {camera_id}.")
+#         return None, None
+#     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.0001)
+#     objp = np.zeros((CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
+#     objp[:, :2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2) * CHECKERBOARD_SQUARE_SIZE
+#     objpoints = []
+#     imgpoints = []
+#     print(f"Show a 6x8 checkerboard (25mm squares). Press 'c' to capture, 'q' to finish (needs {NUM_CALIBRATION_FRAMES} frames).")
+#     count = 0
+#     cv2.namedWindow("Checkerboard Calibration", cv2.WINDOW_NORMAL)
+#     cv2.resizeWindow("Checkerboard Calibration", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+#     while count < NUM_CALIBRATION_FRAMES:
+#         ret, frame = cap.read()
+#         if not ret:
+#             print("Failed to capture frame.")
+#             break
+#         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#         ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, None)
+#         if ret:
+#             corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+#             cv2.drawChessboardCorners(frame, CHECKERBOARD, corners2, ret)
+#         frame_display = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
+#         cv2.imshow("Checkerboard Calibration", frame_display)
+#         key = cv2.waitKey(1) & 0xFF
+#         if key == ord('c') and ret:
+#             objpoints.append(objp)
+#             imgpoints.append(corners2)
+#             count += 1
+#             print("Captured")
+#         elif key == ord('q'):
+#             break
+#     cap.release()
+#     cv2.destroyAllWindows()
+#     if len(objpoints) < 15:
+#         print("Insufficient frames for calibration.")
+#         return None, None
+#     ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+
+
+
+#     if ret:
+#         mean_error = 0
+#         for i in range(len(objpoints)):
+#             imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+#             error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+#             mean_error += error
+#         mean_error /= len(objpoints)
         
-        # Display calibration results
-        print("\n=== CALIBRATION RESULTS ===")
-        print(f"Camera Matrix:\n{camera_matrix}")
-        print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
-        print(f"Reprojection Error: {mean_error:.4f} pixels")
-        print(f"Focal Length (fx, fy): ({camera_matrix[0,0]:.2f}, {camera_matrix[1,1]:.2f})")
-        print(f"Principal Point (cx, cy): ({camera_matrix[0,2]:.2f}, {camera_matrix[1,2]:.2f})")
+#         # Display calibration results
+#         print("\n=== CALIBRATION RESULTS ===")
+#         print(f"Camera Matrix:\n{camera_matrix}")
+#         print(f"Distortion Coefficients: {dist_coeffs.flatten()}")
+#         print(f"Reprojection Error: {mean_error:.4f} pixels")
+#         print(f"Focal Length (fx, fy): ({camera_matrix[0,0]:.2f}, {camera_matrix[1,1]:.2f})")
+#         print(f"Principal Point (cx, cy): ({camera_matrix[0,2]:.2f}, {camera_matrix[1,2]:.2f})")
         
-        if mean_error > 0.5:
-            print("WARNING: High reprojection error - consider recalibrating")
+#         if mean_error > 0.5:
+#             print("WARNING: High reprojection error - consider recalibrating")
         
-        save_calibration(camera_matrix, dist_coeffs)
-        return camera_matrix, dist_coeffs
-    else:
-        print("Calibration failed.")
-        return None, None
+#         save_calibration(camera_matrix, dist_coeffs)
+#         return camera_matrix, dist_coeffs
+#     else:
+#         print("Calibration failed.")
+#         return None, None
 
 def rotation_matrix_to_euler(R):
     sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
@@ -1028,7 +1163,7 @@ def sensor_to_mounting_frame(sensor_reading):
     return mounting_frame
 
 
-def detect_apriltags(camera_matrix, dist_coeffs):
+def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coeffs):
     global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera,R_senToCube
     
 
@@ -1104,6 +1239,13 @@ def detect_apriltags(camera_matrix, dist_coeffs):
     (DISPLAY_WIDTH, DISPLAY_HEIGHT),  # Use your camera resolution
     cv2.CV_16SC2
     )
+
+    map3, map4 = cv2.initUndistortRectifyMap(
+    top_camera_matrix, top_dist_coeffs, None,
+    top_camera_matrix,
+    (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+    cv2.CV_16SC2
+    )
     
     cv2.namedWindow("AprilTag Localization", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("AprilTag Localization", DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -1128,7 +1270,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
                 # frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
                 frame_undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-                top_frame_undistorted = cv2.remap(top_frame, map1, map2, cv2.INTER_LINEAR)
+                top_frame_undistorted = cv2.remap(top_frame, map3, map4, cv2.INTER_LINEAR)
                 undistort_time = time.time()
               
                 text_frame[:] = 0  # Reset to black
@@ -1145,8 +1287,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 detection_time = time.time()
            
                 top_detections = detector.detect(top_gray, estimate_tag_pose=True,
-                                                 camera_params=(camera_matrix[0, 0], camera_matrix[1, 1],
-                                                                camera_matrix[0, 2], camera_matrix[1, 2]),
+                                                 camera_params=(top_camera_matrix[0, 0], top_camera_matrix[1, 1],
+                                                                top_camera_matrix[0, 2], top_camera_matrix[1, 2]),
                                                  tag_size=TAG_SIZE)
                 top_detection_time = time.time()
 
@@ -1223,7 +1365,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                         corners = det.corners
                         for i in range(4):
                             cv2.line(top_frame_undistorted, tuple(corners[i].astype(int)), tuple(corners[(i+1)%4].astype(int)), (0, 255, 0), 2)
-                        rvec, tvec = refine_pose(corners, camera_matrix, dist_coeffs)
+                        rvec, tvec = refine_pose(corners, top_camera_matrix, top_dist_coeffs)
                         if rvec is None or tvec is None:
                             print(f"Pose refinement failed for top tag {det.tag_id}")
                             continue
@@ -1480,10 +1622,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
 
 
-                if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None):
-                    print(f"top cam x:{top_t_cube1_cube2_tag[0]:.3f}\ty:{top_t_cube1_cube2_tag[1]:.3f}\tz:{top_t_cube1_cube2_tag[2]:.3f}\t\tSide cam x:{t_cube1_cube2_tag[0]:.3f}\ty:{t_cube1_cube2_tag[1]:.3f}\tz:{t_cube1_cube2_tag[2]:.3f}")
-                if(top_q_cube1_cube2 is not None and q_cube1_cube2 is not None):
-                    print(f"top cam qx:{top_q_cube1_cube2[0]:.3f}\tqy:{top_q_cube1_cube2[1]:.3f}\tqz:{top_q_cube1_cube2[2]:.3f}\tqw:{top_q_cube1_cube2[3]:.3f}\t\tSide cam qx:{q_cube1_cube2[0]:.3f}\tqy:{q_cube1_cube2[1]:.3f}\tqz:{q_cube1_cube2[2]:.3f}\tqw:{q_cube1_cube2[3]:.3f}")
+                # if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None):
+                #     print(f"top cam x:{top_t_cube1_cube2_tag[0]:.3f}\ty:{top_t_cube1_cube2_tag[1]:.3f}\tz:{top_t_cube1_cube2_tag[2]:.3f}\t\tSide cam x:{t_cube1_cube2_tag[0]:.3f}\ty:{t_cube1_cube2_tag[1]:.3f}\tz:{t_cube1_cube2_tag[2]:.3f}")
+                # if(top_q_cube1_cube2 is not None and q_cube1_cube2 is not None):
+                #     print(f"top cam qx:{top_q_cube1_cube2[0]:.3f}\tqy:{top_q_cube1_cube2[1]:.3f}\tqz:{top_q_cube1_cube2[2]:.3f}\tqw:{top_q_cube1_cube2[3]:.3f}\t\tSide cam qx:{q_cube1_cube2[0]:.3f}\tqy:{q_cube1_cube2[1]:.3f}\tqz:{q_cube1_cube2[2]:.3f}\tqw:{q_cube1_cube2[3]:.3f}")
 
 
                 ################################################################################################################################
@@ -1498,10 +1640,10 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                     
 
 
-                # Print for debugging
-                if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
-                    print(f"Fused pos: x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f}")
-                    print(f"Fused ori: qx={fused_q_cube1_cube2[0]:.3f}, qy={fused_q_cube1_cube2[1]:.3f}, qz={fused_q_cube1_cube2[2]:.3f}, qw={fused_q_cube1_cube2[3]:.3f}")
+                # # Print for debugging
+                # if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
+                #     print(f"Fused pos: x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f}")
+                #     print(f"Fused ori: qx={fused_q_cube1_cube2[0]:.3f}, qy={fused_q_cube1_cube2[1]:.3f}, qz={fused_q_cube1_cube2[2]:.3f}, qw={fused_q_cube1_cube2[3]:.3f}")
 
 
 
@@ -1524,9 +1666,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 
     
 
-
-
-
+                if (R_cube1_cube2 is not None) and (magX != 0.0 or magY != 0.0 or magZ != 0.0):
+                    b_global = R_cube1_cube2 @ np.array([magX, magY, magZ])
 
 
 
@@ -1534,7 +1675,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 # Update position estimation at controlled rate (NON-BLOCKING)
                 current_time = time.time()
                 if current_time - last_position_update > POSITION_UPDATE_INTERVAL:
-                    update_position_estimation(q_btcap_cube2, magX, magY, magZ)  # This is now non-blocking
+                    update_position_estimation(fused_q_cube1_cube2, magX, magY, magZ)  # This is now non-blocking
                     last_position_update = current_time
 
                 # Draw estimated position and axes
@@ -1581,8 +1722,8 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 q_cap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
                 q_q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
                 est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
-                pos_error_text =        f"Pos Err: x={estX-t_cube1_cube2_tag[0]:.3f} m, y={estY-t_cube1_cube2_tag[1]:.3f} m, z={estZ-t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "Pos Err: N/A"
-                t_cube1_cube2_text =     f"True rel pos: x={t_cube1_cube2_tag[0]:.3f} m, y={t_cube1_cube2_tag[1]:.3f} m, z={t_cube1_cube2_tag[2]:.3f} m" if t_cube1_cube2_tag is not None else "True rel pos: N/A"
+                pos_error_text =        f"Pos Err: x={estX-fused_t_cube1_cube2_tag[0]:.3f} m, y={estY-fused_t_cube1_cube2_tag[1]:.3f} m, z={estZ-fused_t_cube1_cube2_tag[2]:.3f} m" if fused_t_cube1_cube2_tag is not None else "Pos Err: N/A"
+                bglobal_text =     f"bglobal: x={b_global[0]:.3f} uT, y={b_global[1]:.3f} uT, z={b_global[2]:.3f} uT" if b_global is not None else "Global mag vector: N/A"
                 diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
                 diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
                 side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
@@ -1597,7 +1738,7 @@ def detect_apriltags(camera_matrix, dist_coeffs):
                 draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                 draw_text_with_background(text_frame, q_q_btcap_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                 draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
-                draw_text_with_background(text_frame, t_cube1_cube2_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, bglobal_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
                 draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
@@ -1697,9 +1838,9 @@ def detect_apriltags(camera_matrix, dist_coeffs):
 if __name__ == "__main__":
     try:
         
-        camera_matrix, dist_coeffs = calibrate_camera()
-        if camera_matrix is not None and dist_coeffs is not None:
-            detect_apriltags(camera_matrix, dist_coeffs)
+        camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs = calibrate_camera()
+        if camera_matrix is not None and dist_coeffs is not None and top_camera_matrix is not None and top_dist_coeffs is not None:
+            detect_apriltags(camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs)
     except Exception as e:
         print(f"Main program error: {e}")
     finally:
