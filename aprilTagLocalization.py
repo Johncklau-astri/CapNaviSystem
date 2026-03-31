@@ -24,8 +24,8 @@ import serial
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 3
-camera_id = 0
-top_camera_id = 3
+camera_id = 3
+top_camera_id = 0
 
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
@@ -587,8 +587,8 @@ def calibrate_camera():
         side_camera_matrix, side_dist_coeffs, top_camera_matrix, top_dist_coeffs
     """
     # Define calibration files for each camera
-    SIDE_CALIBRATION_FILE = "side_camera_calibration.npz"
-    TOP_CALIBRATION_FILE = "top_camera_calibration.npz"
+    SIDE_CALIBRATION_FILE = "VidAprilTagCalibration.npz"
+    TOP_CALIBRATION_FILE = "VidAprilTagCalibration.npz"
     
     # Helper function to load calibration if exists
     def load_camera_calibration(calib_file):
