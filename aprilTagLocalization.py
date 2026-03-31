@@ -1,3 +1,6 @@
+
+## FAST CYCLE
+
 import cv2
 import numpy as np
 try:
@@ -17,6 +20,7 @@ import queue
 from concurrent.futures import ThreadPoolExecutor, Future
 import asyncio
 import select
+import serial
 
 # --- Configuration ---
 ## side camera id is 0
@@ -92,6 +96,13 @@ estZ = 0.0
 bt_quat_global = [1.0, 0.0, 0.0, 0.0]  # Quaternion from bt_angleEst
 R_senToCube = np.eye(3)
 
+# ADD THESE LINES FOR SERIAL DATA
+serial_magX = 0.0
+serial_magY = 0.0
+serial_magZ = 0.0
+serial_mag_lock = threading.Lock()
+serial_port = None
+
 
 # Thread-safe queues
 bt_data_queue = queue.Queue(maxsize=100)  # Buffer up to 100 samples
@@ -114,6 +125,88 @@ stop_event = threading.Event()
 position_thread_running = True
 position_socket = None
 position_socket_lock = threading.Lock()
+
+# Add serial port initialization
+def init_serial_connection(port='COM19', baudrate=115200):
+    global serial_port
+    try:
+        ser = serial.Serial(port, baudrate, timeout=1)
+        ser.flush()
+        time.sleep(2)
+        print(f"Serial port {port} opened successfully at {baudrate} baud")
+        return ser
+    except serial.SerialException as e:
+        print(f"Error opening serial port {port}: {e}")
+        print("Continuing without serial data...")
+        return None
+# Initialize serial connection
+serial_port = init_serial_connection('COM19', 115200)  # Change COM port as needed
+
+def run_serial_data_receiver(stop_event):
+    """Receive magnetic field data from Arduino via serial"""
+    global serial_magX, serial_magY, serial_magZ, serial_port
+    
+    if serial_port is None:
+        print("Serial port not available, skipping serial data thread")
+        return
+    
+    buffer = ""
+    
+    while not stop_event.is_set():
+        try:
+            if serial_port.in_waiting > 0:
+                # Read available data
+                data = serial_port.read(serial_port.in_waiting).decode('utf-8', errors='ignore')
+                buffer += data
+                
+                # Process complete lines
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    
+                    if line.startswith('M:'):
+                        mag_data = line[2:].split(',')
+                        if len(mag_data) == 3:
+                            try:
+                                sensor_mag_x, sensor_mag_y, sensor_mag_z = map(float, mag_data)
+                                with serial_mag_lock:
+                                    # Apply coordinate transformations if needed
+                                    serial_magX = sensor_mag_x
+                                    serial_magY = -sensor_mag_y  # Invert Y to match coordinate system
+                                    serial_magZ = -sensor_mag_z  # Invert Z to match coordinate system
+                                    # print(f"Raw Serial Mag: X={sensor_mag_x:.2f}, Y={sensor_mag_y:.2f}, Z={sensor_mag_z:.2f}")
+                                    
+                                    # Optional: print at lower rate to avoid console spam
+                                    if not hasattr(run_serial_data_receiver, "last_print") or \
+                                       time.time() - run_serial_data_receiver.last_print > 1.0:
+                                        # print(f"Serial Mag: X={serial_magX:.2f}, Y={serial_magY:.2f}, Z={serial_magZ:.2f}")
+                                        run_serial_data_receiver.last_print = time.time()
+                            except ValueError as e:
+                                print(f"Error parsing magnetic field data: {line} - {e}")
+                    elif line.startswith('M:Error'):
+                        print(f"Arduino error: {line}")
+            time.sleep(0.005)  # 5ms polling interval
+            
+        except serial.SerialException as e:
+            print(f"Serial communication error: {e}")
+            # Attempt to reconnect
+            try:
+                if serial_port:
+                    serial_port.close()
+                time.sleep(1)
+                serial_port = init_serial_connection('COM20', 115200)
+            except Exception as reconnect_error:
+                print(f"Failed to reconnect: {reconnect_error}")
+                time.sleep(5)
+        except Exception as e:
+            print(f"Serial data thread error: {e}")
+            time.sleep(0.1)
+    
+    if serial_port:
+        serial_port.close()
+    print("Serial data thread stopped")
+
+
 
 def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
     global latest_position_data, auto_record_flag
@@ -1164,8 +1257,9 @@ def sensor_to_mounting_frame(sensor_reading):
 
 
 def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coeffs):
-    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ, bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera,R_senToCube
-    
+    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ
+    global bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera,R_senToCube
+    global serial_magX, serial_magY, serial_magZ, serial_mag_lock
 
     ## Sen to cube Calibration
     x_meas = np.array([12.3, 45.6, -7.8])
@@ -1230,6 +1324,16 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     bt_receiver_thread = threading.Thread(target=run_bt_data_receiver, args=('localhost', BT_ANGLE_EST_PORT, stop_event))
     bt_receiver_thread.daemon = True
     bt_receiver_thread.start()
+    
+    # ADD THIS: Start serial data receiver thread
+    if serial_port is not None:
+        serial_thread = threading.Thread(target=run_serial_data_receiver, args=(stop_event,))
+        serial_thread.daemon = True
+        serial_thread.start()
+        print("Serial data receiver thread started")
+    else:
+        print("Serial data receiver not started (no serial connection)")
+
 
     capture_time = None
 
@@ -1284,13 +1388,12 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                                             camera_params=(camera_matrix[0, 0], camera_matrix[1, 1],
                                                            camera_matrix[0, 2], camera_matrix[1, 2]),
                                             tag_size=TAG_SIZE)
-                detection_time = time.time()
            
                 top_detections = detector.detect(top_gray, estimate_tag_pose=True,
                                                  camera_params=(top_camera_matrix[0, 0], top_camera_matrix[1, 1],
                                                                 top_camera_matrix[0, 2], top_camera_matrix[1, 2]),
                                                  tag_size=TAG_SIZE)
-                top_detection_time = time.time()
+                detection_time = time.time()
 
                 # side cam data
                 tags = []
@@ -1334,6 +1437,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 fused_t_cube1_cube2_tag = None
                 fused_q_cube1_cube2 = None
 
+                b_global = None
                 # Non-camera specific data
                 magX = 0.0
                 magY = 0.0
@@ -1388,6 +1492,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                             latest_bt_data.get('qy', 0.0),
                             latest_bt_data.get('qz', 0.0)
                         ]
+
 
                 ################################################################################################################################
                 ###################                     side Cam cube Extraction                 #########################################
@@ -1729,6 +1834,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
                 top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f}" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
                 fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f}" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
+                serial_mag_text = f"Serial Mag: X={serial_magX:.2f} uT, Y={serial_magY:.2f} uT, Z={serial_magZ:.2f} uT" if serial_magX is not None else "Serial Mag: N/A"
                 intervalOffset = 1
                 FONT_SCALE = 1
                 draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
@@ -1740,7 +1846,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
                 draw_text_with_background(text_frame, bglobal_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
-                draw_text_with_background(text_frame, diff_euler_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, serial_mag_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
                 # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
 
@@ -1755,12 +1861,13 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 drawtext_time = time.time()
 
                 print(
-                    # f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms, "
-                    # f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
-                    # f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
-                    # f"Detection: {(detection_time-convert_time)*1000:.1f}ms, "
-                    # f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
-                    # f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
+                    f"Timing Capture: {(capture_time-start_time)*1000:.1f}ms, "
+                    f"Undistort: {(undistort_time-capture_time)*1000:.1f}ms, "
+                    f"Convert: {(convert_time-undistort_time)*1000:.1f}ms, "
+                    f"Detection: {(detection_time-convert_time)*1000:.1f}ms, "
+                    f"Processing: {(processing_time-detection_time)*1000:.1f}ms, "
+                    f"Calculation: {(calculation_time-processing_time)*1000:.1f}ms, "
+                    f"drawText: {(drawtext_time-calculation_time)*1000:.1f}ms, "
                     f"Total: {(time.time()-start_time)*1000:.1f}ms"
                 )
                 
