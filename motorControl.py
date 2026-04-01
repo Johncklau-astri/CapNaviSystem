@@ -156,7 +156,7 @@ def send_data_to_arduino(host='localhost', port=12345, data_dict=None):
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1.0)  # 1-second timeout
+            sock.settimeout(0.01)  # 1-second timeout
             sock.connect((host, port))
             # Convert dict to JSON string and encode
             data_str = json.dumps(data_dict)
@@ -184,36 +184,35 @@ def vertPreMove(dev, motors):
     setUpVertMotorMove(dev, vert1, -0.1, 50, 100, 100)
     launchMoveCommand(dev, motors)
 
-def automated_movement(dev,motors):
+def automated_movement(dev,motors): 
     global worldX, worldY, worldZ # Assume actual_pos tracks motor positions
     global rollAngle, pitchAngle, yawAngle
-    interval = 2    ## in cm
-    x_number = 5    ## in quantity
-    y_number = 4    ## in quantity
-    z_number = 14   ## in quantity
-    pitch_iteration = 3
+    interval = 1    ## in cm
+    x_number = 5   ## in quantity
+    y_number = 8    ## in quantity
+    z_number = 20   ## in quantity
+    pitch_iteration = 1
 
     speed = 65
     acc= 250
     dec = 250
-    print("Magnet should be at middle height of test range")
+    print("Magnet should be at middle height of test range, the also the closest point to capsule")
 
-    small_timeout = 1.3 ##1.3
-    mid_timeout = 0.5   ##0.5
-    big_timeout = 5
+    small_timeout = 1.2 ##1.3
+    mid_timeout = 0.3   ##0.5
 
     for x in range(0,x_number):
-        # Returning pitch to zero
-        if (x != 0):
-            setUpPitchMotorMove(dev, pitch, 30, speed, acc, dec)    
+        # # Returning pitch to zero
+        # if (x != 0):
+        #     setUpPitchMotorMove(dev, pitch, 0, speed, acc, dec)    
         for p in range(0, pitch_iteration):
 
-            ## Adjust pitch to +30deg
-            if(p == 1):
-                setUpPitchMotorMove(dev, pitch, 30, speed, acc, dec)
-            ## Adjust pitch to +30deg
-            if(p == 2):
-                setUpPitchMotorMove(dev, pitch, -60, speed, acc, dec)
+            # ## Adjust pitch to +30deg
+            # if(p == 1):
+            #     setUpPitchMotorMove(dev, pitch, 0, speed, acc, dec)
+            # ## Adjust pitch to +30deg
+            # if(p == 2):
+            #     setUpPitchMotorMove(dev, pitch, 0, speed, acc, dec)
 
             if( p != 0):
                 # if(y_number % 2 == 0):
@@ -1312,18 +1311,18 @@ press q to quit
 
             global rotaryDisplacement, vertDisplacement, horiDisplacement, pitchAngle, rollAngle , yawAngle
             # Predefined travel amounts
-            rotary_travel = 10.0    # degrees (positive/negative)
+            rotary_travel = 45.0    # degrees (positive/negative)
             vert_travel = 5      # cm (positive/negative, for vert1 and vert2)
-            hori_travel = 2      # cm (positive/negative, for hori1 and hori2)
-            pitch_travel = 5.0     # degrees (positive/negative)
+            hori_travel = 3      # cm (positive/negative, for hori1 and hori2)
+            pitch_travel = 20.0     # degrees (positive/negative)
 
-            vert_travel_fine = 0.1  # cm for fine control
+            vert_travel_fine = 0.05  # cm for fine control
             pitch_travel_fine = 0.5  # degrees for fine control
 
             vert_travel_super_fine = 0.1  # cm for super fine control
 
             # Fixed speed, acceleration, deceleration
-            speed = 50  # RPM or steps/s (adjust as needed)
+            speed = 100  # RPM or steps/s (adjust as needed)
             acc = 100   # RPM/s or steps/s²
             dec = 100   # RPM/s or steps/s²
 
@@ -1399,7 +1398,7 @@ press q to quit
                         # Rotary (Option 1)
                         if selected_option == 1 and key in ('h', 'j'):
                             travel = -rotary_travel if key == 'h' else rotary_travel
-                            setUpRotaryMotorMove(dev, rotary, travel, 220, 280, 280) 
+                            setUpRotaryMotorMove(dev, rotary, travel, 350, 280, 280) 
                             launchMoveCommand(dev, motors)
 
                             rotaryDisplacement = rotaryDisplacement + rotary_travel if key == 'h' else rotaryDisplacement - rotary_travel
@@ -1443,7 +1442,7 @@ press q to quit
                         # Pitch (Option 4)
                         elif selected_option == 4 and key in ('h', 'j'):
                             travel = pitch_travel if key == 'h' else -pitch_travel
-                            setUpPitchMotorMove(dev, pitch, travel, speed, acc, dec)
+                            setUpPitchMotorMove(dev, pitch, travel, 30, acc, dec)
                             launchMoveCommand(dev, motors)
                             pitchAngle = pitchAngle + pitch_travel if key == 'h' else pitchAngle - pitch_travel
 
@@ -1452,7 +1451,7 @@ press q to quit
                         # Pitch fine control with "n,m" keys
                         elif selected_option == 4 and key in ('n', 'm'):
                             travel = pitch_travel_fine if key == 'n' else -pitch_travel_fine
-                            setUpPitchMotorMove(dev, pitch, travel, speed, acc, dec)
+                            setUpPitchMotorMove(dev, pitch, travel, 30, acc, dec)
                             launchMoveCommand(dev, motors)
                             pitchAngle = pitchAngle + pitch_travel_fine if key == 'n' else pitchAngle - pitch_travel_fine
 
