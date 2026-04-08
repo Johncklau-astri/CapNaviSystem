@@ -21,7 +21,7 @@ from mpl_toolkits.mplot3d import Axes3D
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
-CSV_FILE = 'twoCamMagField.csv'
+CSV_FILE = 'new_1cm.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
@@ -120,6 +120,311 @@ def log_comparison_result(B_custom, quat_sensor, r_physics, r_ml, true_pos=None)
             
     except Exception as e:
         print(f"❌ Failed to log comparison: {e}")
+# Add this function after load_and_filter_data() and before run_optimization_enhanced()
+
+def split_data_for_staged_optimization(positions, B_measured, quaternions, data_df, fraction=0.33, random_state=42):
+    """
+    Split data into two sets:
+    - optimization_set: fraction of data for multipole optimization
+    - ml_training_set: full dataset for ML training (including optimization set)
+    """
+    n_samples = len(positions)
+    n_opt = int(n_samples * fraction)
+    
+    # Randomly select indices for optimization
+    np.random.seed(random_state)
+    opt_indices = np.random.choice(n_samples, n_opt, replace=False)
+    
+    # Create optimization subset
+    opt_positions = positions[opt_indices]
+    opt_B_measured = B_measured[opt_indices]
+    opt_quaternions = quaternions[opt_indices]
+    opt_data = data_df.iloc[opt_indices].copy() if data_df is not None else None
+    
+    print(f"\n📊 Data Split:")
+    print(f"   Total samples: {n_samples}")
+    print(f"   Optimization set: {n_opt} ({fraction*100:.0f}%)")
+    print(f"   ML training set: {n_samples} (100% of data)")
+    
+    return opt_positions, opt_B_measured, opt_quaternions, opt_data, opt_indices
+
+
+def run_optimization_staged(fraction=0.33):
+    """
+    Run staged optimization: 
+    - Use fraction of data for dipole parameter optimization (faster)
+    - Use ALL data for ML training (more accurate)
+    """
+    print("\n" + "="*60)
+    print("STAGED OPTIMIZATION MODE")
+    print("="*60)
+    print(f"Using {fraction*100:.0f}% of data for dipole optimization")
+    print(f"Using 100% of data for ML training\n")
+    
+    # Load all data
+    positions, B_measured, quaternions, data_df = load_and_filter_data()
+    if positions is None:
+        print("Failed to load data.")
+        return None, None, None, None, None, None, None, None
+    
+    N = len(positions)
+    print(f"Total data points available: {N}")
+    
+    # Split data for optimization (use only fraction)
+    opt_positions, opt_B_measured, opt_quaternions, opt_data, opt_indices = split_data_for_staged_optimization(
+        positions, B_measured, quaternions, data_df, fraction=fraction
+    )
+    
+    N_opt = len(opt_positions)
+    print(f"\n🔧 Running dipole optimization on {N_opt} points ({fraction*100:.0f}% of data)...")
+    
+    # First stage: optimize dipole moment m using subset
+    m0 = np.array([-0.1, 0, 0])
+    
+    # Try to get a better initial guess
+    for i, r in enumerate(opt_positions):
+        x, y, z = r
+        if abs(y) < 0.01 and abs(z) < 0.01:
+            B_local = opt_B_measured[i]
+            R_sensor = quaternion_to_rotation_matrix(opt_quaternions[i])
+            B_global = R_sensor @ B_local
+            B_x = B_global[0] * 1e6
+            m0_x = (B_x * abs(x)**3) / (factor * 2)
+            if -1000 <= m0_x <= 0:
+                m0[0] = m0_x
+                print(f"  Initial guess from on-axis point: m_x = {m0_x:.6f}")
+                break
+    
+    bounds_m = ([-1000, -1000, -1000], [0, 1000, 1000])
+    
+    print("\n📈 Stage 1: Optimizing dipole moment on subset...")
+    start_time = time.time()
+    
+    try:
+        # Use TRF method for robust optimization
+        result = least_squares(
+            residuals_m, m0, 
+            args=(opt_positions, opt_B_measured, opt_quaternions),
+            bounds=bounds_m, 
+            method='trf', 
+            ftol=1e-8, 
+            xtol=1e-8
+        )
+        m_best = result.x
+        optimization_time = time.time() - start_time
+        
+        print(f"  ✅ Dipole optimization completed in {optimization_time:.2f}s")
+        print(f"  Optimized dipole: m = [{m_best[0]:.6f}, {m_best[1]:.6f}, {m_best[2]:.6f}] A·m²")
+        
+    except Exception as e:
+        print(f"  ❌ Dipole optimization failed: {e}")
+        return None, None, None, None, None, None, None, None
+    
+    # Stage 2: Optimize quadratic coefficients with fixed dipole moment (still on subset)
+    print("\n📈 Stage 2: Optimizing quadratic coefficients on subset...")
+    start_time = time.time()
+    
+    abc0 = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]  # [a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z]
+    
+    abc_bounds = [
+        (-10, 10), (-10, 10), (-1, 1),  # x coefficients
+        (-10, 10), (-10, 10), (-1, 1),  # y coefficients  
+        (-10, 10), (-10, 10), (-1, 1)   # z coefficients
+    ]
+    
+    try:
+        result_abc = minimize(
+            objective_abc, abc0, 
+            args=(m_best, opt_positions, opt_B_measured, opt_quaternions, 1e-3),
+            method='Nelder-Mead',
+            bounds=abc_bounds,
+            options={'xatol': 1e-6, 'fatol': 1e-6, 'maxiter': 1000}
+        )
+        
+        a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best = result_abc.x
+        optimization_time = time.time() - start_time
+        
+        print(f"  ✅ Quadratic optimization completed in {optimization_time:.2f}s")
+        print(f"  X transform: {a_x_best:.6f}·x² + {b_x_best:.6f}·x + {c_x_best:.6f}")
+        print(f"  Y transform: {a_y_best:.6f}·y² + {b_y_best:.6f}·y + {c_y_best:.6f}")
+        print(f"  Z transform: {a_z_best:.6f}·z² + {b_z_best:.6f}·z + {c_z_best:.6f}")
+        
+    except Exception as e:
+        print(f"  ❌ Quadratic optimization failed: {e}")
+        # Fall back to linear model
+        a_x_best, b_x_best, c_x_best = 0.0, 1.0, 0.0
+        a_y_best, b_y_best, c_y_best = 0.0, 1.0, 0.0
+        a_z_best, b_z_best, c_z_best = 0.0, 1.0, 0.0
+    
+    # Stage 3: Re-optimize dipole with quadratic coefficients (still on subset)
+    print("\n📈 Stage 3: Final dipole refinement with quadratic coefficients...")
+    start_time = time.time()
+    
+    try:
+        def residuals_m_with_quad(m, positions, B_measured, quaternions, 
+                                   a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z):
+            residuals = []
+            for r, B_meas, quat in zip(positions, B_measured, quaternions):
+                R_sensor = quaternion_to_rotation_matrix(quat)
+                B_pred = dipole_field_enhanced(r, m, R_sensor, 
+                                               a_x, b_x, c_x, a_y, b_y, c_y, a_z, b_z, c_z)
+                residuals.append(B_pred - B_meas)
+            return np.ravel(residuals)
+        
+        result_m_final = least_squares(
+            residuals_m_with_quad, m_best,
+            args=(opt_positions, opt_B_measured, opt_quaternions,
+                  a_x_best, b_x_best, c_x_best,
+                  a_y_best, b_y_best, c_y_best,
+                  a_z_best, b_z_best, c_z_best),
+            bounds=bounds_m, 
+            method='trf', 
+            ftol=1e-8, 
+            xtol=1e-8
+        )
+        m_final = result_m_final.x
+        optimization_time = time.time() - start_time
+        
+        print(f"  ✅ Final refinement completed in {optimization_time:.2f}s")
+        print(f"  Final dipole: m = [{m_final[0]:.6f}, {m_final[1]:.6f}, {m_final[2]:.6f}] A·m²")
+        
+    except Exception as e:
+        print(f"  ❌ Final refinement failed: {e}")
+        m_final = m_best
+    
+    # Compute metrics on subset (to verify optimization)
+    rmse_subset, ang_err_subset, ang_errs_subset, B_pred_subset = compute_metrics_enhanced(
+        m_final, opt_positions, opt_B_measured, opt_quaternions,
+        a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best
+    )
+    
+    print(f"\n📊 Subset Performance (on {N_opt} points):")
+    print(f"  RMSE: {rmse_subset:.2f} µT")
+    print(f"  Angular Error: {ang_err_subset:.2f}°")
+    
+    # Compute metrics on FULL dataset (to see generalization)
+    print(f"\n📊 Validating on FULL dataset ({N} points)...")
+    
+    rmse_full, ang_err_full, ang_errs_full, B_pred_full = compute_metrics_enhanced(
+        m_final, positions, B_measured, quaternions,
+        a_x_best, b_x_best, c_x_best, a_y_best, b_y_best, c_y_best, a_z_best, b_z_best, c_z_best
+    )
+    
+    print(f"  RMSE: {rmse_full:.2f} µT")
+    print(f"  Angular Error: {ang_err_full:.2f}°")
+    
+    if rmse_full < rmse_subset:
+        print(f"\n✨ Model generalizes well! Full dataset RMSE improved.")
+    else:
+        print(f"\n⚠️  Model generalization gap: {rmse_full - rmse_subset:.2f} µT")
+        print(f"   Consider increasing fraction (currently {fraction*100:.0f}%)")
+    
+    # Create dipole parameters dictionary
+    dipole_params = {
+        'm': m_final,
+        'a_x': a_x_best, 'b_x': b_x_best, 'c_x': c_x_best,
+        'a_y': a_y_best, 'b_y': b_y_best, 'c_y': c_y_best,
+        'a_z': a_z_best, 'b_z': b_z_best, 'c_z': c_z_best
+    }
+    
+    # Save parameters
+    params = {
+        'm_x': float(m_final[0]),
+        'm_y': float(m_final[1]),
+        'm_z': float(m_final[2]),
+        'a_x': float(a_x_best), 'b_x': float(b_x_best), 'c_x': float(c_x_best),
+        'a_y': float(a_y_best), 'b_y': float(b_y_best), 'c_y': float(c_y_best),
+        'a_z': float(a_z_best), 'b_z': float(b_z_best), 'c_z': float(c_z_best),
+        'rmse_subset': float(rmse_subset),
+        'rmse_full': float(rmse_full),
+        'angular_error': float(ang_err_full),
+        'optimization_fraction': fraction,
+        'optimization_points': N_opt,
+        'total_points': N
+    }
+    
+    with open('dipole_model_params.json', 'w') as f:
+        json.dump(params, f, indent=4)
+    
+    print(f"\n💾 Parameters saved to dipole_model_params.json")
+    
+    pos_bounds = (
+        [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
+        [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
+    )
+    
+    # NOW train ML models on FULL dataset (all data)
+    print("\n" + "="*60)
+    print("ML TRAINING ON FULL DATASET")
+    print("="*60)
+    print(f"Training ML correction models using ALL {N} data points...")
+    
+    # First, update the CSV with estimates using the optimized model on ALL data
+    print("\n📝 Generating position estimates for all data points...")
+    
+    r_estimated = np.zeros_like(positions)
+    r_initial = np.zeros_like(positions)
+    
+    for i, (r_true, B, quat) in enumerate(zip(positions, B_measured, quaternions)):
+        B_uT = B / muT_to_T
+        r_est, r_init = estimate_position_custom(
+            B_uT, quat, dipole_params['m'], pos_bounds,
+            dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+            dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+            dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z']
+        )
+        r_estimated[i] = r_est
+        r_initial[i] = r_init
+        
+        if (i + 1) % 50 == 0:
+            print(f"  Processed {i+1}/{N} points...")
+    
+    # Update DataFrame with estimates
+    if data_df is not None:
+        data_df['Est_Xm'] = r_estimated[:, 0]
+        data_df['Est_Ym'] = r_estimated[:, 1]
+        data_df['Est_Zm'] = r_estimated[:, 2]
+        data_df['Error_Xm'] = r_estimated[:, 0] - positions[:, 0]
+        data_df['Error_Ym'] = r_estimated[:, 1] - positions[:, 1]
+        data_df['Error_Zm'] = r_estimated[:, 2] - positions[:, 2]
+        
+        # Save updated CSV
+        try:
+            data_df.to_csv(CSV_FILE, index=False, encoding='utf-8')
+            print(f"\n✅ Updated {CSV_FILE} with position estimates")
+        except Exception as e:
+            print(f"Error saving CSV: {e}")
+    
+    # Now train ML models on ALL data
+    print("\n🎯 Training ML correction models on ALL data...")
+    xgb_models = train_correction_model(data_df, save=True)
+    
+    # Apply correction model to update CSV
+    if xgb_models[0] is not None:
+        print("\n📝 Applying ML correction to all data points...")
+        data_df = apply_correction_model(data_df, xgb_models[0], xgb_models[1], xgb_models[2])
+        
+        try:
+            data_df.to_csv(CSV_FILE, index=False, encoding='utf-8')
+            print(f"✅ Updated {CSV_FILE} with ML-corrected positions")
+        except Exception as e:
+            print(f"Error saving corrected CSV: {e}")
+        
+        # Compute final statistics
+        original_errors = np.linalg.norm(r_estimated - positions, axis=1)
+        corrected_errors = np.linalg.norm(data_df[['Corrected_Xm', 'Corrected_Ym', 'Corrected_Zm']].values - positions, axis=1)
+        
+        print("\n📊 Final Position Estimation Statistics:")
+        print(f"  Original mean error: {np.mean(original_errors)*1000:.2f} mm")
+        print(f"  Original std error: {np.std(original_errors)*1000:.2f} mm")
+        print(f"  ML-corrected mean error: {np.mean(corrected_errors)*1000:.2f} mm")
+        print(f"  ML-corrected std error: {np.std(corrected_errors)*1000:.2f} mm")
+        improvement = (np.mean(original_errors) - np.mean(corrected_errors)) / np.mean(original_errors) * 100
+        print(f"  Improvement: {improvement:.1f}%")
+    
+    return dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_full, B_pred_full, "Staged Optimization"
+
+
 
 # --- TCP Server for Position Estimation ---
 def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT, 
@@ -159,9 +464,126 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT,
         if 'server_socket' in locals():
             server_socket.close()
 
+# def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml=True):
+#     """Enhanced client handler with ML comparison"""
+#     try:
+#         while not STOP_EVENT.is_set():
+#             # Receive data length
+#             length_bytes = b''
+#             while len(length_bytes) < 4:
+#                 chunk = client_socket.recv(4 - len(length_bytes))
+#                 if not chunk:
+#                     raise ConnectionError("Client disconnected")
+#                 length_bytes += chunk
+#             length = struct.unpack('>I', length_bytes)[0]
+            
+#             # Receive data
+#             data_bytes = b''
+#             while len(data_bytes) < length:
+#                 chunk = client_socket.recv(length - len(data_bytes))
+#                 if not chunk:
+#                     raise ConnectionError("Client disconnected")
+#                 data_bytes += chunk
+            
+#             # Parse JSON data
+#             data = json.loads(data_bytes.decode('utf-8'))
+#             B_custom = [data['magX'], data['magY'], data['magZ']]
+#             quat_sensor = [data['qw'], data['qx'], data['qy'], data['qz']]
+            
+#             # Validate inputs
+#             if any(abs(m) > max_Bfield for m in B_custom):
+#                 print(f"⚠️ Invalid magnetic field values: {B_custom} µT")
+#                 response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0, 
+#                            'mlX': 0.0, 'mlY': 0.0, 'mlZ': 0.0,
+#                            'error': 'Invalid magnetic field values'}
+#             else:
+#                 quat_norm = np.sqrt(sum(x**2 for x in quat_sensor))
+#                 if not 0.99 <= quat_norm <= 1.01:
+#                     print(f"⚠️ Invalid quaternion norm: {quat_norm:.3f}")
+#                     response = {'estX': 0.0, 'estY': 0.0, 'estZ': 0.0,
+#                                'mlX': 0.0, 'mlY': 0.0, 'mlZ': 0.0,
+#                                'error': 'Invalid quaternion norm'}
+#                 else:
+#                     quat_sensor = [x / quat_norm for x in quat_sensor]
+                    
+#                     # Estimate position with and without ML
+#                     start_time = time.time()
+                    
+#                     # Physics-only estimate
+#                     r_physics, r_init = estimate_position_custom(
+#                         B_custom, quat_sensor, dipole_params['m'], pos_bounds,
+#                         dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+#                         dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+#                         dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
+#                         xgb_models=None  # Force physics-only
+#                     )
+                    
+#                     # ML-corrected estimate (if enabled and models available)
+#                     r_ml = r_physics.copy()
+#                     if enable_ml and xgb_models[0] is not None:
+#                         r_ml, _ = estimate_position_custom(
+#                             B_custom, quat_sensor, dipole_params['m'], pos_bounds,
+#                             dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
+#                             dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
+#                             dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
+#                             xgb_models
+#                         )
+                    
+#                     estimation_time = time.time() - start_time
+                    
+#                     # Log comparison
+#                     log_comparison_result(B_custom, quat_sensor, r_physics, r_ml)
+                    
+#                     print(f"\n📡 Client {addr}:")
+#                     print(f"   Input: B = {B_custom} µT")
+#                     print(f"   Physics: x={r_physics[0]:.6f}, y={r_physics[1]:.6f}, z={r_physics[2]:.6f} m")
+#                     if enable_ml and xgb_models[0] is not None:
+#                         print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")
+#                         diff = r_ml - r_physics
+#                         print(f"   Δ: {diff[0]*1000:.2f}, {diff[1]*1000:.2f}, {diff[2]*1000:.2f} mm")
+                    
+#                     # Send both estimates back
+#                     response = {
+#                         'estX': float(r_physics[0]),  # Physics-only for backward compatibility
+#                         'estY': float(r_physics[1]),
+#                         'estZ': float(r_physics[2]),
+#                         # 'mlX': float(r_ml[0]),        # ML-corrected
+#                         # 'mlY': float(r_ml[1]),
+#                         # 'mlZ': float(r_ml[2]),
+#                         # 'ml_enabled': bool(enable_ml and xgb_models[0] is not None)
+#                     }
+            
+#             # Send response
+#             response_str = json.dumps(response)
+#             response_bytes = response_str.encode('utf-8')
+#             client_socket.sendall(struct.pack('>I', len(response_bytes)))
+#             client_socket.sendall(response_bytes)
+            
+#     except (ConnectionError, socket.error, json.JSONDecodeError) as e:
+#         print(f"Client {addr} error: {e}")
+#     except Exception as e:
+#         print(f"Unexpected error handling client {addr}: {e}")
+#     finally:
+#         client_socket.close()
+
 def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml=True):
-    """Enhanced client handler with ML comparison"""
+    """Enhanced client handler with ML comparison and both quadratic/cubic comparison"""
     try:
+        # Try to load quadratic model for comparison
+        quad_params = None
+        try:
+            with open('dipole_model_params.json', 'r') as f:
+                quad_data = json.load(f)
+                if all(k in quad_data for k in ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'c_x', 'a_y', 'b_y', 'c_y', 'a_z', 'b_z', 'c_z']):
+                    quad_params = {
+                        'm': np.array([quad_data['m_x'], quad_data['m_y'], quad_data['m_z']]),
+                        'a_x': quad_data['a_x'], 'b_x': quad_data['b_x'], 'c_x': quad_data['c_x'],
+                        'a_y': quad_data['a_y'], 'b_y': quad_data['b_y'], 'c_y': quad_data['c_y'],
+                        'a_z': quad_data['a_z'], 'b_z': quad_data['b_z'], 'c_z': quad_data['c_z']
+                    }
+        except:
+            pass
+        
         while not STOP_EVENT.is_set():
             # Receive data length
             length_bytes = b''
@@ -201,51 +623,53 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                 else:
                     quat_sensor = [x / quat_norm for x in quat_sensor]
                     
-                    # Estimate position with and without ML
                     start_time = time.time()
                     
-                    # Physics-only estimate
-                    r_physics, r_init = estimate_position_custom(
-                        B_custom, quat_sensor, dipole_params['m'], pos_bounds,
-                        dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
-                        dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
-                        dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
-                        xgb_models=None  # Force physics-only
+                    # Cubic estimate (current model)
+                    r_cubic, r_init = estimate_position_unified(
+                        B_custom, quat_sensor, dipole_params, pos_bounds,
+                        xgb_models=None
                     )
                     
-                    # ML-corrected estimate (if enabled and models available)
-                    r_ml = r_physics.copy()
+                    # Quadratic estimate (if available)
+                    r_quad = None
+                    if quad_params is not None:
+                        r_quad, _ = estimate_position_unified(
+                            B_custom, quat_sensor, quad_params, pos_bounds,
+                            xgb_models=None
+                        )
+                    
+                    # ML-corrected estimate (if enabled)
+                    r_ml = r_cubic.copy()
                     if enable_ml and xgb_models[0] is not None:
-                        r_ml, _ = estimate_position_custom(
-                            B_custom, quat_sensor, dipole_params['m'], pos_bounds,
-                            dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
-                            dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
-                            dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
+                        r_ml, _ = estimate_position_unified(
+                            B_custom, quat_sensor, dipole_params, pos_bounds,
                             xgb_models
                         )
                     
                     estimation_time = time.time() - start_time
                     
                     # Log comparison
-                    log_comparison_result(B_custom, quat_sensor, r_physics, r_ml)
+                    log_comparison_result(B_custom, quat_sensor, r_cubic, r_ml)
                     
+                    # Print results
                     print(f"\n📡 Client {addr}:")
-                    print(f"   Input: B = {B_custom} µT")
-                    print(f"   Physics: x={r_physics[0]:.6f}, y={r_physics[1]:.6f}, z={r_physics[2]:.6f} m")
+                    print(f"   Model: CUBIC (primary)")
+                    print(f"   Input: B = [{B_custom[0]:.3f}, {B_custom[1]:.3f}, {B_custom[2]:.3f}] µT")
+                    print(f"   cubic Physics: x={r_cubic[0]:.6f}, y={r_cubic[1]:.6f}, z={r_cubic[2]:.6f} m")
+                    
+                    if r_quad is not None:
+                        print(f"   quadratic physics: x={r_quad[0]:.6f}, y={r_quad[1]:.6f}, z={r_quad[2]:.6f} m")
+                    
                     if enable_ml and xgb_models[0] is not None:
                         print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")
-                        diff = r_ml - r_physics
+                        diff = r_ml - r_cubic
                         print(f"   Δ: {diff[0]*1000:.2f}, {diff[1]*1000:.2f}, {diff[2]*1000:.2f} mm")
                     
-                    # Send both estimates back
                     response = {
-                        'estX': float(r_ml[0]),  # Physics-only for backward compatibility
-                        'estY': float(r_ml[1]),
-                        'estZ': float(r_ml[2]),
-                        # 'mlX': float(r_ml[0]),        # ML-corrected
-                        # 'mlY': float(r_ml[1]),
-                        # 'mlZ': float(r_ml[2]),
-                        # 'ml_enabled': bool(enable_ml and xgb_models[0] is not None)
+                        'estX': float(r_cubic[0]),
+                        'estY': float(r_cubic[1]),
+                        'estZ': float(r_cubic[2]),
                     }
             
             # Send response
@@ -260,36 +684,66 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
         print(f"Unexpected error handling client {addr}: {e}")
     finally:
         client_socket.close()
-
-# --- Helper Functions ---
 def load_dipole_params():
-    param_file = 'dipole_model_params.json'
-    if not os.path.exists(param_file):
+    """Load dipole parameters, supporting both quadratic and cubic models"""
+    # Try cubic parameters first
+    cubic_param_file = 'dipole_model_params_cubic.json'
+    quad_param_file = 'dipole_model_params.json'
+    
+    # Check for cubic parameters
+    if os.path.exists(cubic_param_file):
+        try:
+            with open(cubic_param_file, 'r') as f:
+                params = json.load(f)
+            
+            # Check if it has cubic parameters
+            cubic_keys = ['a2_x', 'b2_x', 'c2_x', 'a2_y', 'b2_y', 'c2_y', 'a2_z', 'b2_z', 'c2_z',
+                         'a3_x', 'b3_x', 'c3_x', 'd3_x', 'a3_y', 'b3_y', 'c3_y', 'd3_y', 
+                         'a3_z', 'b3_z', 'c3_z', 'd3_z']
+            
+            if all(key in params for key in cubic_keys):
+                m = np.array(params['m']) if isinstance(params['m'], list) else np.array([params['m_x'], params['m_y'], params['m_z']])
+                print(f"✅ Loaded CUBIC model from {cubic_param_file}")
+                return {
+                    'model_type': 'cubic',
+                    'm': m,
+                    'a2_x': params['a2_x'], 'b2_x': params['b2_x'], 'c2_x': params['c2_x'],
+                    'a2_y': params['a2_y'], 'b2_y': params['b2_y'], 'c2_y': params['c2_y'],
+                    'a2_z': params['a2_z'], 'b2_z': params['b2_z'], 'c2_z': params['c2_z'],
+                    'a3_x': params['a3_x'], 'b3_x': params['b3_x'], 'c3_x': params['c3_x'], 'd3_x': params['d3_x'],
+                    'a3_y': params['a3_y'], 'b3_y': params['b3_y'], 'c3_y': params['c3_y'], 'd3_y': params['d3_y'],
+                    'a3_z': params['a3_z'], 'b3_z': params['b3_z'], 'c3_z': params['c3_z'], 'd3_z': params['d3_z']
+                }
+        except Exception as e:
+            print(f"Error loading cubic params: {e}")
+    
+    # Fall back to quadratic parameters
+    if not os.path.exists(quad_param_file):
         return None
+    
     try:
-        with open(param_file, 'r') as f:
+        with open(quad_param_file, 'r') as f:
             params = json.load(f)
+        
         # Check for enhanced parameters first, fall back to linear
         enhanced_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'c_x', 'a_y', 'b_y', 'c_y', 'a_z', 'b_z', 'c_z']
         linear_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'a_y', 'b_y', 'a_z', 'b_z']
         
         if all(key in params for key in enhanced_keys):
-            # Enhanced parameters with quadratic terms
             required_keys = enhanced_keys
             is_enhanced = True
         elif all(key in params for key in linear_keys):
-            # Linear parameters, set quadratic terms to zero
             required_keys = linear_keys
             is_enhanced = False
         else:
             missing_enhanced = [key for key in enhanced_keys if key not in params]
             missing_linear = [key for key in linear_keys if key not in params]
-            print(f"Missing keys in {param_file}: Enhanced: {missing_enhanced}, Linear: {missing_linear}")
+            print(f"Missing keys in {quad_param_file}: Enhanced: {missing_enhanced}, Linear: {missing_linear}")
             return None
         
         missing_keys = [key for key in required_keys if key not in params]
         if missing_keys:
-            print(f"Missing keys in {param_file}: {missing_keys}")
+            print(f"Missing keys in {quad_param_file}: {missing_keys}")
             return None
         
         m = np.array([params['m_x'], params['m_y'], params['m_z']])
@@ -298,28 +752,170 @@ def load_dipole_params():
             return None
         
         if is_enhanced:
+            print(f"✅ Loaded QUADRATIC model from {quad_param_file}")
             return {
+                'model_type': 'quadratic',
                 'm': m,
                 'a_x': params['a_x'], 'b_x': params['b_x'], 'c_x': params['c_x'],
                 'a_y': params['a_y'], 'b_y': params['b_y'], 'c_y': params['c_y'],
                 'a_z': params['a_z'], 'b_z': params['b_z'], 'c_z': params['c_z']
             }
         else:
-            # Linear parameters - set quadratic terms to zero
+            print(f"✅ Loaded LINEAR model from {quad_param_file}")
             return {
+                'model_type': 'linear',
                 'm': m,
-                'a_x': 0.0, 'b_x': params['a_x'], 'c_x': params['b_x'],  # Map a_x->b_x, b_x->c_x
+                'a_x': 0.0, 'b_x': params['a_x'], 'c_x': params['b_x'],
                 'a_y': 0.0, 'b_y': params['a_y'], 'c_y': params['b_y'],
                 'a_z': 0.0, 'b_z': params['a_z'], 'c_z': params['b_z']
             }
             
     except json.JSONDecodeError as e:
-        print(f"Failed to decode {param_file}: {e}")
+        print(f"Failed to decode {quad_param_file}: {e}")
         return None
     except Exception as e:
-        print(f"Unexpected error loading {param_file}: {e}")
+        print(f"Unexpected error loading {quad_param_file}: {e}")
         return None
+# # --- Helper Functions ---
+# def load_dipole_params():
+#     param_file = 'dipole_model_params.json'
+#     if not os.path.exists(param_file):
+#         return None
+#     try:
+#         with open(param_file, 'r') as f:
+#             params = json.load(f)
+#         # Check for enhanced parameters first, fall back to linear
+#         enhanced_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'c_x', 'a_y', 'b_y', 'c_y', 'a_z', 'b_z', 'c_z']
+#         linear_keys = ['m_x', 'm_y', 'm_z', 'a_x', 'b_x', 'a_y', 'b_y', 'a_z', 'b_z']
+        
+#         if all(key in params for key in enhanced_keys):
+#             # Enhanced parameters with quadratic terms
+#             required_keys = enhanced_keys
+#             is_enhanced = True
+#         elif all(key in params for key in linear_keys):
+#             # Linear parameters, set quadratic terms to zero
+#             required_keys = linear_keys
+#             is_enhanced = False
+#         else:
+#             missing_enhanced = [key for key in enhanced_keys if key not in params]
+#             missing_linear = [key for key in linear_keys if key not in params]
+#             print(f"Missing keys in {param_file}: Enhanced: {missing_enhanced}, Linear: {missing_linear}")
+#             return None
+        
+#         missing_keys = [key for key in required_keys if key not in params]
+#         if missing_keys:
+#             print(f"Missing keys in {param_file}: {missing_keys}")
+#             return None
+        
+#         m = np.array([params['m_x'], params['m_y'], params['m_z']])
+#         if np.linalg.norm(m) > 1000:
+#             print(f"Dipole moment norm ({np.linalg.norm(m):.3f} A·m²) is too large.")
+#             return None
+        
+#         if is_enhanced:
+#             return {
+#                 'm': m,
+#                 'a_x': params['a_x'], 'b_x': params['b_x'], 'c_x': params['c_x'],
+#                 'a_y': params['a_y'], 'b_y': params['b_y'], 'c_y': params['c_y'],
+#                 'a_z': params['a_z'], 'b_z': params['b_z'], 'c_z': params['c_z']
+#             }
+#         else:
+#             # Linear parameters - set quadratic terms to zero
+#             return {
+#                 'm': m,
+#                 'a_x': 0.0, 'b_x': params['a_x'], 'c_x': params['b_x'],  # Map a_x->b_x, b_x->c_x
+#                 'a_y': 0.0, 'b_y': params['a_y'], 'c_y': params['b_y'],
+#                 'a_z': 0.0, 'b_z': params['a_z'], 'c_z': params['b_z']
+#             }
+            
+#     except json.JSONDecodeError as e:
+#         print(f"Failed to decode {param_file}: {e}")
+#         return None
+#     except Exception as e:
+#         print(f"Unexpected error loading {param_file}: {e}")
+#         return None
+def estimate_position_unified(B_custom, quat_sensor, dipole_params, pos_bounds, xgb_models=None):
+    """
+    Unified position estimation that works with both quadratic and cubic models
+    """
+    if any(np.isnan(B_custom)) or any(np.isnan(quat_sensor)) or any(abs(b) > max_Bfield for b in B_custom):
+        print(f"Invalid input: B_custom={B_custom}, quat_sensor={quat_sensor}")
+        return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
     
+    B_custom_T = np.array(B_custom) * muT_to_T
+    R_sensor = quaternion_to_rotation_matrix(quat_sensor)
+    r_init = initial_position_guess(B_custom_T, dipole_params['m'], R_sensor, pos_bounds)
+    
+    try:
+        # Choose estimation method based on model type
+        if dipole_params.get('model_type') == 'cubic':
+            # Use cubic model
+            result = least_squares(
+                residuals_position_cubic_wrapper, r_init,
+                args=(B_custom_T, dipole_params['m'], R_sensor, dipole_params),
+                bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+            )
+        else:
+            # Use quadratic model
+            result = least_squares(
+                residuals_position_enhanced, r_init,
+                args=(B_custom_T, dipole_params['m'], R_sensor, 
+                      dipole_params.get('a_x', 0.0), dipole_params.get('b_x', 1.0), dipole_params.get('c_x', 0.0),
+                      dipole_params.get('a_y', 0.0), dipole_params.get('b_y', 1.0), dipole_params.get('c_y', 0.0),
+                      dipole_params.get('a_z', 0.0), dipole_params.get('b_z', 1.0), dipole_params.get('c_z', 0.0)),
+                bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+            )
+        
+        if not result.success or np.any(np.isnan(result.x)):
+            print(f"Optimization failed for B_custom={B_custom}")
+            return r_init, r_init
+        
+        r_est = result.x
+        
+        # Apply ML correction if models are provided
+        if xgb_models is not None and all(model is not None for model in xgb_models):
+            xgb_x, xgb_y, xgb_z = xgb_models
+            
+            # Prepare features for correction model
+            features = np.array([[B_custom[0], B_custom[1], B_custom[2],
+                                 quat_sensor[0], quat_sensor[1], quat_sensor[2], quat_sensor[3],
+                                 r_est[0], r_est[1], r_est[2]]])
+            
+            if np.any(np.isnan(features)):
+                print(f"NaN in features: {features}")
+                return r_est, r_init
+            
+            # Predict errors
+            error_x_pred = xgb_x.predict(features)[0]
+            error_y_pred = xgb_y.predict(features)[0]
+            error_z_pred = xgb_z.predict(features)[0]
+            
+            # Correct position
+            r_ml = np.array([r_est[0] - error_x_pred, 
+                            r_est[1] - error_y_pred, 
+                            r_est[2] - error_z_pred])
+            
+            return r_ml, r_init
+        
+        return r_est, r_init
+        
+    except Exception as e:
+        print(f"Error estimating position: {str(e)}")
+        return r_init, r_init
+
+def residuals_position_cubic_wrapper(r, B_measured, m, R_sensor, dipole_params):
+    """Wrapper for cubic position residuals"""
+    B_pred = dipole_field_enhanced_cubic(
+        r, m, R_sensor,
+        dipole_params['a2_x'], dipole_params['b2_x'], dipole_params['c2_x'],
+        dipole_params['a2_y'], dipole_params['b2_y'], dipole_params['c2_y'],
+        dipole_params['a2_z'], dipole_params['b2_z'], dipole_params['c2_z'],
+        dipole_params['a3_x'], dipole_params['b3_x'], dipole_params['c3_x'], dipole_params['d3_x'],
+        dipole_params['a3_y'], dipole_params['b3_y'], dipole_params['c3_y'], dipole_params['d3_y'],
+        dipole_params['a3_z'], dipole_params['b3_z'], dipole_params['c3_z'], dipole_params['d3_z']
+    )
+    return B_pred - B_measured
+
 def diagnose_pitch_misalignment(data_df):
     """
     Diagnostic focusing on pitch variation (since you have good pitch data)
@@ -585,6 +1181,475 @@ def dipole_field_enhanced(r, m, R_sensor=None, a_x=0.0, b_x=1.0, c_x=0.0, a_y=0.
     
     B_local = R_sensor.T @ B_global
     return B_local
+def dipole_field_enhanced_cubic(r, m, R_sensor=None, 
+                                 # Quadratic coefficients (power 2)
+                                 a2_x=0.0, b2_x=1.0, c2_x=0.0,
+                                 a2_y=0.0, b2_y=1.0, c2_y=0.0,
+                                 a2_z=0.0, b2_z=1.0, c2_z=0.0,
+                                 # Cubic coefficients (power 3)
+                                 a3_x=0.0, b3_x=0.0, c3_x=0.0, d3_x=0.0,
+                                 a3_y=0.0, b3_y=0.0, c3_y=0.0, d3_y=0.0,
+                                 a3_z=0.0, b3_z=0.0, c3_z=0.0, d3_z=0.0):
+    """
+    Enhanced magnetic field model with quadratic AND cubic position corrections
+    r: position vector [x, y, z] in meters
+    m: dipole moment vector [mx, my, mz] in A·m²
+    
+    Quadratic: p = a2 * x^2 + b2 * x + c2
+    Cubic: p = a3 * x^3 + b3 * x^2 + c3 * x + d3
+    """
+    x, y, z = r
+    
+    # Apply cubic corrections to position (can use quadratic, cubic, or both)
+    p_x = (a3_x * x**3 + b3_x * x**2 + c3_x * x + d3_x) + (a2_x * x**2 + b2_x * x + c2_x)
+    p_y = (a3_y * y**3 + b3_y * y**2 + c3_y * y + d3_y) + (a2_y * y**2 + b2_y * y + c2_y)
+    p_z = (a3_z * z**3 + b3_z * z**2 + c3_z * z + d3_z) + (a2_z * z**2 + b2_z * z + c2_z)
+    
+    m_x, m_y, m_z = m
+    r2 = p_x**2 + p_y**2 + p_z**2
+    
+    if r2 < 1e-12:
+        return np.zeros(3)
+    
+    r_mag = np.sqrt(r2)
+    r5 = r2**2.5
+    
+    # Dipole field
+    r_dot_m = p_x * m_x + p_y * m_y + p_z * m_z
+    
+    B_x = factor * (3 * p_x * r_dot_m / r5 - m_x / (r2 * r_mag))
+    B_y = factor * (3 * p_y * r_dot_m / r5 - m_y / (r2 * r_mag))
+    B_z = factor * (3 * p_z * r_dot_m / r5 - m_z / (r2 * r_mag))
+    
+    B_global = np.array([B_x, B_y, B_z])
+    B_global *= muT_to_T
+    
+    if R_sensor is None:
+        R_sensor = np.eye(3)
+    
+    B_local = R_sensor.T @ B_global
+    return B_local
+def residuals_m_with_cubic(params, positions, B_measured, quaternions,
+                          a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                          a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z):
+    """Residuals for dipole moment optimization with cubic terms"""
+    m = params
+    residuals = []
+    for r, B_meas, quat in zip(positions, B_measured, quaternions):
+        R_sensor = quaternion_to_rotation_matrix(quat)
+        B_pred = dipole_field_enhanced_cubic(
+            r, m, R_sensor,
+            a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+            a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+        )
+        residuals.append(B_pred - B_meas)
+    return np.ravel(residuals)
+
+def objective_cubic(params, m_fixed, positions, B_measured, quaternions, lambda_reg=1e-3):
+    """Objective function for cubic coefficients optimization with regularization"""
+    # params order: 12 quadratic + 12 cubic = 24 parameters
+    # Quadratic: a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z
+    # Cubic: a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+    a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z, \
+    a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z = params
+    
+    res = []
+    for r, B_meas, quat in zip(positions, B_measured, quaternions):
+        R_sensor = quaternion_to_rotation_matrix(quat)
+        B_pred = dipole_field_enhanced_cubic(
+            r, m_fixed, R_sensor,
+            a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+            a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+        )
+        res.append(B_pred - B_meas)
+    
+    res_array = np.ravel(res)
+    
+    # Regularization to prefer simpler models (closer to identity)
+    reg = lambda_reg * (
+        # Quadratic regularization (prefer linear)
+        (a2_x - 0.0)**2 + (b2_x - 1.0)**2 + (c2_x - 0.0)**2 +
+        (a2_y - 0.0)**2 + (b2_y - 1.0)**2 + (c2_y - 0.0)**2 +
+        (a2_z - 0.0)**2 + (b2_z - 1.0)**2 + (c2_z - 0.0)**2 +
+        # Cubic regularization (prefer zero)
+        (a3_x - 0.0)**2 + (b3_x - 0.0)**2 + (c3_x - 1.0)**2 + (d3_x - 0.0)**2 +
+        (a3_y - 0.0)**2 + (b3_y - 0.0)**2 + (c3_y - 1.0)**2 + (d3_y - 0.0)**2 +
+        (a3_z - 0.0)**2 + (b3_z - 0.0)**2 + (c3_z - 1.0)**2 + (d3_z - 0.0)**2
+    )
+    
+    return np.sum(res_array**2) + reg
+def run_optimization_with_cubic():
+    """Run optimization with quadratic AND cubic correction terms"""
+    positions, B_measured, quaternions, data_df = load_and_filter_data()
+    if positions is None:
+        print("Failed to load data for optimization.")
+        return None, None, None, None, None, None, None, None
+
+    N = len(positions)
+    if N < 10:
+        print(f"Too few measurements ({N}). At least 10 are recommended for cubic model.")
+        return None, None, None, None, None, None, None, None
+
+    print(f"\n{'='*60}")
+    print("OPTIMIZATION WITH CUBIC CORRECTIONS")
+    print(f"{'='*60}")
+    print(f"Data points: {N}")
+
+    # Stage 1: Optimize dipole moment with simple linear model
+    m0 = np.array([-0.1, 0, 0])
+    for i, r in enumerate(positions):
+        x, y, z = r
+        if abs(y) < 0.01 and abs(z) < 0.01:
+            B_local = B_measured[i]
+            R_sensor = quaternion_to_rotation_matrix(quaternions[i])
+            B_global = R_sensor @ B_local
+            B_x = B_global[0] * 1e6
+            m0_x = (B_x * abs(x)**3) / (factor * 2)
+            if -1000 <= m0_x <= 0:
+                m0[0] = m0_x
+                print(f"  Initial guess from on-axis point: m_x = {m0_x:.6f}")
+                break
+
+    bounds_m = ([-1000, -1000, -1000], [0, 1000, 1000])
+    
+    print("\n📈 Stage 1: Optimizing dipole moment (linear model)...")
+    start_time = time.time()
+    
+    try:
+        result = least_squares(
+            residuals_m, m0, 
+            args=(positions, B_measured, quaternions),
+            bounds=bounds_m, 
+            method='trf', 
+            ftol=1e-8, 
+            xtol=1e-8
+        )
+        m_best = result.x
+        print(f"  ✅ Completed in {time.time() - start_time:.2f}s")
+        print(f"  Dipole: m = [{m_best[0]:.6f}, {m_best[1]:.6f}, {m_best[2]:.6f}] A·m²")
+        
+    except Exception as e:
+        print(f"  ❌ Dipole optimization failed: {e}")
+        return None, None, None, None, None, None, None, None
+
+    # Stage 2: Optimize quadratic + cubic coefficients
+    print("\n📈 Stage 2: Optimizing quadratic + cubic coefficients...")
+    start_time = time.time()
+    
+    # Initial parameters: quadratic (identity) + cubic (identity)
+    # Order: 9 quadratic + 12 cubic = 21 parameters
+    params0 = np.array([
+        # Quadratic (a2, b2, c2) - 9 parameters
+        0.0, 1.0, 0.0,   # X
+        0.0, 1.0, 0.0,   # Y
+        0.0, 1.0, 0.0,   # Z
+        # Cubic (a3, b3, c3, d3) - 12 parameters
+        0.0, 0.0, 1.0, 0.0,  # X: a3*x^3 + b3*x^2 + c3*x + d3
+        0.0, 0.0, 1.0, 0.0,  # Y
+        0.0, 0.0, 1.0, 0.0   # Z
+    ])
+    
+    # Define bounds for coefficients - MUST match length of params0 (21 parameters)
+    bounds_cubic = []
+    # Quadratic bounds (a2, b2, c2) - 3 per axis * 3 axes = 9 bounds
+    for _ in range(3):  # X, Y, Z axes
+        bounds_cubic.append((-10, 10))   # a2
+        bounds_cubic.append((-10, 10))   # b2
+        bounds_cubic.append((-1, 1))     # c2
+    # Cubic bounds (a3, b3, c3, d3) - 4 per axis * 3 axes = 12 bounds
+    for _ in range(3):  # X, Y, Z axes
+        bounds_cubic.append((-5, 5))     # a3
+        bounds_cubic.append((-5, 5))     # b3
+        bounds_cubic.append((-2, 2))     # c3
+        bounds_cubic.append((-0.5, 0.5)) # d3
+    
+    # Verify bounds length
+    print(f"  Parameters: {len(params0)}")
+    print(f"  Bounds: {len(bounds_cubic)}")
+    
+    try:
+        result_cubic = minimize(
+            objective_cubic, params0,
+            args=(m_best, positions, B_measured, quaternions, 1e-4),
+            method='L-BFGS-B',  # Changed from Nelder-Mead to L-BFGS-B which handles bounds better
+            bounds=bounds_cubic,
+            options={'ftol': 1e-6, 'gtol': 1e-6, 'maxiter': 1000}
+        )
+        
+        if not result_cubic.success:
+            print(f"  ⚠️ Optimization warning: {result_cubic.message}")
+        
+        # Extract parameters
+        params_opt = result_cubic.x
+        
+        # Quadratic parameters
+        a2_x, b2_x, c2_x = params_opt[0], params_opt[1], params_opt[2]
+        a2_y, b2_y, c2_y = params_opt[3], params_opt[4], params_opt[5]
+        a2_z, b2_z, c2_z = params_opt[6], params_opt[7], params_opt[8]
+        
+        # Cubic parameters
+        a3_x, b3_x, c3_x, d3_x = params_opt[9], params_opt[10], params_opt[11], params_opt[12]
+        a3_y, b3_y, c3_y, d3_y = params_opt[13], params_opt[14], params_opt[15], params_opt[16]
+        a3_z, b3_z, c3_z, d3_z = params_opt[17], params_opt[18], params_opt[19], params_opt[20]
+        
+        print(f"  ✅ Completed in {time.time() - start_time:.2f}s")
+        print(f"\n  Quadratic Corrections:")
+        print(f"    X: {a2_x:.6f}·x² + {b2_x:.6f}·x + {c2_x:.6f}")
+        print(f"    Y: {a2_y:.6f}·y² + {b2_y:.6f}·y + {c2_y:.6f}")
+        print(f"    Z: {a2_z:.6f}·z² + {b2_z:.6f}·z + {c2_z:.6f}")
+        print(f"\n  Cubic Corrections:")
+        print(f"    X: {a3_x:.6f}·x³ + {b3_x:.6f}·x² + {c3_x:.6f}·x + {d3_x:.6f}")
+        print(f"    Y: {a3_y:.6f}·y³ + {b3_y:.6f}·y² + {c3_y:.6f}·y + {d3_y:.6f}")
+        print(f"    Z: {a3_z:.6f}·z³ + {b3_z:.6f}·z² + {c3_z:.6f}·z + {d3_z:.6f}")
+        
+    except Exception as e:
+        print(f"  ❌ Cubic optimization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fall back to quadratic-only model
+        a2_x, b2_x, c2_x = 0.0, 1.0, 0.0
+        a2_y, b2_y, c2_y = 0.0, 1.0, 0.0
+        a2_z, b2_z, c2_z = 0.0, 1.0, 0.0
+        a3_x, b3_x, c3_x, d3_x = 0.0, 0.0, 1.0, 0.0
+        a3_y, b3_y, c3_y, d3_y = 0.0, 0.0, 1.0, 0.0
+        a3_z, b3_z, c3_z, d3_z = 0.0, 0.0, 1.0, 0.0
+
+    # Stage 3: Re-optimize dipole with cubic coefficients
+    print("\n📈 Stage 3: Final dipole refinement with cubic coefficients...")
+    start_time = time.time()
+    
+    try:
+        def residuals_m_final(m, positions, B_measured, quaternions):
+            residuals = []
+            for r, B_meas, quat in zip(positions, B_measured, quaternions):
+                R_sensor = quaternion_to_rotation_matrix(quat)
+                B_pred = dipole_field_enhanced_cubic(
+                    r, m, R_sensor,
+                    a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                    a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+                )
+                residuals.append(B_pred - B_meas)
+            return np.ravel(residuals)
+        
+        result_m_final = least_squares(
+            residuals_m_final, m_best,
+            args=(positions, B_measured, quaternions),
+            bounds=bounds_m,
+            method='trf',
+            ftol=1e-8,
+            xtol=1e-8
+        )
+        m_final = result_m_final.x
+        print(f"  ✅ Completed in {time.time() - start_time:.2f}s")
+        print(f"  Final dipole: m = [{m_final[0]:.6f}, {m_final[1]:.6f}, {m_final[2]:.6f}] A·m²")
+        
+    except Exception as e:
+        print(f"  ❌ Final refinement failed: {e}")
+        m_final = m_best
+
+    # Compute metrics for comparison
+    print("\n📊 Computing performance metrics...")
+    
+    # Quadratic-only model metrics (using only quadratic terms, zero cubic)
+    rmse_quad, ang_err_quad, _, _ = compute_metrics_enhanced(
+        m_final, positions, B_measured, quaternions,
+        a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z
+    )
+    
+    # Cubic model metrics
+    rmse_cubic, ang_err_cubic, ang_errs_cubic, B_pred_cubic = compute_metrics_cubic(
+        m_final, positions, B_measured, quaternions,
+        a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+        a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+    )
+    
+    print(f"\n{'='*60}")
+    print("MODEL COMPARISON")
+    print(f"{'='*60}")
+    print(f"Quadratic Model:  RMSE = {rmse_quad:.2f} µT, Angular Error = {ang_err_quad:.2f}°")
+    print(f"Cubic Model:      RMSE = {rmse_cubic:.2f} µT, Angular Error = {ang_err_cubic:.2f}°")
+    
+    improvement_rmse = (rmse_quad - rmse_cubic) / rmse_quad * 100
+    improvement_ang = (ang_err_quad - ang_err_cubic) / ang_err_quad * 100 if ang_err_quad > 0 else 0
+    
+    print(f"\nImprovement: RMSE: {improvement_rmse:+.1f}%, Angular: {improvement_ang:+.1f}%")
+    
+    if rmse_cubic < rmse_quad:
+        print(f"\n✅ Cubic model performs better!")
+    else:
+        print(f"\n⚠️  Quadratic model performs better. Cubic terms may be overfitting.")
+    
+    # Save parameters - FIXED: convert numpy arrays to lists for JSON serialization
+    dipole_params = {
+        'm': m_final.tolist() if hasattr(m_final, 'tolist') else list(m_final),  # Convert to list
+        'a2_x': float(a2_x), 'b2_x': float(b2_x), 'c2_x': float(c2_x),
+        'a2_y': float(a2_y), 'b2_y': float(b2_y), 'c2_y': float(c2_y),
+        'a2_z': float(a2_z), 'b2_z': float(b2_z), 'c2_z': float(c2_z),
+        'a3_x': float(a3_x), 'b3_x': float(b3_x), 'c3_x': float(c3_x), 'd3_x': float(d3_x),
+        'a3_y': float(a3_y), 'b3_y': float(b3_y), 'c3_y': float(c3_y), 'd3_y': float(d3_y),
+        'a3_z': float(a3_z), 'b3_z': float(b3_z), 'c3_z': float(c3_z), 'd3_z': float(d3_z),
+        'rmse_quadratic': float(rmse_quad),
+        'rmse_cubic': float(rmse_cubic),
+        'angular_error_quadratic': float(ang_err_quad),
+        'angular_error_cubic': float(ang_err_cubic),
+        'improvement_rmse_percent': float(improvement_rmse),
+        'improvement_angular_percent': float(improvement_ang)
+    }
+    
+    with open('dipole_model_params_cubic.json', 'w') as f:
+        json.dump(dipole_params, f, indent=4)
+    
+    print(f"\n💾 Parameters saved to dipole_model_params_cubic.json")
+    
+    pos_bounds = (
+        [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
+        [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
+    )
+    
+    # Return also the cubic coefficients for potential use
+    return dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_cubic, B_pred_cubic, "Cubic Model"
+
+def compute_metrics_cubic(m, positions, B_measured, quaternions,
+                         a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                         a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z):
+    """Compute metrics using cubic dipole field model"""
+    B_pred = np.array([
+        dipole_field_enhanced_cubic(
+            r, m, quaternion_to_rotation_matrix(quat),
+            a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+            a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+        )
+        for r, quat in zip(positions, quaternions)
+    ])
+    
+    errors = B_pred - B_measured
+    rmse = np.sqrt(np.mean(errors**2)) * 1e6
+    
+    angular_errors = []
+    for b_p, b_m in zip(B_pred, B_measured):
+        if np.linalg.norm(b_m) > 1e-10 and np.linalg.norm(b_p) > 1e-10:
+            cos_theta = np.dot(b_p, b_m) / (np.linalg.norm(b_p) * np.linalg.norm(b_m))
+            cos_theta = np.clip(cos_theta, -1, 1)
+            theta = np.arccos(cos_theta) * 180 / np.pi
+            angular_errors.append(theta)
+        else:
+            angular_errors.append(np.nan)
+    
+    mean_angular_error = np.nanmean(angular_errors) if angular_errors else np.nan
+    return rmse, mean_angular_error, angular_errors, B_pred * 1e6
+def estimate_position_with_cubic(B_custom, quat_sensor, m, pos_bounds,
+                                 a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                                 a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z):
+    """Position estimation using cubic model"""
+    if any(np.isnan(B_custom)) or any(np.isnan(quat_sensor)):
+        return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
+    
+    B_custom_T = np.array(B_custom) * muT_to_T
+    R_sensor = quaternion_to_rotation_matrix(quat_sensor)
+    r_init = initial_position_guess(B_custom_T, m, R_sensor, pos_bounds)
+    
+    def residuals_position_cubic(r, B_measured, m, R_sensor,
+                                  a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                                  a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z):
+        B_pred = dipole_field_enhanced_cubic(
+            r, m, R_sensor,
+            a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+            a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z
+        )
+        return B_pred - B_measured
+    
+    try:
+        result = least_squares(
+            residuals_position_cubic, r_init,
+            args=(B_custom_T, m, R_sensor,
+                  a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
+                  a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z),
+            bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+        )
+        
+        if not result.success or np.any(np.isnan(result.x)):
+            return r_init, r_init
+        
+        return result.x, r_init
+        
+    except Exception as e:
+        print(f"Error in cubic position estimation: {str(e)}")
+        return r_init, r_init
+    
+def compare_quadratic_vs_cubic():
+    """Compare quadratic vs cubic model performance"""
+    print("\n" + "="*60)
+    print("COMPARING QUADRATIC VS CUBIC MODELS")
+    print("="*60)
+    
+    # Run cubic optimization
+    dipole_params_cubic, pos_bounds, positions, B_measured, quaternions, ang_errs, B_pred, model_name = run_optimization_with_cubic()
+    
+    if dipole_params_cubic is None:
+        print("Cubic optimization failed.")
+        return
+    
+    # Also run quadratic optimization for comparison
+    print("\n" + "="*60)
+    print("RUNNING QUADRATIC OPTIMIZATION FOR COMPARISON")
+    print("="*60)
+    
+    dipole_params_quad, _, _, _, _, _, _, _ = run_optimization_enhanced()
+    
+    # Plot comparison
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Load results
+    with open('dipole_model_params_cubic.json', 'r') as f:
+        cubic_results = json.load(f)
+    
+    with open('dipole_model_params.json', 'r') as f:
+        quad_results = json.load(f)
+    
+    # Bar plot comparison
+    models = ['Quadratic', 'Cubic']
+    rmse_values = [quad_results.get('rmse', 0), cubic_results.get('rmse_cubic', 0)]
+    ang_values = [quad_results.get('angular_error', 0), cubic_results.get('angular_error_cubic', 0)]
+    
+    axes[0,0].bar(models, rmse_values, color=['blue', 'green'])
+    axes[0,0].set_ylabel('RMSE (µT)')
+    axes[0,0].set_title('Field Prediction RMSE')
+    axes[0,0].grid(True, alpha=0.3)
+    
+    axes[0,1].bar(models, ang_values, color=['blue', 'green'])
+    axes[0,1].set_ylabel('Angular Error (degrees)')
+    axes[0,1].set_title('Field Direction Error')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # Improvement text
+    improvement_rmse = cubic_results.get('improvement_rmse_percent', 0)
+    improvement_ang = cubic_results.get('improvement_angular_percent', 0)
+    
+    axes[1,0].text(0.5, 0.5, f'RMSE Improvement: {improvement_rmse:+.1f}%\nAngular Improvement: {improvement_ang:+.1f}%',
+                  ha='center', va='center', fontsize=14, transform=axes[1,0].transAxes,
+                  bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    axes[1,0].set_title('Performance Summary')
+    axes[1,0].axis('off')
+    
+    # Residual plot comparison
+    axes[1,1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('quadratic_vs_cubic_comparison.png', dpi=150)
+    plt.show()
+    
+    print(f"\n{'='*60}")
+    print("CONCLUSION")
+    print(f"{'='*60}")
+    if improvement_rmse > 0:
+        print(f"✅ Cubic model improves RMSE by {improvement_rmse:.1f}%")
+    else:
+        print(f"⚠️  Cubic model degrades RMSE by {abs(improvement_rmse):.1f}%")
+    
+    if improvement_ang > 0:
+        print(f"✅ Cubic model improves angular error by {improvement_ang:.1f}%")
+    else:
+        print(f"⚠️  Cubic model degrades angular error by {abs(improvement_ang):.1f}%")
 
 # For backward compatibility
 def dipole_field(r, m, R_sensor=None, a_x=1.0, b_x=0.0, a_y=1.0, b_y=0.0, a_z=1.0, b_z=0.0):
@@ -1014,8 +2079,8 @@ def load_and_filter_data():
             quaternions[i] = q / norm
 
     # Filter extreme values
-    min_distance = 0.05
-    max_B = 10000 * muT_to_T
+    min_distance = 0
+    max_B = 20000 * muT_to_T
     mask = (np.linalg.norm(positions, axis=1) > min_distance) & (np.linalg.norm(B_measured, axis=1) < max_B)
     positions = positions[mask]
     B_measured = B_measured[mask]
@@ -1597,43 +2662,93 @@ def analyze_ml_performance():
         'avg_improvement': avg_improvement
     }
 
+
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Position estimation server with ML comparison")
     parser.add_argument('--optimize', action='store_true', help="Run optimization to generate dipole parameters")
+    parser.add_argument('--staged', action='store_true', help="Use staged optimization (fast dipole optimization on subset, ML on all data)")
+    parser.add_argument('--opt-fraction', type=float, default=0.33, help="Fraction of data for dipole optimization (default: 0.33)")
     parser.add_argument('--interactive', action='store_true', help="Run CSV-based position estimation with plotting")
     parser.add_argument('--console', action='store_true', help="Run console-based interactive position estimation")
     parser.add_argument('--diagnose', action='store_true', help="Run magnet alignment diagnostic on CSV data")
     parser.add_argument('--analyze', action='store_true', help="Analyze ML performance from comparison log")
     parser.add_argument('--no-ml', action='store_true', help="Disable ML correction in server mode")
     parser.add_argument('--force-train', action='store_true', help="Force retraining of ML models")
-
+    parser.add_argument('--cubic', action='store_true', help="Use cubic model instead of quadratic")
+    parser.add_argument('--compare-models', action='store_true', help="Compare quadratic vs cubic performance")
     args = parser.parse_args()
 
     # Initialize comparison log
     init_comparison_log()
+    
+    # Handle compare models mode
+    if args.compare_models:
+        compare_quadratic_vs_cubic()
+        exit(0)
+
+    # Initialize variables
+    dipole_params = None
+    pos_bounds = None
+    positions = None
+    B_measured = None
+    quaternions = None
+    ang_errs_final = None
+    B_pred_final = None
+    best_stage = None
+
+    # Handle cubic optimization mode (runs optimization and saves file)
+    if args.cubic:
+        print("\n🔧 Running cubic optimization...")
+        result = run_optimization_with_cubic()
+        if result is None or len(result) < 8:
+            print("Cubic optimization failed.")
+            exit(1)
+        dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
+        
+        # After cubic optimization, we have the params, so skip loading
+        # Set a flag to indicate we already have params
+        params_already_loaded = True
+    else:
+        params_already_loaded = False
 
     # Handle analysis mode
     if args.analyze:
         analyze_ml_performance()
         exit(0)
 
-    # Load dipole parameters
-    dipole_params = load_dipole_params()
+    # Load dipole parameters if not already loaded from cubic optimization
+    if not params_already_loaded:
+        dipole_params = load_dipole_params()
+        
     if dipole_params is None and not args.optimize:
         print("No valid dipole parameters. Run with --optimize to generate them.")
         exit(1)
 
-    # Load data
-    positions, B_measured, quaternions, data_df = load_and_filter_data()
-    pos_bounds = None
+    # Print which model is being used
+    if dipole_params:
+        model_type = dipole_params.get('model_type', 'quadratic')
+        print(f"\n📌 Using {model_type.upper()} model for position estimation")
+        if model_type == 'cubic':
+            print(f"   Dipole moment: {dipole_params['m']}")
+            print(f"   Quadratic corrections applied")
+            print(f"   Cubic corrections applied")
+
+    # Load data if we don't already have it from cubic optimization
+    if positions is None:
+        positions, B_measured, quaternions, data_df = load_and_filter_data()
     
-    if positions is not None:
+    if pos_bounds is None and positions is not None:
         pos_bounds = (
             [positions[:,0].min(), positions[:,1].min(), positions[:,2].min()],
             [positions[:,0].max(), positions[:,1].max(), positions[:,2].max()]
         )
         print(f"Position bounds: {pos_bounds}")
+
+    # Load data_df if needed
+    if 'data_df' not in locals() or data_df is None:
+        _, _, _, data_df = load_and_filter_data()
 
     # Handle ML models
     xgb_models = (None, None, None)
@@ -1662,21 +2777,26 @@ if __name__ == "__main__":
             print("Error: Could not load data for diagnostic")
             exit(1)
 
-    if args.optimize:
+    if args.optimize and not args.cubic:  # Don't re-optimize if we already did cubic
         print("\n🔧 Running optimization...")
-        result = run_optimization_enhanced()
-        if result is None or len(result) < 8:
-            print("Optimization failed.")
-            exit(1)
-        dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
+        
+        if args.staged:
+            # Use staged optimization (fast dipole on subset, ML on all data)
+            result = run_optimization_staged(fraction=args.opt_fraction)
+            if result is None or len(result) < 8:
+                print("Staged optimization failed.")
+                exit(1)
+            dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
+        else:
+            # Use original optimization
+            result = run_optimization_enhanced()
+            if result is None or len(result) < 8:
+                print("Optimization failed.")
+                exit(1)
+            dipole_params, pos_bounds, positions, B_measured, quaternions, ang_errs_final, B_pred_final, best_stage = result
         
         if positions is not None:
             generate_vector_plots(positions, B_measured, quaternions, dipole_params, best_stage, ang_errs_final, B_pred_final)
-            
-            # Retrain correction models with optimized results
-            if data_df is not None:
-                print("\n🔄 Retraining ML models with optimized parameters...")
-                xgb_models = train_correction_model(data_df, save=True)
 
     if dipole_params is None:
         print("No valid dipole parameters. Run with --optimize to generate them.")
@@ -1691,13 +2811,18 @@ if __name__ == "__main__":
         server_thread.daemon = True
         server_thread.start()
         
-        interactive_position_estimation(
-            dipole_params['m'], pos_bounds,
-            dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
-            dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
-            dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z'],
-            positions
-        )
+        # Check if quadratic params exist for interactive mode
+        if 'a_x' in dipole_params:
+            interactive_position_estimation(
+                dipole_params['m'], pos_bounds,
+                dipole_params.get('a_x', 0.0), dipole_params.get('b_x', 1.0), dipole_params.get('c_x', 0.0),
+                dipole_params.get('a_y', 0.0), dipole_params.get('b_y', 1.0), dipole_params.get('c_y', 0.0),
+                dipole_params.get('a_z', 0.0), dipole_params.get('b_z', 1.0), dipole_params.get('c_z', 0.0),
+                positions
+            )
+        else:
+            print("Interactive mode only supported for quadratic model currently.")
+            
     elif args.interactive:
         server_thread = threading.Thread(
             target=run_position_server,
