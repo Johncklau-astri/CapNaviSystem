@@ -1,4 +1,5 @@
 import asyncio
+from anyio import current_time
 from bleak import BleakScanner, BleakClient
 import struct
 import time
@@ -18,6 +19,8 @@ from scipy.spatial.transform import Rotation
 LOG_FILENAME = "magnetometer_log.txt"
 log_file = None
 logging_enabled = False
+
+accel_logging_trigger = threading.Event()
 
 def start_logging():
     """Start logging magnetometer data to file."""
@@ -87,8 +90,13 @@ timestamp_deque = deque(maxlen=10)
 
 # Connection management
 connection_active = True
-max_reconnection_attempts = 10
+max_reconnection_attempts = 1000
 reconnection_delay = 5  # seconds
+
+q_prev = None  # To store previous quaternion for gyro prediction
+gyro_predicted_field = None  # To be set based on gyro predictions
+forced_invert_signs = False  # Set to True to force sign inversion for testing
+counter = 0
 
 class MadgwickFilter:
     def __init__(self, beta=0.5):
@@ -99,8 +107,10 @@ class MadgwickFilter:
             beta (float): Algorithm gain beta
             dt (float): Sample period [s]
         """
+        self.alpha = 0.03  # Low-pass filter coefficient for quaternion smoothing
         self.beta = beta
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        self.filtered_q = np.array([1.0, 0.0, 0.0, 0.0])  # For low-pass filtering of quaternion
         self.last_time = None  # Track last update time
         
         # Reference vectors in Earth frame
@@ -218,11 +228,14 @@ class MadgwickFilter:
         q_dot = q_dot_gyro - q_dot_gradient
         self.q = self.q + q_dot * dt
         self.q = self.normalize_quaternion(self.q)
+
+        # adding low pass filter for q
+        self.filtered_q = (1 - self.alpha) * self.filtered_q + self.alpha * self.q
         
         # Return error vector for debugging (approximated from gradient)
         error = gradient[1:] * self.beta
         
-        return self.q, error, corrected_gyro
+        return self.filtered_q, error, corrected_gyro
 
 class LockInAmplifier:
     def __init__(self, target_freq=10.0, alpha=0.01, hp_alpha=0.01):
@@ -276,41 +289,111 @@ class LockInAmplifier:
         print("Calibration complete. Phase offsets (degrees):", [np.degrees(off) for off in self.phase_offsets])
         print("DC offsets (uT):", self.dc_offsets)
 
+    # def update(self, mag_uT, current_time):
+    #     # Apply high-pass filter to remove DC offset
+    #     filtered_mag = self.high_pass_filter(mag_uT)
+        
+    #     dt = current_time - self.last_time
+    #     self.last_time = current_time
+    #     t = current_time
+    #     ref_in = np.sin(2 * np.pi * self.target_freq * t)
+    #     ref_quad = np.cos(2 * np.pi * self.target_freq * t)
+
+    #     amplitudes = []
+    #     phase_angles = []
+    #     for i in range(3):
+    #         prod_in = filtered_mag[i] * ref_in
+    #         prod_quad = filtered_mag[i] * ref_quad
+    #         self.x_in[i] = (1 - self.alpha) * self.x_in[i] + self.alpha * prod_in
+    #         self.x_quad[i] = (1 - self.alpha) * self.x_quad[i] + self.alpha * prod_quad
+    #         amplitude = np.sqrt(self.x_in[i]**2 + self.x_quad[i]**2)
+    #         phase = np.arctan2(self.x_quad[i], self.x_in[i])
+            
+    #         # Apply phase offset
+    #         if self.is_calibrated:
+    #             if self.phase_offsets[i] == 1:
+    #                 phase = -phase  # Shift by 180 degrees
+            
+    #         # Determine amplitude sign based on phase
+    #         if phase > 0:
+    #             signed_amplitude = amplitude
+    #         else:
+    #             signed_amplitude = -amplitude        
+
+    #         amplitudes.append(signed_amplitude)
+    #         phase_angles.append(np.degrees(phase))
+            
+    #     return amplitudes, phase_angles , filtered_mag, t
     def update(self, mag_uT, current_time):
-        # Apply high-pass filter to remove DC offset
+    # """Paper-based lock-in amplifier that uses phase differences only."""
+        global gyro_predicted_field,forced_invert_signs
+
         filtered_mag = self.high_pass_filter(mag_uT)
         
         dt = current_time - self.last_time
+        if dt > 0.1:
+            dt = 0.01
         self.last_time = current_time
-        t = current_time
-        ref_in = np.sin(2 * np.pi * self.target_freq * t)
-        ref_quad = np.cos(2 * np.pi * self.target_freq * t)
-
+        
+        # Use PLL or fixed frequency reference
+        ref_in = np.sin(2 * np.pi * self.target_freq * current_time)
+        ref_quad = np.cos(2 * np.pi * self.target_freq * current_time)
+        
+        # Get amplitudes and raw phases for each axis
         amplitudes = []
-        phase_angles = []
+        raw_phases = []
+        
         for i in range(3):
             prod_in = filtered_mag[i] * ref_in
             prod_quad = filtered_mag[i] * ref_quad
             self.x_in[i] = (1 - self.alpha) * self.x_in[i] + self.alpha * prod_in
             self.x_quad[i] = (1 - self.alpha) * self.x_quad[i] + self.alpha * prod_quad
+            
             amplitude = np.sqrt(self.x_in[i]**2 + self.x_quad[i]**2)
             phase = np.arctan2(self.x_quad[i], self.x_in[i])
             
-            # Apply phase offset
-            if self.is_calibrated:
-                if self.phase_offsets[i] == 1:
-                    phase = -phase  # Shift by 180 degrees
-            
-            # Determine amplitude sign based on phase
-            if phase > 0:
-                signed_amplitude = amplitude
+            amplitudes.append(amplitude)
+            raw_phases.append(phase)
+        
+        # PAPER METHOD: Determine signs using phase differences (Equation 1)
+        # Reference: Choose axis with strongest signal as reference
+        ref_axis = np.argmax(amplitudes)
+        signs = [1.0, 1.0, 1.0]
+        
+        for i in range(3):
+            if i == ref_axis:
+                signs[i] = 1.0  # Reference axis sign arbitrary, will be resolved by gyro
             else:
-                signed_amplitude = -amplitude        
-
-            amplitudes.append(signed_amplitude)
-            phase_angles.append(np.degrees(phase))
+                # Calculate phase difference
+                phase_diff = abs(raw_phases[i] - raw_phases[ref_axis])
+                # If phase difference > 90°, they're opposite
+                if phase_diff > np.pi/2:
+                    signs[i] = -1.0
+                else:
+                    signs[i] = 1.0
+        
+        # Create signed amplitude vector (still ambiguous: ±vector)
+        signed_amplitudes = [amplitudes[i] * signs[i] for i in range(3)]
+        # print(f"Raw phases (degrees): {[np.degrees(p) for p in raw_phases]}, Signs: {signs}, Amplitudes: {amplitudes}")
+        
+        # PAPER METHOD: Use gyro to resolve final sign (Equation 2)
+        # You need to pass the gyro-predicted field direction
+        if gyro_predicted_field is not None:
+            # print(f"Gyro predicted field: {gyro_predicted_field}, Signed amplitudes: {signed_amplitudes}")
+            # Dot product to determine if vector points roughly same direction as predicted
+            dot = (signed_amplitudes[0] * gyro_predicted_field[0] +
+                signed_amplitudes[1] * gyro_predicted_field[1] +
+                signed_amplitudes[2] * gyro_predicted_field[2])
             
-        return amplitudes, phase_angles , filtered_mag
+            if dot < 0:
+                # Flip all signs if pointing opposite to prediction
+                signed_amplitudes = [-s for s in signed_amplitudes]
+                
+        # if forced_invert_signs:
+        #     signed_amplitudes = [-s for s in signed_amplitudes] 
+        #     forced_invert_signs = False  # Reset after forcing sign inversion for testing
+        
+        return signed_amplitudes, [np.degrees(p) for p in raw_phases], filtered_mag, current_time
 
     def reset_dc_offsets(self):
         """Reset DC offset estimates (useful when conditions change dramatically)."""
@@ -450,7 +533,7 @@ def live_plot():
     ax1.set_title('Raw Magnetometer (uT)')
     ax2.set_title('Lock-in AC Amplitude (uT)')
     ax3.set_title('Low pass mag (uT)')
-    ax4.set_title('High pass mag (uT)')
+    ax4.set_title('EULER angles (degrees)')
     ax4.set_xlabel('Time (s)')
     lines1 = [ax1.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
     lines2 = [ax2.plot([], [], label=lbl)[0] for lbl in ['X', 'Y', 'Z']]
@@ -459,7 +542,7 @@ def live_plot():
     ax1.set_ylim(-10000, 10000)
     ax2.set_ylim(-300, 300)
     ax3.set_ylim(-5000, 5000)
-    ax4.set_ylim(-400, 400)  # Adjust based on expected omega range
+    ax4.set_ylim(-180, 180)  # Adjust based on expected omega range
     ax1.legend()
     ax2.legend()
     ax3.legend()
@@ -530,14 +613,76 @@ lockin = LockInAmplifier(target_freq=10.0, alpha=0.03 , hp_alpha=0.01)
 
 data_queue = queue.Queue()
 calibration_trigger = threading.Event()
+def rotate_quaternion_yaw_180(q):
+    """
+    Rotate quaternion by 180 degrees around Z-axis.
+    
+    Args:
+        q: Quaternion in [w, x, y, z] format
+        
+    Returns:
+        Rotated quaternion in [w, x, y, z] format
+    """
+    # Quaternion for 180-degree rotation about Z-axis
+    # angle = 180° = π radians
+    # half-angle = 90° = π/2
+    # cos(90°) = 0, sin(90°) = 1
+    # So rotation quaternion = [cos(π/2), 0, 0, sin(π/2)] = [0, 0, 0, 1]
+    rotation_quat = np.array([0.0, 0.0, 0.0, 1.0])  # [w, x, y, z]
+    
+    # Quaternion multiplication: q_result = rotation_quat * q
+    w1, x1, y1, z1 = rotation_quat
+    w2, x2, y2, z2 = q
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return np.array([w, x, y, z])
 
 def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
+    global q_prev, gyro_predicted_field,forced_invert_signs
     if calibration_trigger.is_set():
         lockin.calibrate(mag_uT, current_time)
         calibration_trigger.clear()
+    # Check if we need to flip sign permanently
+    if forced_invert_signs:
+        # CRITICAL: Reset lock-in internal state when flipping sign
+        lockin.x_in = [0.0, 0.0, 0.0]
+        lockin.x_quad = [0.0, 0.0, 0.0]
+        lockin.dc_offsets = [0.0, 0.0, 0.0]
+        lockin.filtered_signals = [0.0, 0.0, 0.0]
+        
+        # Also reset the filter to prevent orientation jump
+        filter.init()
+        q_prev = None  # Force gyro prediction to rebuild
+        
+        print("Lock-in state reset due to sign inversion")
+        forced_invert_signs = False
+
+
+    # Calculate expected magnetic field based on previous orientation
+    if q_prev is not None:
+
+        print(f"Previous quaternion: {q_prev}")
+        # AC field is known to be along global X axis
+        ac_field_global = np.array([1.0, 0.0, 0.0])  # Helmholtz coil axis
+        
+        # Rotate to sensor frame using previous quaternion
+        R = quaternion_to_rotation_matrix(q_prev)
+        expected_field = R.T @ ac_field_global  # Global to body frame
+        
+        # Pass to lock-in for sign resolution
+        gyro_predicted_field = expected_field
     
-    mag_amplitudes, mag_phases , highpass_mag_uT = lockin.update(mag_uT, current_time)
-    
+    # Update lock-in
+    mag_amplitudes, mag_phases, highpass_mag_uT, t = lockin.update(mag_uT, current_time)
+
+    # if(forced_invert_signs):
+    #     mag_amplitudes = [-a for a in mag_amplitudes] 
+    #     forced_invert_signs = False  # Reset after forcing sign inversion for testing
+
     # Use raw magnetometer data for Madgwick filter, not lock-in amplitudes
     q, error, omega_corrected = filter.update(
         np.radians(gyro_dps),
@@ -545,15 +690,143 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
         np.array(mag_amplitudes),
         current_time=current_time
     )
+    q_prev = q.copy()
 
-    return q, error, omega_corrected, mag_amplitudes, mag_phases , highpass_mag_uT
+    return q, error, omega_corrected, mag_amplitudes, mag_phases , highpass_mag_uT ,t
+def calculate_dc_offset(lockin, mag_raw, t_current, alpha_dc=0.05):
+    """
+    Calculate DC offset by removing lock-in detected AC component.
+    Includes safety checks for None values.
+    """
+    # SAFETY CHECK: Ensure lock-in components are valid
+    if lockin.x_in is None or lockin.x_quad is None:
+        print("Warning: Lock-in components are None, returning raw data")
+        return mag_raw, np.zeros_like(mag_raw)
+    
+    # Also check if they're lists with valid values
+    if not isinstance(lockin.x_in, (list, np.ndarray)) or not isinstance(lockin.x_quad, (list, np.ndarray)):
+        print(f"Warning: Lock-in components have invalid type: {type(lockin.x_in)}")
+        return mag_raw, np.zeros_like(mag_raw)
+    
+    # Generate reference signals at current time
+    ref_in = np.sin(2 * np.pi * lockin.target_freq * t_current)
+    ref_quad = np.cos(2 * np.pi * lockin.target_freq * t_current)
+    
+    try:
+        # Reconstruct AC component with safety
+        ac_component = np.array([
+            lockin.x_in[0] * ref_in + lockin.x_quad[0] * ref_quad,
+            lockin.x_in[1] * ref_in + lockin.x_quad[1] * ref_quad,
+            lockin.x_in[2] * ref_in + lockin.x_quad[2] * ref_quad
+        ])
+    except (TypeError, IndexError) as e:
+        print(f"Error reconstructing AC component: {e}")
+        return mag_raw, np.zeros_like(mag_raw)
+    
+    # Calculate instantaneous DC (raw - AC)
+    dc_instantaneous = mag_raw - ac_component
+    
+    return dc_instantaneous, ac_component
+
+class DCEstimator:
+    """Robust DC offset estimator with adaptive filtering"""
+    
+    def __init__(self, alpha=0.05, outlier_threshold=5.0):
+        self.alpha = alpha
+        self.outlier_threshold = outlier_threshold
+        self.dc_filtered = None
+        self.dc_history = deque(maxlen=100)
+        self.dc_std = None
+        self.initialized = False
+        
+    def update(self, dc_instantaneous):
+        """
+        Update DC estimate with outlier rejection and adaptive filtering.
+        Includes safety checks for None values.
+        """
+        # Safety check
+        if dc_instantaneous is None:
+            if self.dc_filtered is not None:
+                return self.dc_filtered
+            return np.array([0.0, 0.0, 0.0])
+        
+        # Ensure we're working with numpy array
+        if not isinstance(dc_instantaneous, np.ndarray):
+            dc_instantaneous = np.array(dc_instantaneous)
+        
+        # Initialize on first call
+        if self.dc_filtered is None:
+            self.dc_filtered = dc_instantaneous.copy()
+            self.dc_history.append(dc_instantaneous.copy())
+            self.initialized = True
+            return self.dc_filtered
+        
+        # Update history for statistics
+        self.dc_history.append(dc_instantaneous.copy())
+        
+        # Calculate running statistics if we have enough history
+        effective_alpha = self.alpha
+        if len(self.dc_history) > 10:
+            dc_array = np.array(self.dc_history)
+            self.dc_std = np.std(dc_array, axis=0)
+            
+            # Reject outliers
+            deviation = np.abs(dc_instantaneous - self.dc_filtered)
+            if np.any(deviation > self.outlier_threshold * self.dc_std):
+                effective_alpha = self.alpha * 0.1
+        
+        # Apply filtered update
+        self.dc_filtered = (1 - effective_alpha) * self.dc_filtered + effective_alpha * dc_instantaneous
+        
+        return self.dc_filtered
+    
+    def reset(self):
+        """Reset estimator state"""
+        self.dc_filtered = None
+        self.dc_history.clear()
+        self.dc_std = None
+        self.initialized = False
+
+# Initialize globally
+dc_estimator = DCEstimator(alpha=0.03, outlier_threshold=3.0)
+
+
+def sensor_to_mounting_frame(sensor_reading):
+    """
+    Transform a single sensor reading from sensor frame to mounting frame
+    
+    Args:
+        sensor_reading: [x, y, z] in sensor's coordinate system
+    
+    Returns:
+        mounting_frame: [x, y, z] in mounting frame coordinate system
+    """
+
+    # Inverted matrix (flip Y and Z rows)
+    R_mc_inverted = np.array([
+    [0.99729097, -0.05141686, 0.05260256],
+    [0.04623249, 0.99436218, 0.09542749],
+    [-0.05721258, -0.09273703, 0.99404555]
+    ])
+    sensor_reading = np.array(sensor_reading)
+    # R_mc @ sensor_reading  (matrix multiplication)
+    mounting_frame = R_mc_inverted @ sensor_reading
+    return mounting_frame
+
+
 
 def processing_thread():
     loop_timestamps = deque(maxlen=10)
+    dc_estimator = DCEstimator(alpha=0.03)
+    
+    # Add a counter for lock-in warm-up
+    warmup_samples = 0
+    WARMUP_REQUIRED = 50  # Wait for 50 samples before using lock-in for DC
     
     # Low-pass filter parameters for magnetometer data
-    alpha = 0.03  # Smoothing factor (0 = no smoothing, 1 = no filtering)  5,Nov: 0.03 is good
-    lowpass_mag_uT = None  # Initialize filtered value
+    alpha = 0.05
+    lowpass_mag_uT = None
+    final_dc = 0
     
     with ThreadPoolExecutor(max_workers=2) as executor:
         while True:
@@ -564,10 +837,64 @@ def processing_thread():
                     current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get_nowait()
                 
                 future = executor.submit(process_data, current_time, accel_g, gyro_dps, mag_uT, running_freq_hz)
-                q, error, omega_corrected, mag_amplitudes, mag_phases, highpass_mag_uT = future.result()
+                q, error, omega_corrected, mag_amplitudes, mag_phases, highpass_mag_uT , t_lockin= future.result()
 
-                # Convert mag_uT to numpy array for element-wise operations
+                # Convert mag_uT to numpy array
                 mag_uT_array = np.array(mag_uT)
+                
+                # Increment warmup counter
+                warmup_samples += 1
+                
+                # METHOD 1: Calculate DC using lock-in reconstruction (only after warmup)
+                if warmup_samples > WARMUP_REQUIRED:
+                    dc_instantaneous, ac_component = calculate_dc_offset(lockin, mag_uT_array, t_lockin)
+                    
+                    # Safety check for None
+                    if dc_instantaneous is not None and ac_component is not None:
+                        dc_estimate = dc_estimator.update(dc_instantaneous)
+                        final_dc = dc_estimate
+                        
+                        # Optional: Verify AC removal
+                        ac_removal_quality = np.linalg.norm(mag_uT_array - (final_dc + ac_component))
+                        # print(f"DC Estimate: [{final_dc[0]:.1f}, {final_dc[1]:.1f}, {final_dc[2]:.1f}] uT | "
+                        #       f"AC Removal Error: {ac_removal_quality:.3f} uT")
+                    else:
+                        # Fallback to low-pass filter
+                        if lowpass_mag_uT is None:
+                            lowpass_mag_uT = mag_uT_array
+                        else:
+                            alpha_lp = 0.05
+                            lowpass_mag_uT = alpha_lp * mag_uT_array + (1 - alpha_lp) * lowpass_mag_uT
+                        final_dc = lowpass_mag_uT
+                else:
+                    # During warmup, use simple low-pass filter
+                    if lowpass_mag_uT is None:
+                        lowpass_mag_uT = mag_uT_array
+                    else:
+                        alpha_lp = 0.05
+                        lowpass_mag_uT = alpha_lp * mag_uT_array + (1 - alpha_lp) * lowpass_mag_uT
+                    final_dc = lowpass_mag_uT
+                
+                # METHOD 2: Simple low-pass filter on raw data (for comparison)
+                if lowpass_mag_uT is None:
+                    lowpass_mag_uT = mag_uT_array
+                else:
+                    alpha_lp = 0.05
+                    lowpass_mag_uT = alpha_lp * mag_uT_array + (1 - alpha_lp) * lowpass_mag_uT
+                # Compare the two methods
+                dc_difference = np.linalg.norm(dc_estimate - lowpass_mag_uT)
+                
+                # Use dc_estimate as your final DC value (it's better than lowpass_mag_uT)
+                final_dc = dc_estimate
+                
+                # Optional: Verify AC removal
+                ac_removal_quality = np.linalg.norm(mag_uT_array - (final_dc + ac_component))
+                
+                # print(
+                #     f"DC Estimate: [{final_dc[0]:.1f}, {final_dc[1]:.1f}, {final_dc[2]:.1f}] uT | "
+                #     # f"AC Removal Error: {ac_removal_quality:.3f} uT | "
+                #     f"vs LP Diff: {dc_difference:.3f} uT"
+                # )
                 
                 # Apply low-pass filter to magnetometer data
                 if lowpass_mag_uT is None:
@@ -590,31 +917,45 @@ def processing_thread():
                 accel_amp = np.sqrt(accel_g[0]**2 + accel_g[1]**2 + accel_g[2]**2)
                 lowpass_mag_uT_amp = np.sqrt(lowpass_mag_uT[0]**2 + lowpass_mag_uT[1]**2 + lowpass_mag_uT[2]**2)
 
-                # Earth mag field removal
-                #Earth field measured in global frame, NOT capsule sensor axis, NEED to convert sensor reading to global
-                earth_mag_global = np.array([-11,-23,-22])
 
-                earth_mag_sensor = quaternion_to_rotation_matrix(mod_q).T@earth_mag_global
-                earth_mag_sensor = np.array([-earth_mag_sensor[1],-earth_mag_sensor[0],-earth_mag_sensor[2]])
+                ## calculate Mag DC theoretical
+                mag_dc_theoretical = np.array([0.0, 0.0, 0.0])  # Replace with actual theoretical values if available
 
-
-                adjusted_mag_uT = lowpass_mag_uT - earth_mag_sensor
-                adjusted_mag_uT_mag = np.sqrt(adjusted_mag_uT[0]**2 + adjusted_mag_uT[1]**2 + adjusted_mag_uT[2]**2)                
+                np_mag_amplitudes = np.array(mag_amplitudes)
+                
+                mag_dc_theoretical = mag_uT_array - np_mag_amplitudes*np.sin(2*np.pi*10*t_lockin+ np.radians(mag_phases))
 
 
+
+                # # Earth mag field removal
+                # #Earth field measured in global frame, NOT capsule sensor axis, NEED to convert sensor reading to global
+                # earth_mag_global = np.array([-11,-23,-22])
+
+                # earth_mag_sensor = quaternion_to_rotation_matrix(mod_q).T@earth_mag_global
+                # earth_mag_sensor = np.array([-earth_mag_sensor[1],-earth_mag_sensor[0],-earth_mag_sensor[2]])
+
+
+                # adjusted_mag_uT = lowpass_mag_uT - earth_mag_sensor
+                # adjusted_mag_uT_mag = np.sqrt(adjusted_mag_uT[0]**2 + adjusted_mag_uT[1]**2 + adjusted_mag_uT[2]**2)                
+
+                mountFrame_final_dc = sensor_to_mounting_frame(final_dc)
+                mag_uT_amp = np.sqrt(mag_uT_array[0]**2 + mag_uT_array[1]**2 + mag_uT_array[2]**2)
 
                 print(
-                    # f"Yaw: {yaw:.1f}°\t "
-                    # f"Madgwick Pitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t\t "
+                    f"Yaw: {yaw:.1f}°\tPitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t "
+                    # f"mag_dc_theoretical (uT): [X: {mag_dc_theoretical[0]:.1f}, Y: {mag_dc_theoretical[1]:.1f}, Z: {mag_dc_theoretical[2]:.1f}]\t "
                     # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
-                    f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
-                    f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
-                    f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f}, Y: {lowpass_mag_uT[1]:.1f}, \t Z: {lowpass_mag_uT[2]:.1f} , mag:{lowpass_mag_uT_amp:.1f}]\t "
-                    f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
-                    f"Adj Mag (uT): [X: {adjusted_mag_uT[0]:.1f}, Y: {adjusted_mag_uT[1]:.1f},  \tZ: {adjusted_mag_uT[2]:.1f} , mag:{adjusted_mag_uT_mag:.1f}]\t "
+                    # f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
+                    # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
+                    # f"DC Estimate (uT): [X: {final_dc[0]:.1f}\t, Y: {final_dc[1]:.1f}\t, Z: {final_dc[2]:.1f}]\t "
+                    # f"Calibrated Mag (uT): [X: {mag_uT[0]:.1f}, Y: {mag_uT[1]:.1f}, Z: {mag_uT[2]:.1f}, \tMagnitude: {mag_uT_amp:.1f}]\t "
+                    # f"mountFrame Mag (uT): [X: {mountFrame_final_dc[0]:.1f}, Y: {mountFrame_final_dc[1]:.1f}, Z: {mountFrame_final_dc[2]:.1f}]\t "
+                    # f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f},\tY: {lowpass_mag_uT[1]:.1f},\tZ: {lowpass_mag_uT[2]:.1f}\t "
+                    # f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
+                    # f"Adj Mag (uT): [X: {adjusted_mag_uT[0]:.1f}, Y: {adjusted_mag_uT[1]:.1f},  \tZ: {adjusted_mag_uT[2]:.1f} , mag:{adjusted_mag_uT_mag:.1f}]\t "
                     # f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz"
                 )
-                send_to_tcp_clients(mod_q, adjusted_mag_uT)
+                send_to_tcp_clients(mod_q, final_dc)
 
                 plot_time.append(current_time)
                 plot_mag_x.append(mag_uT[0])
@@ -626,10 +967,11 @@ def processing_thread():
                 plot_lp_x.append(lowpass_mag_uT[0])
                 plot_lp_y.append(lowpass_mag_uT[1])
                 plot_lp_z.append(lowpass_mag_uT[2])
-                plot_hp_x.append(highpass_mag_uT[0])
-                plot_hp_y.append(highpass_mag_uT[1])
-                plot_hp_z.append(highpass_mag_uT[2])
+                plot_hp_x.append(yaw)
+                plot_hp_y.append(pitch)
+                plot_hp_z.append(roll)
                 data_queue.task_done()
+
             except queue.Empty:
                 continue
             except Exception as e:
@@ -692,47 +1034,103 @@ def notification_handler(sender, data):
         # Calibrate magnetometer data
         mag_uT_calibrated = calibrate_magnetometer(mag_uT)
 
+        # print(f"Raw Mag (uT): {mag_uT}, Calibrated Mag (uT): {mag_uT_calibrated}")
+        #Calibrate accelerometer data
+        accel_g = calibrate_accelerometer(accel_g)
+
+        # Check if we need to log a single accelerometer point
+        if accel_logging_trigger.is_set():
+            log_single_accelerometer_point(mag_uT_calibrated)
+            accel_logging_trigger.clear()
+
         # Log magnetometer data if logging is enabled
         if logging_enabled:
-            log_magnetometer_data(mag_uT)
+            log_magnetometer_data(mag_uT_calibrated)
 
         data_queue.put((current_time, accel_g, gyro_dps, mag_uT_calibrated, running_freq_hz))
 
+
+
+
+def calibrate_accelerometer(accel_raw):
+    """
+    Calibrate raw accelerometer data using bias and calibration matrix.
+    """
+    # Bias parameters (offset correction)
+    bias_x = -0.011205
+    bias_y = -0.012890
+    bias_z = 0.024886
+    
+    # Calibration matrix (scale and misalignment correction)
+    cal_matrix_xx = 0.989532
+    cal_matrix_xy = -0.001051
+    cal_matrix_xz = 0.001429
+    
+    cal_matrix_yx = -0.001051
+    cal_matrix_yy = 0.989770
+    cal_matrix_yz = -0.001372
+    
+    cal_matrix_zx = 0.001429
+    cal_matrix_zy = -0.001372
+    cal_matrix_zz = 1.003220
+
+    # Step 1: Apply bias correction (remove offset)
+    accel_biased = [
+        accel_raw[0] - bias_x,
+        accel_raw[1] - bias_y,
+        accel_raw[2] - bias_z
+    ]
+    
+    # Step 2: Apply calibration matrix (correct scale and alignment)
+    accel_calibrated = [
+        cal_matrix_xx * accel_biased[0] + cal_matrix_xy * accel_biased[1] + cal_matrix_xz * accel_biased[2],
+        cal_matrix_yx * accel_biased[0] + cal_matrix_yy * accel_biased[1] + cal_matrix_yz * accel_biased[2],
+        cal_matrix_zx * accel_biased[0] + cal_matrix_zy * accel_biased[1] + cal_matrix_zz * accel_biased[2]
+    ]
+    
+    return accel_calibrated
+
+
 def calibrate_magnetometer(mag_raw):
-    # Hard iron bias parameters
-    hard_iron_bias_x = -22.105616
-    hard_iron_bias_y = -28.343595
-    hard_iron_bias_z = 6.451873
+    """
+    Calibrate raw magnetometer data using hard iron bias and soft iron matrix.
+    Calibration parameters from ellipsoid fitting.
+    Auto-detected field strength: 39.38 µT
     
-    # Soft iron bias matrix parameters (these are likely the inverse matrix)
-    soft_iron_bias_xx = 22.052792
-    soft_iron_bias_xy = -0.208071
-    soft_iron_bias_xz = 0.104460
-    
-    soft_iron_bias_yx = -0.208071
-    soft_iron_bias_yy = 23.190581
-    soft_iron_bias_yz = -0.186571
-    
-    soft_iron_bias_zx = 0.104460
-    soft_iron_bias_zy = -0.186571
-    soft_iron_bias_zz = 21.728060
-    
-    # Apply hard iron calibration (subtract bias)
-    mag_corrected = [
-        mag_raw[0] - hard_iron_bias_x,
-        mag_raw[1] - hard_iron_bias_y,
-        mag_raw[2] - hard_iron_bias_z
-    ]
-    
-    # Apply only hard iron calibration first
-    mag_calibrated = [
-        mag_raw[0] - hard_iron_bias_x,
-        mag_raw[1] - hard_iron_bias_y,
-        mag_raw[2] - hard_iron_bias_z
-    ]
-    
-    return mag_calibrated
+    Args:
+        mag_raw: Raw magnetometer readings [x, y, z] in microTesla
         
+    Returns:
+        Calibrated magnetometer readings [x, y, z] in microTesla
+    """
+    
+    # Convert to numpy array for vectorized operations
+    mag_raw = np.array(mag_raw)
+    
+    # Hard iron bias (offset correction)
+    hard_iron_bias = np.array([44.805678, 8.588545, 1.792226])
+
+    # Soft iron matrix (scale and alignment correction)
+    soft_iron_matrix = np.array([
+        [1.023535, -0.017253, 0.005967],
+        [-0.017253, 1.002418, -0.001270],
+        [0.005967, -0.001270, 0.974608]
+    ])
+    # Apply calibration: (raw - bias) @ soft_iron_matrix.T
+    # Note: The matrix multiplication order matters!
+    mag_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
+    
+    # Optional validation
+    expected_strength = 39.38
+    mag_magnitude = np.linalg.norm(mag_corrected)
+    
+    # if abs(mag_magnitude - expected_strength) > 10:
+    #     print(f"⚠️  Warning: Calibrated magnetometer magnitude {mag_magnitude:.1f} µT "
+    #           f"differs from expected {expected_strength:.1f} µT")
+    
+    return mag_corrected.tolist()  # Convert back to list for compatibility
+
+
 
 def send_to_tcp_clients(q, mag_uT):
     """Send quaternion and magnetometer data to connected TCP clients."""
@@ -799,22 +1197,41 @@ def tcp_server_thread():
         client_socket.close()
     tcp_server_socket.close()
 
+
+def log_single_accelerometer_point(accel_g):
+    """Log a single accelerometer data point to file."""
+    try:
+        with open("accelerometer_single_log.txt", 'a') as f:  # 'a' for append mode
+            f.write(f"{accel_g[0]:.3f},{accel_g[1]:.3f},{accel_g[2]:.3f}\n")
+        print(f"Logged accelerometer point: X={accel_g[0]:.3f}, Y={accel_g[1]:.3f}, Z={accel_g[2]:.3f}")
+    except Exception as e:
+        print(f"Error writing accelerometer data: {e}")
+
+
 def keyboard_listener():
     """Listen for keyboard input to trigger calibration and logging."""
     print("Press 'c' to calibrate the sensor's phase angles when in known orientation.")
-    print("Press 'l' to start/stop logging magnetometer data.")
+    print("Press 'm' to start/stop logging magnetometer data.")
+    print("Press 'l' to log a single accelerometer data point.")
+    global forced_invert_signs
     while True:
         if keyboard.is_pressed('c'):
-            print("Calibration triggered. Ensure sensor is in known orientation.")
-            calibration_trigger.set()
-            time.sleep(0.5)  # Debounce to prevent multiple triggers
+            # print("Calibration triggered. Ensure sensor is in known orientation.")
+            # calibration_trigger.set()
+            # time.sleep(0.5)  # Debounce to prevent multiple triggers
+            forced_invert_signs = True
         
-        if keyboard.is_pressed('l'):
+        if keyboard.is_pressed('m'):
             global logging_enabled
             if not logging_enabled:
                 start_logging()
             else:
                 stop_logging()
+            time.sleep(0.5)  # Debounce to prevent multiple triggers
+        
+        if keyboard.is_pressed('l'):
+            print("Logging single accelerometer data point...")
+            accel_logging_trigger.set()
             time.sleep(0.5)  # Debounce to prevent multiple triggers
         
         time.sleep(0.1)
