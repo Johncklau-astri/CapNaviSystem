@@ -99,7 +99,7 @@ forced_invert_signs = False  # Set to True to force sign inversion for testing
 counter = 0
 
 class MadgwickFilter:
-    def __init__(self, beta=0.5):
+    def __init__(self, beta=0.3):
         """
         Initialize Madgwick filter parameters.
         
@@ -115,7 +115,7 @@ class MadgwickFilter:
         
         # Reference vectors in Earth frame
         self.gravity_ref = np.array([0.0, 0.0, 1.0])  # Gravity points down
-        self.magnetic_ref = np.array([0.0, -1.0, 0.0])  # Magnetic field points North
+        self.magnetic_ref = np.array([0.0, 1.0, 0.0])  # Magnetic field points North
 
     def quaternion_multiply(self, q1, q2):
         """Multiply two quaternions."""
@@ -665,7 +665,7 @@ def process_data(current_time, accel_g, gyro_dps, mag_uT, running_freq_hz):
     # Calculate expected magnetic field based on previous orientation
     if q_prev is not None:
 
-        print(f"Previous quaternion: {q_prev}")
+        # print(f"Previous quaternion: {q_prev}")
         # AC field is known to be along global X axis
         ac_field_global = np.array([1.0, 0.0, 0.0])  # Helmholtz coil axis
         
@@ -942,13 +942,13 @@ def processing_thread():
                 mag_uT_amp = np.sqrt(mag_uT_array[0]**2 + mag_uT_array[1]**2 + mag_uT_array[2]**2)
 
                 print(
-                    f"Yaw: {yaw:.1f}°\tPitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t "
+                    # f"Yaw: {yaw:.1f}°\tPitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t "
                     # f"mag_dc_theoretical (uT): [X: {mag_dc_theoretical[0]:.1f}, Y: {mag_dc_theoretical[1]:.1f}, Z: {mag_dc_theoretical[2]:.1f}]\t "
                     # f"accel: x:{accel_g[0]:.2f}g, y:{accel_g[1]:.2f}g, z:{accel_g[2]:.2f}g\t "
-                    # f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
+                    f"mod_q: {mod_q[0]:.2f} , {mod_q[1]:.2f} , {mod_q[2]:.2f} , {mod_q[3]:.2f}\t"
                     # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
                     # f"DC Estimate (uT): [X: {final_dc[0]:.1f}\t, Y: {final_dc[1]:.1f}\t, Z: {final_dc[2]:.1f}]\t "
-                    # f"Calibrated Mag (uT): [X: {mag_uT[0]:.1f}, Y: {mag_uT[1]:.1f}, Z: {mag_uT[2]:.1f}, \tMagnitude: {mag_uT_amp:.1f}]\t "
+                    f"Calibrated Mag (uT): [X: {mag_uT[0]:.1f}, Y: {mag_uT[1]:.1f}, Z: {mag_uT[2]:.1f}, \tMagnitude: {mag_uT_amp:.1f}]\t "
                     # f"mountFrame Mag (uT): [X: {mountFrame_final_dc[0]:.1f}, Y: {mountFrame_final_dc[1]:.1f}, Z: {mountFrame_final_dc[2]:.1f}]\t "
                     # f"LP Mag (uT): [X: {lowpass_mag_uT[0]:.1f},\tY: {lowpass_mag_uT[1]:.1f},\tZ: {lowpass_mag_uT[2]:.1f}\t "
                     # f"earth_mag_sensor (uT): [X: {earth_mag_sensor[0]:.1f}, Y: {earth_mag_sensor[1]:.1f}, Z: {earth_mag_sensor[2]:.1f}]\t"
@@ -1033,6 +1033,7 @@ def notification_handler(sender, data):
 
         # Calibrate magnetometer data
         mag_uT_calibrated = calibrate_magnetometer(mag_uT)
+        # print(f"Calib mag: [X: {mag_uT_calibrated[0]:.1f} uT, Y: {mag_uT_calibrated[1]:.1f} uT, Z: {mag_uT_calibrated[2]:.1f} uT]")
 
         # print(f"Raw Mag (uT): {mag_uT}, Calibrated Mag (uT): {mag_uT_calibrated}")
         #Calibrate accelerometer data
@@ -1109,6 +1110,7 @@ def calibrate_magnetometer(mag_raw):
     
     # Hard iron bias (offset correction)
     hard_iron_bias = np.array([44.805678, 8.588545, 1.792226])
+    magnet_bias = np.array([0,0,0])
 
     # Soft iron matrix (scale and alignment correction)
     soft_iron_matrix = np.array([
@@ -1118,7 +1120,7 @@ def calibrate_magnetometer(mag_raw):
     ])
     # Apply calibration: (raw - bias) @ soft_iron_matrix.T
     # Note: The matrix multiplication order matters!
-    mag_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
+    mag_corrected = (mag_raw - hard_iron_bias- magnet_bias) @ soft_iron_matrix.T
     
     # Optional validation
     expected_strength = 39.38

@@ -220,7 +220,7 @@ class LockInAmplifier:
         
         dt = current_time - self.last_time
         self.last_time = current_time
-        t = current_time - self.first_sample_time
+        t = current_time 
         
         ref_in = np.sin(2 * np.pi * self.target_freq * t)
         ref_quad = np.cos(2 * np.pi * self.target_freq * t)

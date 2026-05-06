@@ -23,8 +23,8 @@ import serial
 
 # --- Configuration ---
 ## side camera id is 0
-## top camera id is 3
-camera_id = 3
+## top camera id is 1
+camera_id = 1
 top_camera_id = 0
 
 TAG_SIZE = 0.06
@@ -46,30 +46,35 @@ Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 LOG_FILE = "magnetic_field_log.csv"
 
-cube2MagOffset_X = 0.004
-cube2MagOffset_Y = 0.0
-cube2MagOffset_Z = -0.105 
+
+## if z= -0.1 and want to zero it, here should the offset should be cube2MagOffset_Z = -0.1
+cube2MagOffset_X = -0.002
+cube2MagOffset_Y = -0.0535
+cube2MagOffset_Z = -0.104 
 
 top_R_1000_cube1_camera = None
 R_1000_cube1_camera = None
+
+q_mag_after_motorZeroing = [1.0, 0.001, -0.023, 0.003]  # Identity quaternion as initial value
 
 
 ##### Position weights
 SIDE_POS_WEIGHTS = {
     'x': 0.05,  # Side camera is bad at X
-    'y': 0.9,  # Side camera is okay at Y  
+    'y': 0.95,  # Side camera is okay at Y  
     'z': 0.95   # Side camera is good at Z
 }
 
 TOP_POS_WEIGHTS = {
     'x': 0.95,  # Top camera is good at X
-    'y': 0.1,  # Top camera is good at Y
+    'y': 0.05,  # Top camera is good at Y
     'z': 0.05   # Top camera is bad at Z
 }
 
 # Orientation weights
+## ROLL IS ACTUALLY PITCH
 SIDE_ORI_WEIGHTS = {
-    'roll': 0.9,   # Side camera good at roll (X rotation)
+    'roll': 0.9,   # actually is pitch since its x axis rotation (X rotation)
     'pitch': 0.5,  # Side camera good at pitch (Y rotation)
     'yaw': 0.1     # Side camera bad at yaw (Z rotation)
 }
@@ -125,6 +130,31 @@ position_thread_running = True
 position_socket = None
 position_socket_lock = threading.Lock()
 
+def get_relative_quaternion(q1_B_rel_A, q2_C_rel_A):
+    """
+    Calculates the quaternion of B relative to C.
+    Assumes quaternions are [w, x, y, z].
+    """
+    # 1. Invert q2 (C relative to A) to get (A relative to C)
+    # q2_inv = [w, -x, -y, -z]
+    q2_inv = np.array([q2_C_rel_A[0], -q2_C_rel_A[1], -q2_C_rel_A[2], -q2_C_rel_A[3]])
+    
+    # 2. Multiply q2_inv * q1 to get B relative to C
+    # Quaternion multiplication: (w1, v1) * (w2, v2)
+    w1, x1, y1, z1 = q2_inv
+    w2, x2, y2, z2 = q1_B_rel_A
+    
+    q_res = np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ])
+    
+    # Normalize to ensure it remains a valid unit quaternion
+    return q_res / np.linalg.norm(q_res)
+
+
 # Add serial port initialization
 def init_serial_connection(port='COM19', baudrate=115200):
     global serial_port
@@ -139,7 +169,7 @@ def init_serial_connection(port='COM19', baudrate=115200):
         print("Continuing without serial data...")
         return None
 # Initialize serial connection
-serial_port = init_serial_connection('COM19', 115200)  # Change COM port as needed
+serial_port = init_serial_connection('COM7', 115200)  # Change COM port as needed
 
 def run_serial_data_receiver(stop_event):
     """Receive magnetic field data from Arduino via serial"""
@@ -150,6 +180,15 @@ def run_serial_data_receiver(stop_event):
         return
     
     buffer = ""
+    
+    # Initialize filtered values
+    filtered_magX = None
+    filtered_magY = None
+    filtered_magZ = None
+    
+    # Filter parameter (alpha between 0 and 1)
+    # Smaller alpha = more smoothing, larger alpha = faster response
+    alpha = 0.75  # You can adjust this value
     
     while not stop_event.is_set():
         try:
@@ -170,11 +209,30 @@ def run_serial_data_receiver(stop_event):
                                 sensor_mag_x, sensor_mag_y, sensor_mag_z = map(float, mag_data)
                                 with serial_mag_lock:
                                     # Apply coordinate transformations if needed
-                                    serial_magX = sensor_mag_x
-                                    serial_magY = -sensor_mag_y  # Invert Y to match coordinate system
-                                    serial_magZ = -sensor_mag_z  # Invert Z to match coordinate system
-                                    # print(f"Raw Serial Mag: X={sensor_mag_x:.2f}, Y={sensor_mag_y:.2f}, Z={sensor_mag_z:.2f}")
+                                    raw_magX = -sensor_mag_y
+                                    raw_magY = -sensor_mag_x  # Invert Y to match coordinate system
+                                    raw_magZ = sensor_mag_z  # Invert Z to match coordinate system
                                     
+                                    # Apply low-pass filter
+                                    if filtered_magX is None:
+                                        # Initialize with first raw value
+                                        filtered_magX = raw_magX
+                                        filtered_magY = raw_magY
+                                        filtered_magZ = raw_magZ
+                                    else:
+                                        # Exponential moving average filter
+                                        filtered_magX = alpha * raw_magX + (1 - alpha) * filtered_magX
+                                        filtered_magY = alpha * raw_magY + (1 - alpha) * filtered_magY
+                                        filtered_magZ = alpha * raw_magZ + (1 - alpha) * filtered_magZ
+                                    
+                                    # Update global variables with filtered values
+                                    serial_magX = filtered_magX
+                                    serial_magY = filtered_magY
+                                    serial_magZ = filtered_magZ
+                                    
+                                    # print(f"Raw Serial Mag: X={sensor_mag_x:.2f}, Y={sensor_mag_y:.2f}, Z={sensor_mag_z:.2f}")
+                                    # print(f"Filtered Mag: X={filtered_magX:.2f}, Y={filtered_magY:.2f}, Z={filtered_magZ:.2f}")
+
                                     # Optional: print at lower rate to avoid console spam
                                     if not hasattr(run_serial_data_receiver, "last_print") or \
                                        time.time() - run_serial_data_receiver.last_print > 1.0:
@@ -194,6 +252,10 @@ def run_serial_data_receiver(stop_event):
                     serial_port.close()
                 time.sleep(1)
                 serial_port = init_serial_connection('COM20', 115200)
+                # Reset filter values on reconnect
+                filtered_magX = None
+                filtered_magY = None
+                filtered_magZ = None
             except Exception as reconnect_error:
                 print(f"Failed to reconnect: {reconnect_error}")
                 time.sleep(5)
@@ -204,7 +266,6 @@ def run_serial_data_receiver(stop_event):
     if serial_port:
         serial_port.close()
     print("Serial data thread stopped")
-
 
 
 def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
@@ -553,7 +614,15 @@ def update_position_estimation(q,magX, magY, magZ):
                                             q[2], q[3])
     if success:
         return True
-   
+import numpy as np
+
+def invert_pose(q):
+
+    q_inv = np.array([q[0], -q[1], -q[2], -q[3]])
+    
+    q_inv /= np.linalg.norm(q_inv)
+    
+    return q_inv
 
 def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
     h, w = frame.shape[:2]
@@ -914,9 +983,22 @@ def compute_cube_center(tags, cube_size, tag_ids, reference_tag_id=None):
     return cube_center, R_ref
 
 def transform_to_ref_cube_frame(point_camera, ref_cube_center, ref_tag_R):
+    point_camera = np.array(point_camera).reshape(3)
+    ref_cube_center = np.array(ref_cube_center).reshape(3)
+    
+    # Ensure R is 2D (3x3)
+    if ref_tag_R is None:
+        return np.array([0, 0, 0])
+        
+    ref_tag_R = np.atleast_2d(ref_tag_R)
+    
+    if ref_tag_R.shape != (3, 3):
+        # Fallback if it's a flat array of 9 elements
+        ref_tag_R = ref_tag_R.reshape(3, 3)
+        
     point_relative = point_camera - ref_cube_center
-    point_ref = ref_tag_R.T @ point_relative
-    return point_ref
+    # Use np.dot or @ only with confirmed 2D matrix
+    return ref_tag_R.T @ point_relative
 
 def draw_text_with_background(frame, text, org, font, font_scale, color, thickness, bg_color=(0, 0, 0), alpha=0.5):
     text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
@@ -1127,8 +1209,8 @@ def simple_position_fusion(side_pos, top_pos):
 
 def simple_orientation_fusion(side_q, top_q, side_R, top_R):
     """
-    Fuse orientation with simple weights
-    Converts to Euler angles for component-wise fusion
+    Fuse orientation with custom axis weights.
+    Converts to Euler angles for component-wise fusion.
     """
     # If only one camera has data, use that
     if (side_q is None or side_R is None) and (top_q is None or top_R is None):
@@ -1138,22 +1220,24 @@ def simple_orientation_fusion(side_q, top_q, side_R, top_R):
     if top_q is None or top_R is None:
         return side_q
     
-    # Convert quaternions to Euler angles
+    # Convert rotation matrices to Euler angles (Degrees)
     side_euler = rotation_matrix_to_euler(side_R)
     top_euler = rotation_matrix_to_euler(top_R)
     
-    # Weighted average per angle
+    # --- Component-wise Weighted Fusion ---
+    
+    # 1. Roll (X-axis)
     fused_roll = (side_euler[0] * SIDE_ORI_WEIGHTS['roll'] + top_euler[0] * TOP_ORI_WEIGHTS['roll']) / \
                  (SIDE_ORI_WEIGHTS['roll'] + TOP_ORI_WEIGHTS['roll'])
     
+    # 2. Pitch (Y-axis)
     fused_pitch = (side_euler[1] * SIDE_ORI_WEIGHTS['pitch'] + top_euler[1] * TOP_ORI_WEIGHTS['pitch']) / \
                   (SIDE_ORI_WEIGHTS['pitch'] + TOP_ORI_WEIGHTS['pitch'])
     
-    # For yaw, handle angle wrapping (0/360 boundary)
+    # 3. Yaw (Z-axis) - Handle angle wrapping (e.g., 359 to 1 degree)
     side_yaw = side_euler[2]
     top_yaw = top_euler[2]
     
-    # Adjust if angles cross 0/360 boundary
     if abs(side_yaw - top_yaw) > 180:
         if side_yaw > top_yaw:
             top_yaw += 360
@@ -1163,11 +1247,13 @@ def simple_orientation_fusion(side_q, top_q, side_R, top_R):
     fused_yaw = (side_yaw * SIDE_ORI_WEIGHTS['yaw'] + top_yaw * TOP_ORI_WEIGHTS['yaw']) / \
                 (SIDE_ORI_WEIGHTS['yaw'] + TOP_ORI_WEIGHTS['yaw'])
     
-    # Normalize back to -180 to 180
+    # Normalize back to [-180, 180]
     fused_yaw = ((fused_yaw + 180) % 360) - 180
     
-    # Convert back to quaternion
+    # Convert the fused Euler angles back to a Quaternion [qw, qx, qy, qz]
     return euler_to_quaternion_simple(fused_roll, fused_pitch, fused_yaw)
+
+
 
 def euler_to_quaternion_simple(roll, pitch, yaw):
     """Simple Euler to quaternion conversion"""
@@ -1242,17 +1328,17 @@ def sensor_to_mounting_frame(sensor_reading):
     Returns:
         mounting_frame: [x, y, z] in mounting frame coordinate system
     """
-
+    sensor_reading = np.array(sensor_reading)
     # Inverted matrix (flip Y and Z rows)
     R_mc_inverted = np.array([
     [0.99729097, -0.05141686, 0.05260256],
     [0.04623249, 0.99436218, 0.09542749],
     [-0.05721258, -0.09273703, 0.99404555]
     ])
-    sensor_reading = np.array(sensor_reading)
-    # R_mc @ sensor_reading  (matrix multiplication)
-    mounting_frame = R_mc_inverted @ sensor_reading
-    return mounting_frame
+    if sensor_reading.ndim == 1:
+        # Ensure it's a column vector for the multiplication if needed
+        return R_mc_inverted @ sensor_reading
+    return np.zeros(3)
 
 
 def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coeffs):
@@ -1266,6 +1352,27 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     z_meas = np.array([5.6, -12.3, 48.7])
     R_senToCube = calibrate_sensor_from_measurements(x_meas, y_meas, z_meas)
 
+    # For encoder only mag pose estimation test
+    cube2_center_camera_origin = None
+    top_cube2_center_camera_origin = None
+    R_cube2_camera_origin = None
+    top_R_cube2_camera_origin = None
+
+    cube2_pos_rel_origin = None
+    top_cube2_pos_rel_origin = None
+
+    cube2_R_rel_origin = None
+    cube2_q_rel_origin = None
+    top_cube2_R_rel_origin = None
+    top_cube2_q_rel_origin = None
+    fused_cube2_pos_rel_origin = None
+    fused_cube2_q_rel_origin = None
+
+    cube1_center_camera_smoothed = None
+    cube2_center_camera_smoothed = None
+    q_cube1_cube1MotorZeroPose = None
+    fused_q_cube2_cube1 = None
+    
     
 
     cap = cv2.VideoCapture(camera_id)
@@ -1304,10 +1411,12 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     motor_data = None
     last_motor_update = 0
     MOTOR_UPDATE_INTERVAL = 0.1
+
+
     
     # Position estimation update rate control
     last_position_update = 0
-    POSITION_UPDATE_INTERVAL = 0.05  # Update 20 times per second
+    POSITION_UPDATE_INTERVAL = 0.2  # Update 20 times per second
 
     # Start position estimation worker thread
     position_thread = threading.Thread(target=position_estimation_worker, daemon=True)
@@ -1370,10 +1479,28 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 if not ret and not top_ret:
                     print("Failed to capture frame from all camera.")
                     break
+                # Validate frames before undistort
+                frame_undistorted = None
+                top_frame_undistorted = None
 
-                # frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
-                frame_undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-                top_frame_undistorted = cv2.remap(top_frame, map3, map4, cv2.INTER_LINEAR)
+                if ret and frame is not None and frame.size > 0:
+                    frame_undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+
+                if top_ret and top_frame is not None and top_frame.size > 0:
+                    top_frame_undistorted = cv2.remap(top_frame, map3, map4, cv2.INTER_LINEAR)
+
+                # Create placeholder frames for display if cameras fail
+                if frame_undistorted is None:
+                    frame_undistorted = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(frame_undistorted, "SIDE CAMERA OFFLINE", 
+                            (DISPLAY_WIDTH//2 - 200, DISPLAY_HEIGHT//2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                if top_frame_undistorted is None:
+                    top_frame_undistorted = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+                    cv2.putText(top_frame_undistorted, "TOP CAMERA OFFLINE", 
+                            (DISPLAY_WIDTH//2 - 200, DISPLAY_HEIGHT//2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 undistort_time = time.time()
               
                 text_frame[:] = 0  # Reset to black
@@ -1397,12 +1524,12 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 # side cam data
                 tags = []
                 worldCube_center_camera = None
-                R_cube1_camera = None
-                R_cube2_camera = None
+                R_cube1_camera = np.eye(3)
+                R_cube2_camera = np.eye(3)
                 
-                R_cube2_global = None
-                R_cube1_global = None
-                R_cube1_cube2 = None
+                R_cube2_global = np.eye(3)
+                R_cube1_global = np.eye(3)
+                R_cube1_cube2 = np.eye(3)
                 q_cube1_cube2 = None
 
                 worldCube_center_camera = None
@@ -1411,18 +1538,19 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 magnet_position_camera = None
                 t_cube1_cube2_tag = None
+                q_btcap_cube2Actual = None
 
 
                 # top cam data
                 top_tags = []
                 top_worldCube_center_camera = None
 
-                top_R_cube1_camera = None
-                top_R_cube2_camera = None
+                top_R_cube1_camera = np.eye(3)
+                top_R_cube2_camera = np.eye(3)
                 
-                top_R_cube2_global = None
-                top_R_cube1_global = None
-                top_R_cube1_cube2 = None
+                top_R_cube2_global = np.eye(3)
+                top_R_cube1_global = np.eye(3)
+                top_R_cube1_cube2 = np.eye(3)
                 top_q_cube1_cube2 = None
 
                 top_worldCube_center_camera = None
@@ -1435,6 +1563,9 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 # Fused data
                 fused_t_cube1_cube2_tag = None
                 fused_q_cube1_cube2 = None
+                q_cube2_cube2MotorZeroPose = None
+
+                q_btcap_cube2Actual = None
 
                 b_global = None
                 # Non-camera specific data
@@ -1498,24 +1629,24 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ################################################################################################################################
                 if len(tags)>0: 
                         
-                    worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
-                    if worldCube_center_camera is not None:
-                        # print(f"World Cube Center Camera: {worldCube_center_camera}")
-                        worldCube_center_z_buffer.append(worldCube_center_camera[2])
-                        if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
-                            worldCube_center_z_buffer.pop(0)
-                        smoothed_z_world = np.mean(worldCube_center_z_buffer)
-                        worldCube_center_camera_smoothed = worldCube_center_camera.copy()
-                        worldCube_center_camera_smoothed[2] = smoothed_z_world
-                        worldCube_center_point = np.array([[worldCube_center_camera_smoothed]], dtype=np.float32)
-                        img_points, _ = cv2.projectPoints(worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                        img_worldCube_center = img_points[0][0].astype(int)
-                        cv2.circle(frame_undistorted, tuple(img_worldCube_center), 8, (255, 0, 255), -1)
-                        draw_text_with_background(frame_undistorted, "W.C.", (img_worldCube_center[0]+10, img_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    # worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
+                    # if worldCube_center_camera is not None:
+                    #     # print(f"World Cube Center Camera: {worldCube_center_camera}")
+                    #     worldCube_center_z_buffer.append(worldCube_center_camera[2])
+                    #     if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                    #         worldCube_center_z_buffer.pop(0)
+                    #     smoothed_z_world = np.mean(worldCube_center_z_buffer)
+                    #     worldCube_center_camera_smoothed = worldCube_center_camera.copy()
+                    #     worldCube_center_camera_smoothed[2] = smoothed_z_world
+                    #     worldCube_center_point = np.array([[worldCube_center_camera_smoothed]], dtype=np.float32)
+                    #     img_points, _ = cv2.projectPoints(worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    #     img_worldCube_center = img_points[0][0].astype(int)
+                    #     cv2.circle(frame_undistorted, tuple(img_worldCube_center), 8, (255, 0, 255), -1)
+                    #     draw_text_with_background(frame_undistorted, "W.C.", (img_worldCube_center[0]+10, img_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                        R_worldCube_camera = compute_cube_orientation(tags, [7, 8, 9])
-                        worldCube_rvec, _ = cv2.Rodrigues(R_worldCube_camera)
-                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
+                    #     R_worldCube_camera = compute_cube_orientation(tags, [7, 8, 9])
+                    #     worldCube_rvec, _ = cv2.Rodrigues(R_worldCube_camera)
+                    #     draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
                     
                     ## CUBE 1
 
@@ -1537,7 +1668,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         R_cube1_camera = compute_cube_orientation(tags, [1,2])
                         cube1_rvec_camera, _ = cv2.Rodrigues(R_cube1_camera)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube1_rvec_camera, cube1_center_camera_smoothed, AXIS_LENGTH, img_cube1_center)
-                        draw_text_with_background(frame_undistorted, "CAP", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        # draw_text_with_background(frame_undistorted, "CAP", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                         cube1_center_text = f"Cube 1 Center: x={cube1_center_camera_smoothed[0]:.3f} m, y={cube1_center_camera_smoothed[1]:.3f} m, z={cube1_center_camera_smoothed[2]:.3f} m"
                     
                     ## CUBE 2
@@ -1560,14 +1691,14 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         cv2.circle(frame_undistorted, tuple(img_cube2_center), 8, (0, 255, 255), -1)
                         R_cube2_camera = compute_cube_orientation(tags, [3,4,5])
                         cube2_rvec_camera, _ = cv2.Rodrigues(R_cube2_camera)
-                        draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        # draw_text_with_background(frame_undistorted, "MAG", (img_cube2_center[0]+10, img_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube2_rvec_camera, cube2_center_camera_smoothed, AXIS_LENGTH, img_cube2_center)
 
-                    ## Safety check: Ensure cube centers are not too close in image
-                    if(cube1_center_camera is not None and cube2_center_camera is not None):
-                        distance = np.linalg.norm(img_cube1_center - img_cube2_center)
-                        if distance < 20:
-                            print(f"Cube centers too close in image: {distance:.2f} pixels")
+                    # ## Safety check: Ensure cube centers are not too close in image
+                    # if(cube1_center_camera is not None and cube2_center_camera is not None):
+                    #     distance = np.linalg.norm(img_cube1_center - img_cube2_center)
+                    #     if distance < 20:
+                    #         print(f"Cube centers too close in image: {distance:.2f} pixels")
                         
 
                 ################################################################################################################################
@@ -1576,24 +1707,24 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ## Extract cube positions and orientations from top cam
                 if len(top_tags) > 0:
 
-                    top_worldCube_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
-                    if top_worldCube_center_camera is not None:
-                        # print(f"World Cube Center Camera: {top_worldCube_center_camera}")
-                        top_worldCube_center_z_buffer.append(top_worldCube_center_camera[2])
-                        if len(top_worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
-                            top_worldCube_center_z_buffer.pop(0)
-                        smoothed_z_world = np.mean(top_worldCube_center_z_buffer)
-                        top_worldCube_center_camera_smoothed = top_worldCube_center_camera.copy()
-                        top_worldCube_center_camera_smoothed[2] = smoothed_z_world
-                        top_worldCube_center_point = np.array([[top_worldCube_center_camera_smoothed]], dtype=np.float32)
-                        img_points, _ = cv2.projectPoints(top_worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                        img_top_worldCube_center = img_points[0][0].astype(int)
-                        cv2.circle(top_frame_undistorted, tuple(img_top_worldCube_center), 8, (255, 0, 255), -1)
-                        draw_text_with_background(top_frame_undistorted, "W.C.", (img_top_worldCube_center[0]+10, img_top_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    # top_worldCube_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
+                    # if top_worldCube_center_camera is not None:
+                    #     # print(f"World Cube Center Camera: {top_worldCube_center_camera}")
+                    #     top_worldCube_center_z_buffer.append(top_worldCube_center_camera[2])
+                    #     if len(top_worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                    #         top_worldCube_center_z_buffer.pop(0)
+                    #     smoothed_z_world = np.mean(top_worldCube_center_z_buffer)
+                    #     top_worldCube_center_camera_smoothed = top_worldCube_center_camera.copy()
+                    #     top_worldCube_center_camera_smoothed[2] = smoothed_z_world
+                    #     top_worldCube_center_point = np.array([[top_worldCube_center_camera_smoothed]], dtype=np.float32)
+                    #     img_points, _ = cv2.projectPoints(top_worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    #     img_top_worldCube_center = img_points[0][0].astype(int)
+                    #     cv2.circle(top_frame_undistorted, tuple(img_top_worldCube_center), 8, (255, 0, 255), -1)
+                    #     draw_text_with_background(top_frame_undistorted, "W.C.", (img_top_worldCube_center[0]+10, img_top_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                        top_R_worldCube_camera = compute_cube_orientation(top_tags, [7, 8, 9])
-                        top_worldCube_rvec, _ = cv2.Rodrigues(top_R_worldCube_camera)
-                        draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_worldCube_rvec, top_worldCube_center_camera_smoothed, AXIS_LENGTH, img_top_worldCube_center)
+                    #     top_R_worldCube_camera = compute_cube_orientation(top_tags, [7, 8, 9])
+                    #     top_worldCube_rvec, _ = cv2.Rodrigues(top_R_worldCube_camera)
+                    #     draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_worldCube_rvec, top_worldCube_center_camera_smoothed, AXIS_LENGTH, img_top_worldCube_center)
                     
                     ## CUBE 1
 
@@ -1614,7 +1745,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         top_R_cube1_camera = compute_cube_orientation(top_tags, [0,1,2])
                         top_cube1_rvec_camera, _ = cv2.Rodrigues(top_R_cube1_camera)
                         draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_cube1_rvec_camera, top_cube1_center_camera_smoothed, AXIS_LENGTH, img_top_cube1_center)
-                        draw_text_with_background(top_frame_undistorted, "CAP", (img_top_cube1_center[0]+10, img_top_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        # draw_text_with_background(top_frame_undistorted, "CAP", (img_top_cube1_center[0]+10, img_top_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                         top_cube1_center_text = f"Cube 1 Center: x={top_cube1_center_camera_smoothed[0]:.3f} m, y={top_cube1_center_camera_smoothed[1]:.3f} m, z={top_cube1_center_camera_smoothed[2]:.3f} m"
 
                     ## CUBE 2
@@ -1637,14 +1768,14 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         cv2.circle(top_frame_undistorted, tuple(img_top_cube2_center), 8, (0, 255, 255), -1)
                         top_R_cube2_camera = compute_cube_orientation(top_tags, [3,4,5])
                         top_cube2_rvec_camera, _ = cv2.Rodrigues(top_R_cube2_camera)
-                        draw_text_with_background(top_frame_undistorted, "MAG", (img_top_cube2_center[0]+10, img_top_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        # draw_text_with_background(top_frame_undistorted, "MAG", (img_top_cube2_center[0]+10, img_top_cube2_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                         draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_cube2_rvec_camera, top_cube2_center_camera_smoothed, AXIS_LENGTH, img_top_cube2_center)
 
-                    ## Safety check: Ensure cube centers are not too close in image
-                    if(top_cube1_center_camera is not None and top_cube2_center_camera is not None):
-                        distance = np.linalg.norm(img_top_cube1_center - img_top_cube2_center)
-                        if distance < 20:
-                            print(f"Cube centers too close in image: {distance:.2f} pixels")
+                    # ## Safety check: Ensure cube centers are not too close in image
+                    # if(top_cube1_center_camera is not None and top_cube2_center_camera is not None):
+                    #     distance = np.linalg.norm(img_top_cube1_center - img_top_cube2_center)
+                    #     if distance < 20:
+                    #         print(f"Cube centers too close in image: {distance:.2f} pixels")
 
                 
 
@@ -1664,7 +1795,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     cv2.circle(frame_undistorted, tuple(img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
 
                 # Calculate relative position and orientation of cube 1 relative to cube 2:
-                if cube1_center_camera is not None and cube2_center_camera is not None and R_cube2_camera is not None:
+                if cube1_center_camera_smoothed is not None and magnet_position_camera is not None and R_cube2_camera is not None:
                     # Get sensor (Cube 1) position relative to magnet
                     t_cube1_cube2_tag = transform_to_ref_cube_frame(
                         cube1_center_camera_smoothed,
@@ -1685,6 +1816,17 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 if R_cube1_camera is not None and R_worldCube_camera is not None:
                     R_cube1_global = R_worldCube_camera.T @ R_cube1_camera    
                     q_cube1_global = rotation_matrix_to_quaternion(R_cube1_global) if R_cube1_global is not None else [1.0, 0.0, 0.0, 0.0]
+                
+                ## For encoder-only position estimation test: calculate cube 2 position relative to initial position (origin)
+                if cube2_center_camera_origin is not None and R_cube2_camera_origin is not None and cube2_center_camera_smoothed is not None:
+                    cube2_pos_rel_origin = transform_to_ref_cube_frame(
+                        cube2_center_camera_smoothed,
+                        cube2_center_camera_origin,
+                        R_cube2_camera_origin
+                    )
+                    cube2_R_rel_origin = R_cube2_camera_origin.T @ R_cube2_camera
+                    cube2_q_rel_origin = rotation_matrix_to_quaternion(cube2_R_rel_origin) if cube2_R_rel_origin is not None else [1.0, 0.0, 0.0, 0.0]
+
 
 
 
@@ -1702,7 +1844,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     cv2.circle(top_frame_undistorted, tuple(top_img_magnet_center), 6, (255, 0, 255), -1)  # Purple dot for magnet
 
                 # Calculate relative position and orientation of cube 1 relative to cube 2:
-                if top_cube1_center_camera is not None and top_cube2_center_camera is not None and top_R_cube2_camera is not None:
+                if top_cube1_center_camera_smoothed is not None and top_magnet_position_camera is not None and top_R_cube2_camera is not None:
                     # Get sensor (Cube 1) position relative to magnet
                     top_t_cube1_cube2_tag = transform_to_ref_cube_frame(
                         top_cube1_center_camera_smoothed,
@@ -1724,7 +1866,15 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     top_R_cube1_global = top_R_worldCube_camera.T @ top_R_cube1_camera    
                     top_q_cube1_global = rotation_matrix_to_quaternion(top_R_cube1_global) if top_R_cube1_global is not None else [1.0, 0.0, 0.0, 0.0]
 
-
+                ## For encoder-only position estimation test: calculate cube 2 position relative to initial position (origin)
+                if top_cube2_center_camera_origin is not None and top_R_cube2_camera_origin is not None and top_cube2_center_camera_smoothed is not None:
+                    top_cube2_pos_rel_origin = transform_to_ref_cube_frame(
+                        top_cube2_center_camera_smoothed,
+                        top_cube2_center_camera_origin,
+                        top_R_cube2_camera_origin
+                    )
+                    top_cube2_R_rel_origin = top_R_cube2_camera_origin.T @ top_R_cube2_camera
+                    top_cube2_q_rel_origin = rotation_matrix_to_quaternion(top_cube2_R_rel_origin) if top_cube2_R_rel_origin is not None else [1.0, 0.0, 0.0, 0.0]
 
                 # if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None):
                 #     print(f"top cam x:{top_t_cube1_cube2_tag[0]:.3f}\ty:{top_t_cube1_cube2_tag[1]:.3f}\tz:{top_t_cube1_cube2_tag[2]:.3f}\t\tSide cam x:{t_cube1_cube2_tag[0]:.3f}\ty:{t_cube1_cube2_tag[1]:.3f}\tz:{t_cube1_cube2_tag[2]:.3f}")
@@ -1736,13 +1886,33 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ###### Data fusing  to calculate relative position and orientation of cube 1 relative to cube 2           ######################
                 ################################################################################################################################
 
-                if(top_t_cube1_cube2_tag is not None and t_cube1_cube2_tag is not None and
-                   top_q_cube1_cube2 is not None and q_cube1_cube2 is not None):
+                if(top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None) or (t_cube1_cube2_tag is not None and  q_cube1_cube2 is not None):
                     fused_t_cube1_cube2_tag = simple_position_fusion(t_cube1_cube2_tag, top_t_cube1_cube2_tag)
+                    
                     fused_q_cube1_cube2 = simple_orientation_fusion(q_cube1_cube2, top_q_cube1_cube2, 
                                                                     R_cube1_cube2, top_R_cube1_cube2)
                     
+                    fused_q_cube2_cube1 = invert_pose(fused_q_cube1_cube2) if fused_q_cube1_cube2 is not None else None
+                    
 
+                ################################################################################################################################
+                ###### Data fusing  to calculate relative position and orientation of cube2 against origin                 ######################
+                ################################################################################################################################               
+                    
+                if(top_cube2_pos_rel_origin is not None and top_cube2_q_rel_origin is not None) or (cube2_pos_rel_origin is not None and cube2_q_rel_origin is not None):
+                    fused_cube2_pos_rel_origin = simple_position_fusion(cube2_pos_rel_origin, top_cube2_pos_rel_origin)
+                    fused_cube2_q_rel_origin = simple_orientation_fusion(cube2_q_rel_origin, top_cube2_q_rel_origin,
+                                                                        cube2_R_rel_origin, top_cube2_R_rel_origin)
+                    
+                    q_cube2_cube2MotorZeroPose = get_relative_quaternion(fused_cube2_q_rel_origin , q_mag_after_motorZeroing ) if fused_cube2_q_rel_origin is not None else None
+                    R_cube2_cube2MotorZeroPose = quaternion_to_rotation_matrix(q_cube2_cube2MotorZeroPose) if q_cube2_cube2MotorZeroPose is not None else None
+                    R_btcap_cube2Actual =  R_cube2_cube2MotorZeroPose.T @ quaternion_to_rotation_matrix(q_btcap_global) if R_cube2_cube2MotorZeroPose is not None and q_btcap_global is not None else None
+                    q_btcap_cube2Actual = rotation_matrix_to_quaternion(R_btcap_cube2Actual) if R_btcap_cube2Actual is not None else None
+
+                    
+                    
+                    # fused_q_cube1_cube2 = q_cube1_cube2
+                    
 
                 # # Print for debugging
                 # if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
@@ -1775,41 +1945,42 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
 
 
+                # serial_magY = np.sqrt(serial_magY**2)  # Combine Y and Z for a more stable reading
 
                 # Update position estimation at controlled rate (NON-BLOCKING)
                 current_time = time.time()
-                if current_time - last_position_update > POSITION_UPDATE_INTERVAL:
-                    update_position_estimation(fused_q_cube1_cube2, magX, magY, magZ)  # This is now non-blocking
+                if current_time - last_position_update > POSITION_UPDATE_INTERVAL and q_btcap_cube2Actual is not None and magX != 0.0 and magY != 0.0 and magZ != 0.0:
+                    update_position_estimation(q_btcap_cube2Actual, magX, magY, magZ)  # This is now non-blocking
                     last_position_update = current_time
 
-                # Draw estimated position and axes
-                if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and q_btcap_global is not None and R_worldCube_camera is not None:
+                # # Draw estimated position and axes
+                # if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and q_btcap_global is not None and R_worldCube_camera is not None:
                     
-                    # Step 1: Get magnet position in camera frames
-                    magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                #     # Step 1: Get magnet position in camera frames
+                #     magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
                     
-                    # Step 2: estX, estY, estZ are in magnet's coordinate frame
-                    # Transform this vector to camera frame
-                    est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
+                #     # Step 2: estX, estY, estZ are in magnet's coordinate frame
+                #     # Transform this vector to camera frame
+                #     est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
                     
-                    # Step 3: Estimated position in camera frame = magnet position + transformed vector
-                    est_pos_camera = magnet_position_camera + est_vector_camera
+                #     # Step 3: Estimated position in camera frame = magnet position + transformed vector
+                #     est_pos_camera = magnet_position_camera + est_vector_camera
                     
-                    # Project to image coordinates
-                    est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
-                    img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                    img_est_pos = img_points[0][0].astype(int)
+                #     # Project to image coordinates
+                #     est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
+                #     img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                #     img_est_pos = img_points[0][0].astype(int)
                     
-                    # Draw if within bounds
-                    if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
-                        0 <= img_est_pos[1] < frame_undistorted.shape[0]):
-                        cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
+                #     # Draw if within bounds
+                #     if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
+                #         0 <= img_est_pos[1] < frame_undistorted.shape[0]):
+                #         cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
                         
-                        R_bt = quaternion_to_rotation_matrix(q_btcap_global)
-                        R_btcap_cam = R_worldCube_camera @ R_bt
-                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
-                    else:
-                        print(f"Estimated position projected outside image: {img_est_pos}")
+                #         R_bt = quaternion_to_rotation_matrix(q_btcap_global)
+                #         R_btcap_cam = R_worldCube_camera @ R_bt
+                #         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                #     else:
+                #         print(f"Estimated position projected outside image: {img_est_pos}")
 
 
                 calculation_time = time.time()
@@ -1823,8 +1994,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
                 q_cube1_global_text =     f"q_Cap_global: [{q_cube1_global[0]:.3f}, {q_cube1_global[1]:.3f}, {q_cube1_global[2]:.3f}, {q_cube1_global[3]:.3f}]" if q_cube1_global is not None else "Cube2 Quat Cap: N/A"
                 q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{q_cube1_cube2[0]:.3f}, {q_cube1_cube2[1]:.3f}, {q_cube1_cube2[2]:.3f}, {q_cube1_cube2[3]:.3f}]" if q_cube1_cube2 is not None else "Rel Relsensor: N/A"
-                q_cap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
-                q_q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
+                q_btcap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
+                q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
                 est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
                 pos_error_text =        f"Pos Err: x={estX-fused_t_cube1_cube2_tag[0]:.3f} m, y={estY-fused_t_cube1_cube2_tag[1]:.3f} m, z={estZ-fused_t_cube1_cube2_tag[2]:.3f} m" if fused_t_cube1_cube2_tag is not None else "Pos Err: N/A"
                 bglobal_text =     f"bglobal: x={b_global[0]:.3f} uT, y={b_global[1]:.3f} uT, z={b_global[2]:.3f} uT" if b_global is not None else "Global mag vector: N/A"
@@ -1834,28 +2005,41 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f}" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
                 fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f}" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
                 serial_mag_text = f"Serial Mag: X={serial_magX:.2f} uT, Y={serial_magY:.2f} uT, Z={serial_magZ:.2f} uT" if serial_magX is not None else "Serial Mag: N/A"
+                rel_origin_text = f"Rel Origin: x={cube2_pos_rel_origin[0]:.3f} m, y={cube2_pos_rel_origin[1]:.3f} m, z={cube2_pos_rel_origin[2]:.3f} m" if cube2_pos_rel_origin is not None else "Rel Origin: N/A"
+                rel_q_origin_text = f"Rel Q Origin: qx={cube2_q_rel_origin[0]:.3f}, qy={cube2_q_rel_origin[1]:.3f}, qz={cube2_q_rel_origin[2]:.3f}, qw={cube2_q_rel_origin[3]:.3f}" if cube2_q_rel_origin is not None else "Rel Q Origin: N/A"
+                top_rel_origin_text = f"Top Rel Origin: x={top_cube2_pos_rel_origin[0]:.3f} m, y={top_cube2_pos_rel_origin[1]:.3f} m, z={top_cube2_pos_rel_origin[2]:.3f} m" if top_cube2_pos_rel_origin is not None else "Top Rel Origin: N/A"
+                top_rel_q_origin_text = f"Top Rel Q Origin: qx={top_cube2_q_rel_origin[0]:.3f}, qy={top_cube2_q_rel_origin[1]:.3f}, qz={top_cube2_q_rel_origin[2]:.3f}, qw={top_cube2_q_rel_origin[3]:.3f}" if top_cube2_q_rel_origin is not None else "Top Rel Q Origin: N/A"
+                fused_rel_origin_text = f"Fused Rel Origin: x={fused_cube2_pos_rel_origin[0]:.3f} m, y={fused_cube2_pos_rel_origin[1]:.3f} m, z={fused_cube2_pos_rel_origin[2]:.3f} m" if fused_cube2_pos_rel_origin is not None else "Fused Rel Origin: N/A"
+                fused_rel_q_origin_text = f"Fused Rel Q Origin: qx={fused_cube2_q_rel_origin[0]:.3f}, qy={fused_cube2_q_rel_origin[1]:.3f}, qz={fused_cube2_q_rel_origin[2]:.3f}, qw={fused_cube2_q_rel_origin[3]:.3f}" if fused_cube2_q_rel_origin is not None else "Fused Rel Q Origin: N/A"
+                fused_q_cube1_cube2_text = f"Fused q_cube2_cube1: [{fused_q_cube2_cube1[0]:.3f}, {fused_q_cube2_cube1[1]:.3f}, {fused_q_cube2_cube1[2]:.3f}, {fused_q_cube2_cube1[3]:.3f}]" if fused_q_cube2_cube1 is not None else "Fused q_Cap_Mag: N/A"
+                q_cube2_cube2MotorZeroPose_text = f"q_Cube2_Cube2ZeroPose: [{q_cube2_cube2MotorZeroPose[0]:.3f}, {q_cube2_cube2MotorZeroPose[1]:.3f}, {q_cube2_cube2MotorZeroPose[2]:.3f}, {q_cube2_cube2MotorZeroPose[3]:.3f}]" if q_cube2_cube2MotorZeroPose is not None else "q_Cube2_Cube2ZeroPose: N/A"
+                q_btcap_cube2Actual_text = f"q_btcap_cube2Actual: [{q_btcap_cube2Actual[0]:.3f}, {q_btcap_cube2Actual[1]:.3f}, {q_btcap_cube2Actual[2]:.3f}, {q_btcap_cube2Actual[3]:.3f}]" if q_btcap_cube2Actual is not None else "q_btcap_cube2Actual: N/A"
                 intervalOffset = 1
                 FONT_SCALE = 1
                 draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                 draw_text_with_background(text_frame, side_cam_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, top_cam_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, q_cap_Mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, q_q_btcap_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, est_pos_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)    
-                draw_text_with_background(text_frame, bglobal_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, pos_error_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 100, 255, 0), 3)
-                draw_text_with_background(text_frame, serial_mag_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                # draw_text_with_background(text_frame, bt_quat_global_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
-                # draw_text_with_background(text_frame, rel_Relsensor_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+                draw_text_with_background(text_frame, fused_q_cube1_cube2_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, top_rel_origin_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, top_rel_q_origin_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, fused_rel_origin_text, (50, int(310*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, fused_rel_q_origin_text, (50, int(350*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, q_cube2_cube2MotorZeroPose_text, (50, int(390*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+
+                draw_text_with_background(text_frame, q_btcap_global_text, (50, int(450*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 0, 255, 255), 3)
+                draw_text_with_background(text_frame, q_btcap_cube2Actual_text, (50, int(490*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                draw_text_with_background(text_frame, est_pos_text, (50, int(530*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
+                draw_text_with_background(text_frame, pos_error_text, (50, int(570*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # print(fused_cam_text,serial_mag_text)
 
 
                 
-                if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
-                    with position_data_lock:
-                        if latest_position_data:
-                            motor_data = latest_position_data.copy()
-                    last_motor_update = time.time()
+                # if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
+                #     with position_data_lock:
+                #         if latest_position_data:
+                #             motor_data = latest_position_data.copy()
+                #     last_motor_update = time.time()
 
                 drawtext_time = time.time()
 
@@ -1880,30 +2064,41 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         errorZ = estZ - t_cube1_cube2_tag[2]
                         writer.writerow([
                             measurement_order,
-                            f'{t_cube1_cube2_tag[0]:.6f}', f'{t_cube1_cube2_tag[1]:.6f}', f'{t_cube1_cube2_tag[2]:.6f}',
-                            f'{q_cube1_cube2[0]:.5f}', f'{q_cube1_cube2[1]:.5f}', f'{q_cube1_cube2[2]:.5f}', f'{q_cube1_cube2[3]:.5f}',
+                            f'{fused_t_cube1_cube2_tag[0]:.6f}', f'{fused_t_cube1_cube2_tag[1]:.6f}', f'{fused_t_cube1_cube2_tag[2]:.6f}',
+                            f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}',
                             f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
-                            f'{magX:.3f}', f'{magY:.3f}', f'{magZ:.3f}',
+                            f'{serial_magX:.3f}', f'{serial_magY:.3f}', f'{serial_magZ:.3f}',
                             f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
                             f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
                         ])
                         csvfile.flush()
-                        draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
                         time.sleep(0.2)
                         auto_record_flag = False
 
-                elif key == ord ('c'):
-                    if (R_cube1_camera is not None and top_R_cube1_camera):
-                        top_R_1000_cube1_camera = top_R_cube1_camera.copy()
-                        R_1000_cube1_camera = R_cube1_camera.copy()
-                        print("Manually set worldCube reference to Cube 1")
+                elif key == ord ('f'):
+                    ## record the magnet origin position so as to check accuracy of encoder only magnet pose estimation
+                    if (cube2_center_camera is not None and R_cube2_camera is not None):
+                        cube2_center_camera_origin = cube2_center_camera.copy()
+                        R_cube2_camera_origin = R_cube2_camera.copy()
+                        print("Recorded side cam magnet origin position")
+                    if (top_cube2_center_camera is not None and top_R_cube2_camera is not None):
+                        top_cube2_center_camera_origin = top_cube2_center_camera.copy()
+                        top_R_cube2_camera_origin = top_R_cube2_camera.copy()
+                        print("Recorded top cam magnet origin position")
 
-                    
+
+
+
+
+
+
                     
                 # text_frame_resized = cv2.resize(text_frame, (DISPLAY_WIDTH, TEXT_FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
                 # camera_frame_resized = resize_frame(frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
                 # top_camera_frame_resized = resize_frame(top_frame_undistorted, max_height=CAMERA_FRAME_HEIGHT)
                 # combined_frame = np.vstack((text_frame_resized, camera_frame_resized, top_camera_frame_resized))
+
 
 
                 # Calculate half width based on text frame width
