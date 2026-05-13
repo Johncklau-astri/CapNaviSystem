@@ -2,14 +2,11 @@ import threading
 import time
 import select
 import sys
-import msvcrt  # Add this import for Windows keyboard input
+import msvcrt
 import numpy as np
-
 import socket
 import json
 import struct
-# new change
-
 from collections import defaultdict
 from gs_usb.gs_usb import GsUsb
 from gs_usb.gs_usb_frame import GsUsbFrame
@@ -18,14 +15,12 @@ from gs_usb.constants import (
     CAN_ERR_FLAG,
     CAN_RTR_FLAG,
 )
-
-## testing changes 
 class Motor:
     def __init__(self, name, node_id):
         self.name = name
         self.node_id = node_id
         self.current_position = 0
-        self.statusword = 0  # New attribute for statusword
+        self.statusword = 0
         self.status = 'Uninitialized'
         self.last_update_time = None
         self.operational = False
@@ -33,13 +28,18 @@ class Motor:
 
     def update_moveCommand(self, hasMoveCommand):
         self.moveCommand = hasMoveCommand
+
+    def update_position_and_status(self, position, statusword):
+        """Updates internal state from CAN TPDO data"""
+        self.current_position = position
+        self.statusword = statusword
+        self.last_update_time = time.time()
     
     def __repr__(self):
         return (f"Motor({self.name}, ID: {self.node_id}, "
                 f"Current Pos: {self.current_position}, "
                 f"Statusword: 0x{self.statusword:04X}, "
                 f"Status: {self.status})")
-
         
 # gs_usb general also can import from gs_usb_structures.py
 GS_USB_ECHO_ID = 0
@@ -84,6 +84,7 @@ motors = [
     Motor('pitch', 6)
 ]
 
+threads = []
 
 movement_sequence= [
 ## Rotary motor movement        vert motor movement     hori motor movement         pitch motor movement
@@ -95,7 +96,7 @@ movement_sequence= [
 ]
 
 
-
+can_lock = threading.Lock()
 
 # below macro is for gs_usb 0.3.0 and above
 GS_CAN_MODE_NORMAL = 0
@@ -107,6 +108,104 @@ GS_CAN_MODE_HW_TIMESTAMP = (1 << 4)
 
 
 
+def active_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_event=None):
+    """
+    Actively polls positions via SDO and compares them.
+    """
+    v1 = next((m for m in motors_list if m.name == 'vert1'), None)
+    v2 = next((m for m in motors_list if m.name == 'vert2'), None)
+
+    if not v1 or not v2:
+        print("[Polling] Error: Vertical motors not found.")
+        return
+
+    # SDO Read Request for object 0x6064, sub-index 0x00 (Actual Position)
+    # 0x40 = Read Request (SDO download)
+    read_pos_data = bytes.fromhex("4064600000000000")
+
+    print(f"[Polling] Active sync monitoring started (Tolerance: {tolerance})")
+
+    while not stop_event.is_set():
+        try:
+            # Poll Vert 1
+            with can_lock:
+                dev.send(GsUsbFrame(can_id=0x600 + v1.node_id, data=read_pos_data))
+                res1 = GsUsbFrame()
+                if dev.read(res1, 50) and res1.can_id == (0x580 + v1.node_id):
+                    v1.current_position = int.from_bytes(res1.data[4:8], 'little', signed=True)
+                    v1.last_update_time = time.time()
+
+            # Poll Vert 2
+            with can_lock:
+                dev.send(GsUsbFrame(can_id=0x600 + v2.node_id, data=read_pos_data))
+                res2 = GsUsbFrame()
+                if dev.read(res2, 50) and res2.can_id == (0x580 + v2.node_id):
+                    v2.current_position = int.from_bytes(res2.data[4:8], 'little', signed=True)
+                    v2.last_update_time = time.time()
+
+            # Compare if both positions were updated recently
+            if v1.last_update_time and v2.last_update_time:
+                if abs(time.time() - v1.last_update_time) < 0.2 and abs(time.time() - v2.last_update_time) < 0.2:
+                    diff = abs(v1.current_position - v2.current_position)
+                    if diff > tolerance:
+                        print(f"\n[!!!] SYNC ERROR: V1={v1.current_position}, V2={v2.current_position}, Diff={diff}")
+                        emergency_stop_all(dev, motors_list)
+                        break
+
+            time.sleep(interval)
+
+        except Exception as e:
+            print(f"[Polling] Error: {e}")
+            time.sleep(interval)
+
+
+def vert_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_event=None):
+    """
+    Background monitor thread for vert1 and vert2 position sync.
+    If the two vertical motors drift apart by more than tolerance, send emergency stop.
+    """
+    v1 = next((m for m in motors_list if m.name == 'vert1'), None)
+    v2 = next((m for m in motors_list if m.name == 'vert2'), None)
+
+    if not v1 or not v2:
+        print("[Vert Sync] Error: Vertical motors not found.")
+        return
+
+    read_pos_data = bytes.fromhex("4064600000000000")
+
+    print(f"[Vert Sync] Background monitoring started (Tolerance: {tolerance})")
+
+    while not stop_event.is_set():
+        try:
+            with can_lock:
+                dev.send(GsUsbFrame(can_id=0x600 + v1.node_id, data=read_pos_data))
+                res1 = GsUsbFrame()
+                if dev.read(res1, 50) and res1.can_id == (0x580 + v1.node_id) and res1.data[1] == 0x64:
+                    v1.current_position = int.from_bytes(res1.data[4:8], 'little', signed=True)
+                    # print(f"[Vert Sync] Polled Vert1 Position: {v1.current_position}")
+                    v1.last_update_time = time.time()
+
+            with can_lock:
+                dev.send(GsUsbFrame(can_id=0x600 + v2.node_id, data=read_pos_data))
+                res2 = GsUsbFrame()
+                if dev.read(res2, 50) and res2.can_id == (0x580 + v2.node_id) and res2.data[1] == 0x64:
+                    v2.current_position = int.from_bytes(res2.data[4:8], 'little', signed=True)
+                    # print(f"[Vert Sync] Polled Vert2 Position: {v2.current_position}")
+                    v2.last_update_time = time.time()
+
+            if v1.last_update_time and v2.last_update_time:
+                if abs(time.time() - v1.last_update_time) < 0.2 and abs(time.time() - v2.last_update_time) < 0.2:
+                    diff = abs(v1.current_position - v2.current_position)
+                    if diff > tolerance:
+                        print(f"\n[!!!] VERTICAL SYNC ERROR: V1={v1.current_position}, V2={v2.current_position}, Diff={diff}")
+                        emergency_stop_all(dev, motors_list)
+                        break
+
+            time.sleep(interval)
+
+        except Exception as e:
+            print(f"[Vert Sync] Error: {e}")
+            time.sleep(interval)
 
 
 def scan_for_device(target_serial):
@@ -464,86 +563,86 @@ def disable_rotary_tpdo(dev):
 
 
 
-def tpdo_setup(motor_id, dev):
-    """
-    Configures TPDO1 to transmit Actual Position (0x6064) and Statusword (0x6041).
+# def tpdo_setup(motor_id, dev):
+#     """
+#     Configures TPDO1 to transmit Actual Position (0x6064) and Statusword (0x6041).
     
-    Args:
-        motor_id (int): CANopen Node ID of the motor
-        dev: USB-CAN device object
-    """
-    try:
-        # Set synchronous transmission type (0x01 = synchronous)
-        sync_tpdo_frame = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F00180201")
-        )
-        dev.send(sync_tpdo_frame)
-        time.sleep(waitTime)
+#     Args:
+#         motor_id (int): CANopen Node ID of the motor
+#         dev: USB-CAN device object
+#     """
+#     try:
+#         # Set synchronous transmission type (0x01 = synchronous)
+#         sync_tpdo_frame = GsUsbFrame(
+#             can_id=0x600 + motor_id,
+#             data=bytes.fromhex("2F00180201")
+#         )
+#         dev.send(sync_tpdo_frame)
+#         time.sleep(waitTime)
 
-        # Disable TPDO mapping temporarily
-        disable_mapping_frame = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F001A0000")  # Set number of mapped objects to 0
-        )
-        dev.send(disable_mapping_frame)
-        time.sleep(waitTime)
+#         # Disable TPDO mapping temporarily
+#         disable_mapping_frame = GsUsbFrame(
+#             can_id=0x600 + motor_id,
+#             data=bytes.fromhex("2F001A0000")  # Set number of mapped objects to 0
+#         )
+#         dev.send(disable_mapping_frame)
+#         time.sleep(waitTime)
 
-        # Map Actual Position (0x6064, 32-bit)
-        map_pos_frame1 = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("23001A0120006460")
-        )
-        dev.send(map_pos_frame1)
-        time.sleep(waitTime)
+#         # Map Actual Position (0x6064, 32-bit)
+#         map_pos_frame1 = GsUsbFrame(
+#             can_id=0x600 + motor_id,
+#             data=bytes.fromhex("23001A0120006460")
+#         )
+#         dev.send(map_pos_frame1)
+#         time.sleep(waitTime)
 
-        # Map Statusword (0x6041, 16-bit)
-        map_status_frame = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("23001A0210004160")  # 16-bit statusword
-        )
-        dev.send(map_status_frame)
-        time.sleep(waitTime)
+#         # Map Statusword (0x6041, 16-bit)
+#         map_status_frame = GsUsbFrame(
+#             can_id=0x600 + motor_id,
+#             data=bytes.fromhex("23001A0210004160")  # 16-bit statusword
+#         )
+#         dev.send(map_status_frame)
+#         time.sleep(waitTime)
 
-        # Enable TPDO mapping with 2 objects
-        enable_mapping_frame = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F001A0002")  # 2 mapped objects
-        )
-        dev.send(enable_mapping_frame)
-        time.sleep(waitTime)
+#         # Enable TPDO mapping with 2 objects
+#         enable_mapping_frame = GsUsbFrame(
+#             can_id=0x600 + motor_id,
+#             data=bytes.fromhex("2F001A0002")  # 2 mapped objects
+#         )
+#         dev.send(enable_mapping_frame)
+#         time.sleep(waitTime)
 
-        print(f"TPDO setup completed for Motor {motor_id}: Actual Position (0x6064) and Statusword (0x6041)")
-    except Exception as e:
-        print(f"Error setting up TPDO for Motor {motor_id}: {e}")
+#         print(f"TPDO setup completed for Motor {motor_id}: Actual Position (0x6064) and Statusword (0x6041)")
+#     except Exception as e:
+#         print(f"Error setting up TPDO for Motor {motor_id}: {e}")
 
 
 
-def tpdo_listener(dev, stop_event, motors_list):
-    """
-    Listens for TPDO messages and updates motor positions and statuswords.
+# def tpdo_listener(dev, stop_event, motors_list):
+#     """
+#     Listens for TPDO messages and updates motor positions and statuswords.
     
-    Args:
-        dev: USB-CAN device object
-        stop_event: Threading event to stop the listener
-        motors_list (list): List of Motor objects to update
-    """
-    iframe = GsUsbFrame()
-    while not stop_event.is_set():
-        try:
-            if dev.read(iframe, 100):  # 100ms timeout
-                if 0x180 <= iframe.can_id <= 0x1FF:  # TPDO1 range
-                    node_id = iframe.can_id - 0x180
-                    for motor in motors_list:
-                        if motor.node_id == node_id and len(iframe.data) >= 6:
-                            current_pos = int.from_bytes(iframe.data[0:4], 'little', signed=True)
-                            statusword = int.from_bytes(iframe.data[4:6], 'little', signed=False)
-                            motor.update_position_and_status(current_pos, statusword)
-                            # Optional: Print for debugging
-                            # print(f"Motor {motor.name}: Pos={current_pos}, Status=0x{statusword:04X}")
-        except Exception as e:
-            print(f"TPDO listener error: {e}")
-            time.sleep(0.1)
+#     Args:
+#         dev: USB-CAN device object
+#         stop_event: Threading event to stop the listener
+#         motors_list (list): List of Motor objects to update
+#     """
+#     iframe = GsUsbFrame()
+#     while not stop_event.is_set():
+#         try:
+#             if dev.read(iframe, 100):  # 100ms timeout
+#                 if 0x180 <= iframe.can_id <= 0x1FF:  # TPDO1 range
+#                     node_id = iframe.can_id - 0x180
+#                     for motor in motors_list:
+#                         if motor.node_id == node_id and len(iframe.data) >= 6:
+#                             current_pos = int.from_bytes(iframe.data[0:4], 'little', signed=True)
+#                             statusword = int.from_bytes(iframe.data[4:6], 'little', signed=False)
+#                             motor.update_position_and_status(current_pos, statusword)
+#                             # Optional: Print for debugging
+#                             # print(f"Motor {motor.name}: Pos={current_pos}, Status=0x{statusword:04X}")
+#         except Exception as e:
+#             print(f"TPDO listener error: {e}")
+#             time.sleep(0.1)
 
 def zeroing_motor(motor_id, dev, motors_list, timeout=30.0):
     """
@@ -593,16 +692,19 @@ def zeroing_motor(motor_id, dev, motors_list, timeout=30.0):
         print(f"Motor {motor_id} set to CCW mode")
         time.sleep(waitTime)
 
-        zeroing_acc_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B9A6000E8030000"))
-        dev.send(zeroing_acc_frame)
-        print(f"Motor {motor_id} set zeroing acceleration")
-        time.sleep(waitTime)
+
 
         if(motor_id == pitch):
             zeroing_speed_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2399600101000000"))
+            zeroing_acc_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B9A600001000000"))
         else:
             zeroing_speed_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("239960010A000000"))
+
+            zeroing_acc_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B9A6000E8030000"))
+            print(f"Motor {motor_id} set zeroing acceleration")
+            time.sleep(waitTime)
         
+        dev.send(zeroing_acc_frame)
         dev.send(zeroing_speed_frame)
         print(f"Motor {motor_id} set zeroing speed")
         time.sleep(waitTime)
@@ -968,14 +1070,15 @@ def launchMoveCommand(dev, motors_list):
 
     # Launch move commands for all relevant motors
     try:
-        for motor in motors_to_move:
-            motor_launch_frame = GsUsbFrame(
-                can_id=0x600 + motor.node_id, 
-                data=bytes.fromhex("2B4060005F000000")  # Controlword 0x001F: Start movement
-            )
-            dev.send(motor_launch_frame)
-            print(f"Motor {motor.node_id} ({motor.name}) move command launched")
-            motor.update_moveCommand(False)  # Reset moveCommand flag
+        with can_lock:
+            for motor in motors_to_move:
+                motor_launch_frame = GsUsbFrame(
+                    can_id=0x600 + motor.node_id, 
+                    data=bytes.fromhex("2B4060005F000000")  # Controlword 0x001F: Start movement
+                )
+                dev.send(motor_launch_frame)
+                print(f"Motor {motor.node_id} ({motor.name}) move command launched")
+                motor.update_moveCommand(False)  # Reset moveCommand flag
     except Exception as e:
         print(f"Error launching move commands: {e}")
         return
@@ -1141,26 +1244,26 @@ def rotateto1000(dev):
 
     
     rotary_travel = 20.0    # degrees (positive/negative)
-    pitch_travel = 75.5
+    pitch_travel = 84.0
     vert_travel = 15
     hori_travel   = 6
 
     motors_init_brakeRelease(dev, motors)
-    setUpPitchMotorMove(dev, pitch, pitch_travel, 1, 100, 100) 
+    setUpPitchMotorMove(dev, pitch, pitch_travel, 1, 1, 1) 
     launchMoveCommand(dev, motors)
     time.sleep(0.5)  # Wait for pitch motor to start moving
 
-    setUpVertMotorMove(dev, vert1, vert_travel, 20, 100, 100)
-    setUpVertMotorMove(dev, vert2, vert_travel, 20, 100, 100)
+    setUpVertMotorMove(dev, vert1, vert_travel, 10, 100, 100)
+    setUpVertMotorMove(dev, vert2, vert_travel, 10, 100, 100)
     launchMoveCommand(dev, motors)
     time.sleep(0.5)  # Wait for vertical motors to start moving
 
-    setUpHoriMotorMove(dev, hori1, hori_travel, 20, 100, 100)
-    setUpHoriMotorMove(dev, hori2, hori_travel, 20, 100, 100)
+    setUpHoriMotorMove(dev, hori1, hori_travel, 10, 100, 100)
+    setUpHoriMotorMove(dev, hori2, hori_travel, 10, 100, 100)
     launchMoveCommand(dev, motors)
     time.sleep(0.5)  # Wait for horizontal motors to start moving
 
-    setUpRotaryMotorMove(dev, rotary, rotary_travel, 150, 280, 280) 
+    setUpRotaryMotorMove(dev, rotary, rotary_travel, 50, 280, 280) 
     launchMoveCommand(dev, motors)
 
 def autoZeroing(dev,motors):
@@ -1169,6 +1272,7 @@ def autoZeroing(dev,motors):
     start_zeroing_frame = GsUsbFrame(can_id=0x600 + pitch, data=bytes.fromhex("2B4060001F000000"))
     dev.send(start_zeroing_frame)
     print(f"Pitch Motor  zeroing started")
+    time.sleep(7)  # Wait for pitch motor to start zeroing
 
     ## Zeroing vert motors
     zeroing_motor(vert1, dev, motors)
@@ -1215,7 +1319,8 @@ def main():
     8. Slow Shut Down
     9. Auto Mag Field Caliration
     10. Auto Zeroing
-    11. Rotate to 1000                           
+    11. Rotate to 1000
+    12. Start pos listener for Vert1,2                           
     q. Quit
     Enter your choice:\n\n""").strip()
         
@@ -1259,6 +1364,11 @@ def main():
                 data = nmt_input+"00"
                 data = bytes.fromhex(data)  # Convert to bytes: b"\x01\x00"
                 nmtAll2Op_frame = GsUsbFrame(can_id=0x000, data=data)
+                if(nmt_input == "01"):
+                    ret = input("Did you restart the motor power after e-stop? (y/n): ").strip().lower()
+                    if ret != "y":
+                        print("Please restart the motor power before sending the stop command.")
+                        continue
                 dev.send(nmtAll2Op_frame)
                 vertPreMove(dev, motors)
 
@@ -1397,7 +1507,7 @@ def main():
 
                 global rotaryDisplacement, vertDisplacement, horiDisplacement, pitchAngle, rollAngle , yawAngle
                 # Predefined travel amounts
-                rotary_travel = 5.0    # degrees (positive/negative)
+                rotary_travel = 60.0    # degrees (positive/negative)
                 vert_travel = 5      # cm (positive/negative, for vert1 and vert2)
                 hori_travel = 3      # cm (positive/negative, for hori1 and hori2)
                 pitch_travel = 20.0     # degrees (positive/negative)
@@ -1676,6 +1786,23 @@ def main():
                     continue
                 rotateto1000(dev)
 
+            elif user_input == "12":
+                        if dev is None:
+                            print("Please scan for device first.")
+                            continue
+                        
+                        # Reset stop event for a new run
+                        stop_event.clear()
+                        
+                        # Start the background vertical sync monitor thread
+                        t_poll = threading.Thread(
+                            target=vert_sync_monitoring,
+                            args=(dev, motors, 2000, 0.1, stop_event)
+                        )
+                        t_poll.daemon = True
+                        t_poll.start()
+                        print("Vertical sync monitoring is now RUNNING in the background.")
+
 
 
             elif user_input.lower() == "q":
@@ -1720,6 +1847,11 @@ def emergency_stop_all(dev, motors_list):
     """Sends Quick Stop and Switch On Disabled frames to all motors."""
     if dev is None:
         return
+    
+    data = "8200"
+    data = bytes.fromhex(data)  # Convert to bytes: b"\x01\x00"
+    nmtAll2Reset_frame = GsUsbFrame(can_id=0x000, data=data)
+    dev.send(nmtAll2Reset_frame)
         
     print("\n[!] Keyboard Interrupt: Sending Emergency Stop to all motors...")
     for motor in motors_list:
@@ -1731,15 +1863,31 @@ def emergency_stop_all(dev, motors_list):
         # 2. Send Switch On Disabled (Controlword 0x0006)
         reset_frame = GsUsbFrame(
             can_id=0x600 + motor.node_id,
-            data=bytes.fromhex("2B40600006000000")
+            data=bytes.fromhex("2B40600000000000")
+        )
+                # 2. Send Switch On Disabled (Controlword 0x0006)
+        clear_frame = GsUsbFrame(
+            can_id=0x600 + motor.node_id,
+            data=bytes.fromhex("2B4060006F020000")
         )
         try:
             dev.send(quick_stop_frame)
-            time.sleep(0.01) # Small delay to ensure bus doesn't saturate
+            time.sleep(0.001) # Small delay to ensure bus doesn't saturate
             dev.send(reset_frame)
+            dev.send(clear_frame)
             print(f"Emergency stop sent to Motor {motor.node_id} ({motor.name})")
         except Exception as e:
             print(f"Failed to send e-stop to Motor {motor.node_id}: {e}")
+    data = "8200"
+    data = bytes.fromhex(data)  # Convert to bytes: b"\x01\x00"
+    nmtAll2Reset_frame = GsUsbFrame(can_id=0x000, data=data)
+    dev.send(nmtAll2Reset_frame)
+    time.sleep(3)
+
+    ## print warning to cut off power to motor to clear pos memory
+    while True:
+        print("Waiting for user to restart motor power...")
+        time.sleep(0.3)
 if __name__ == "__main__":
     try:
         main()
