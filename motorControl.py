@@ -108,60 +108,13 @@ GS_CAN_MODE_HW_TIMESTAMP = (1 << 4)
 
 
 
-def active_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_event=None):
-    """
-    Actively polls positions via SDO and compares them.
-    """
-    v1 = next((m for m in motors_list if m.name == 'vert1'), None)
-    v2 = next((m for m in motors_list if m.name == 'vert2'), None)
 
-    if not v1 or not v2:
-        print("[Polling] Error: Vertical motors not found.")
-        return
-
-    # SDO Read Request for object 0x6064, sub-index 0x00 (Actual Position)
-    # 0x40 = Read Request (SDO download)
-    read_pos_data = bytes.fromhex("4064600000000000")
-
-    print(f"[Polling] Active sync monitoring started (Tolerance: {tolerance})")
-
-    while not stop_event.is_set():
-        try:
-            # Poll Vert 1
-            with can_lock:
-                dev.send(GsUsbFrame(can_id=0x600 + v1.node_id, data=read_pos_data))
-                res1 = GsUsbFrame()
-                if dev.read(res1, 50) and res1.can_id == (0x580 + v1.node_id):
-                    v1.current_position = int.from_bytes(res1.data[4:8], 'little', signed=True)
-                    v1.last_update_time = time.time()
-
-            # Poll Vert 2
-            with can_lock:
-                dev.send(GsUsbFrame(can_id=0x600 + v2.node_id, data=read_pos_data))
-                res2 = GsUsbFrame()
-                if dev.read(res2, 50) and res2.can_id == (0x580 + v2.node_id):
-                    v2.current_position = int.from_bytes(res2.data[4:8], 'little', signed=True)
-                    v2.last_update_time = time.time()
-
-            # Compare if both positions were updated recently
-            if v1.last_update_time and v2.last_update_time:
-                if abs(time.time() - v1.last_update_time) < 0.2 and abs(time.time() - v2.last_update_time) < 0.2:
-                    diff = abs(v1.current_position - v2.current_position)
-                    if diff > tolerance:
-                        print(f"\n[!!!] SYNC ERROR: V1={v1.current_position}, V2={v2.current_position}, Diff={diff}")
-                        emergency_stop_all(dev, motors_list)
-                        break
-
-            time.sleep(interval)
-
-        except Exception as e:
-            print(f"[Polling] Error: {e}")
-            time.sleep(interval)
 
 
 def vert_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_event=None):
     """
     Background monitor thread for vert1 and vert2 position sync.
+    Monitors position updates from TPDO messages and checks sync.
     If the two vertical motors drift apart by more than tolerance, send emergency stop.
     """
     v1 = next((m for m in motors_list if m.name == 'vert1'), None)
@@ -171,41 +124,28 @@ def vert_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_e
         print("[Vert Sync] Error: Vertical motors not found.")
         return
 
-    read_pos_data = bytes.fromhex("4064600000000000")
-
     print(f"[Vert Sync] Background monitoring started (Tolerance: {tolerance})")
 
     while not stop_event.is_set():
         try:
-            with can_lock:
-                dev.send(GsUsbFrame(can_id=0x600 + v1.node_id, data=read_pos_data))
-                res1 = GsUsbFrame()
-                if dev.read(res1, 50) and res1.can_id == (0x580 + v1.node_id) and res1.data[1] == 0x64:
-                    v1.current_position = int.from_bytes(res1.data[4:8], 'little', signed=True)
-                    # print(f"[Vert Sync] Polled Vert1 Position: {v1.current_position}")
-                    v1.last_update_time = time.time()
-
-            with can_lock:
-                dev.send(GsUsbFrame(can_id=0x600 + v2.node_id, data=read_pos_data))
-                res2 = GsUsbFrame()
-                if dev.read(res2, 50) and res2.can_id == (0x580 + v2.node_id) and res2.data[1] == 0x64:
-                    v2.current_position = int.from_bytes(res2.data[4:8], 'little', signed=True)
-                    # print(f"[Vert Sync] Polled Vert2 Position: {v2.current_position}")
-                    v2.last_update_time = time.time()
-
+            # Check sync if both motors have recent updates
             if v1.last_update_time and v2.last_update_time:
-                if abs(time.time() - v1.last_update_time) < 0.2 and abs(time.time() - v2.last_update_time) < 0.2:
+                time_diff = abs(time.time() - v1.last_update_time)
+                time_diff2 = abs(time.time() - v2.last_update_time)
+                if time_diff < 0.5 and time_diff2 < 0.5:  # Recent updates
                     diff = abs(v1.current_position - v2.current_position)
                     if diff > tolerance:
                         print(f"\n[!!!] VERTICAL SYNC ERROR: V1={v1.current_position}, V2={v2.current_position}, Diff={diff}")
                         emergency_stop_all(dev, motors_list)
                         break
 
-            time.sleep(interval)
+            time.sleep(interval)  # Check at specified interval
 
         except Exception as e:
-            print(f"[Vert Sync] Error: {e}")
-            time.sleep(interval)
+            print(f"[Vert Sync Monitor] Error: {e}")
+            time.sleep(0.01)
+
+    print("[Vert Sync] Monitoring stopped.")
 
 
 def scan_for_device(target_serial):
@@ -561,60 +501,70 @@ def disable_rotary_tpdo(dev):
         dev.send(disable_tpdo1_frame)
         time.sleep(waitTime)
 
+def disable_stepper_28XTpdo(dev):
+    for motor_id in [vert1, vert2, hori1, hori2, pitch]:
+        # Disable TPDO1
+        disable_tpdo1_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("2301180183020080")  # Set number of mapped objects to 0
+        )
+        dev.send(disable_tpdo1_frame)
+        time.sleep(waitTime)
 
 
-# def tpdo_setup(motor_id, dev):
-#     """
-#     Configures TPDO1 to transmit Actual Position (0x6064) and Statusword (0x6041).
+
+def tpdo_setup(motor_id, dev):
+    """
+    Configures TPDO1 to transmit Actual Position (0x6064) and Statusword (0x6041).
     
-#     Args:
-#         motor_id (int): CANopen Node ID of the motor
-#         dev: USB-CAN device object
-#     """
-#     try:
-#         # Set synchronous transmission type (0x01 = synchronous)
-#         sync_tpdo_frame = GsUsbFrame(
-#             can_id=0x600 + motor_id,
-#             data=bytes.fromhex("2F00180201")
-#         )
-#         dev.send(sync_tpdo_frame)
-#         time.sleep(waitTime)
+    Args:
+        motor_id (int): CANopen Node ID of the motor
+        dev: USB-CAN device object
+    """
+    try:
+        # Set synchronous transmission type (0x01 = synchronous)
+        sync_tpdo_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("2F00180201")
+        )
+        dev.send(sync_tpdo_frame)
+        time.sleep(waitTime)
 
-#         # Disable TPDO mapping temporarily
-#         disable_mapping_frame = GsUsbFrame(
-#             can_id=0x600 + motor_id,
-#             data=bytes.fromhex("2F001A0000")  # Set number of mapped objects to 0
-#         )
-#         dev.send(disable_mapping_frame)
-#         time.sleep(waitTime)
+        # Disable TPDO mapping temporarily
+        disable_mapping_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("2F001A0000")  # Set number of mapped objects to 0
+        )
+        dev.send(disable_mapping_frame)
+        time.sleep(waitTime)
 
-#         # Map Actual Position (0x6064, 32-bit)
-#         map_pos_frame1 = GsUsbFrame(
-#             can_id=0x600 + motor_id,
-#             data=bytes.fromhex("23001A0120006460")
-#         )
-#         dev.send(map_pos_frame1)
-#         time.sleep(waitTime)
+        # Map Actual Position (0x6064, 32-bit)
+        map_pos_frame1 = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("23001A0120006460")
+        )
+        dev.send(map_pos_frame1)
+        time.sleep(waitTime)
 
-#         # Map Statusword (0x6041, 16-bit)
-#         map_status_frame = GsUsbFrame(
-#             can_id=0x600 + motor_id,
-#             data=bytes.fromhex("23001A0210004160")  # 16-bit statusword
-#         )
-#         dev.send(map_status_frame)
-#         time.sleep(waitTime)
+        # Map Statusword (0x6041, 16-bit)
+        map_status_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("23001A0210004160")  # 16-bit statusword
+        )
+        dev.send(map_status_frame)
+        time.sleep(waitTime)
 
-#         # Enable TPDO mapping with 2 objects
-#         enable_mapping_frame = GsUsbFrame(
-#             can_id=0x600 + motor_id,
-#             data=bytes.fromhex("2F001A0002")  # 2 mapped objects
-#         )
-#         dev.send(enable_mapping_frame)
-#         time.sleep(waitTime)
+        # Enable TPDO mapping with 2 objects
+        enable_mapping_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("2F001A0002")  # 2 mapped objects
+        )
+        dev.send(enable_mapping_frame)
+        time.sleep(waitTime)
 
-#         print(f"TPDO setup completed for Motor {motor_id}: Actual Position (0x6064) and Statusword (0x6041)")
-#     except Exception as e:
-#         print(f"Error setting up TPDO for Motor {motor_id}: {e}")
+        print(f"TPDO setup completed for Motor {motor_id}: Actual Position (0x6064) and Statusword (0x6041)")
+    except Exception as e:
+        print(f"Error setting up TPDO for Motor {motor_id}: {e}")
 
 
 
@@ -1110,8 +1060,8 @@ def decimal_to_lsb_left_hex(decimal_num):
 
 
 
-def can_reader_thread(dev, stop_event):
-    """Background thread to read CAN packets and detect SDO write error frames."""
+def can_reader_thread(dev, stop_event, motors_list):
+    """Background thread to read CAN packets, detect SDO write error frames, and handle TPDO messages."""
     debug_mode = False  # Set to True for verbose logging of all frames
 
     while not stop_event.is_set():
@@ -1129,8 +1079,22 @@ def can_reader_thread(dev, stop_event):
                     print(f"Debug: Unexpected iframe.data type: {type(iframe.data)}, CAN ID=0x{iframe.can_id:03X}")
                     continue  # Skip this frame
 
+                # Handle TPDO messages (0x180 to 0x1FF for TPDO1)
+                if 0x180 <= iframe.can_id <= 0x1FF:  # TPDO1 range
+                    node_id = iframe.can_id - 0x180
+                    for motor in motors_list:
+                        if motor.node_id == node_id and len(data_bytes) >= 6:
+                            current_pos = int.from_bytes(data_bytes[2:6], 'little', signed=True)
+                            statusword = int.from_bytes(data_bytes[0:2], 'little', signed=False)
+                            motor.update_position_and_status(current_pos, statusword)
+                            motor.last_update_time = time.time()
+                            print(f"Motor {motor.name}: Pos={current_pos}")
+
+                            if debug_mode:
+                                print(f"Motor {motor.name}: Pos={current_pos}, Status=0x{statusword:04X}")
+
                 # Check for SDO server response range (0x580 to 0x5FF)
-                if 0x580 <= iframe.can_id <= 0x5FF and len(data_bytes) >= 1:
+                elif 0x580 <= iframe.can_id <= 0x5FF and len(data_bytes) >= 1:
                     if data_bytes[0] == 0x80:  # First byte is 0x80 (Abort SDO Transfer)
                         node_id = iframe.can_id - 0x580
                         data_str = data_bytes.hex().upper()
@@ -1342,7 +1306,7 @@ def main():
         Reader Thread Started
     ###################################
                     """)
-                    reader_thread = threading.Thread(target=can_reader_thread, args=(dev, stop_event))
+                    reader_thread = threading.Thread(target=can_reader_thread, args=(dev, stop_event, motors))
                     reader_thread.daemon = True
                     reader_thread.start()
                     print("Reader thread started.")
@@ -1520,7 +1484,7 @@ def main():
                 vert_travel_super_fine = 0.1  # cm for super fine control
 
                 # Fixed speed, acceleration, deceleration
-                speed = 100  # RPM or steps/s (adjust as needed)
+                speed = 50  # RPM or steps/s (adjust as needed)
                 acc = 100   # RPM/s or steps/s²
                 dec = 100   # RPM/s or steps/s²
 
@@ -1787,27 +1751,50 @@ def main():
                 rotateto1000(dev)
 
             elif user_input == "12":
-                        if dev is None:
-                            print("Please scan for device first.")
-                            continue
-                        
-                        # Reset stop event for a new run
-                        stop_event.clear()
-                        
-                        # Start the background vertical sync monitor thread
-                        t_poll = threading.Thread(
-                            target=vert_sync_monitoring,
-                            args=(dev, motors, 2000, 0.1, stop_event)
-                        )
-                        t_poll.daemon = True
-                        t_poll.start()
-                        print("Vertical sync monitoring is now RUNNING in the background.")
+                if dev is None:
+                    print("Please scan for device first.")
+                    continue
+                disable_stepper_28XTpdo(dev)
+                
+                # Set up TPDO for all motors
+                # tpdo_setup(vert1, dev)
+                # tpdo_setup(vert2, dev)
+                
+                # Start SYNC master thread
+                sync_stop_event = threading.Event()
+                sync_thread = threading.Thread(target=sync_master, args=(dev, sync_stop_event, 0.01))
+                sync_thread.daemon = True
+                sync_thread.start()
+                print("SYNC master started.")
+                
+                # Start the background vertical sync monitor thread
+                vert_sync_stop_event = threading.Event()
+                t_poll = threading.Thread(
+                    target=vert_sync_monitoring,
+                    args=(dev, motors, 1000, 0.001, vert_sync_stop_event)
+                )
+                t_poll.daemon = True
+                t_poll.start()
+                print("Vertical sync monitoring is now RUNNING in the background.")
+                
+                # Store the stop events for cleanup
+                # threads.append(('sync', sync_stop_event))
+                # threads.append(('vert_sync', vert_sync_stop_event))
+
+            elif user_input == "13":
+                disable_stepper_28XTpdo(dev)
+
+
 
 
 
             elif user_input.lower() == "q":
-                # Stop the listener thread before quitting
+                # Stop all threads before quitting
                 stop_event.set()
+                for thread_name, thread_stop_event in threads:
+                    thread_stop_event.set()
+                    print(f"Stopping {thread_name} thread...")
+                
                 for motor in motors:
                     quick_stop_frame = GsUsbFrame(
                         can_id=0x600 + motor.node_id,
@@ -1840,7 +1827,9 @@ def main():
         emergency_stop_all(dev, motors)
     finally:
         if stop_event:
-            stop_event.set()  # Ensure the reader thread is stoppedhhh
+            stop_event.set()  # Ensure the reader thread is stopped
+        for thread_name, thread_stop_event in threads:
+            thread_stop_event.set()
 
             
 def emergency_stop_all(dev, motors_list):
