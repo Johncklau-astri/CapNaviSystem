@@ -20,11 +20,15 @@ class Motor:
         self.name = name
         self.node_id = node_id
         self.current_position = 0
+        self.last_position = 0
+        self.current_position_real_unit = 0.0
+        self.last_position_real_unit = 0.0
         self.statusword = 0
         self.status = 'Uninitialized'
         self.last_update_time = None
         self.operational = False
         self.moveCommand = False
+        self.is_stopped = False
 
     def update_moveCommand(self, hasMoveCommand):
         self.moveCommand = hasMoveCommand
@@ -34,6 +38,33 @@ class Motor:
         self.current_position = position
         self.statusword = statusword
         self.last_update_time = time.time()
+
+
+        if self.name == 'rotary':
+            raw_unit = self.current_position / (12.9704 * 10 * 10)
+            # print(f"raw unit type: {type(raw_unit)}")
+            self.current_position_real_unit = round(raw_unit, 2)
+            print(f"Rotary current_position_real_unit: {self.current_position_real_unit} last pos: {self.last_position_real_unit}")
+            
+        if(self.name == 'vert1' or self.name == 'vert2'):
+            self.current_position_real_unit = self.current_position / 4000
+        
+        if(self.name == 'hori1' or self.name == 'hori2'):
+            self.current_position_real_unit = self.current_position / 8000
+
+        if(self.name == 'pitch'):
+            self.current_position_real_unit = self.current_position / (2.04 * (4000/360))
+
+        self.is_stopped = self.current_position_real_unit == self.last_position_real_unit
+
+        self.last_position_real_unit = self.current_position_real_unit
+
+    
+
+
+
+
+
     
     def __repr__(self):
         return (f"Motor({self.name}, ID: {self.node_id}, "
@@ -86,13 +117,125 @@ motors = [
 
 threads = []
 
+pitch_up = [0,0,0,40]
+pitch_down = [0,0,0,-40]
+half_pitch_up = [0,0,0,20]
+half_pitch_down = [0,0,0,-20]
+
+
+
 movement_sequence= [
 ## Rotary motor movement        vert motor movement     hori motor movement         pitch motor movement
-((70,1200,300),                   (10,20,50),              (5,20,50),                  (200,5,40)),   # 0
-((-70,1200,300),                  (-10,20,50),            (-5,20,50),                  (-200,5,40)),   # 1
-((70,1200,300),                   (10,20,50),              (5,20,50),                   (200,5,40))   # 2
+[       0,         5,     0,   0                ],   # 0
+## Move to 1st layer starting position
+[       -140,         0,     0,   0                ],   # 0
+[       0,         0,     3,   0                ],   # 0
 
+half_pitch_down,
+pitch_up,
+pitch_down,
+[       20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     -3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
 
+pitch_up,
+pitch_down,
+[       20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+## 1st layer finished, move to 2nd layer starting position
+[       0,         -5,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+
+## start 2nd layer scanning
+[       -20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     -3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+## 2nd layer finished, move to 3rd layer starting position
+[       0,         -5,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+##starting 3rd layer scan
+[       20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     -3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     3,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down
 ]
 
 
@@ -134,7 +277,7 @@ def vert_sync_monitoring(dev, motors_list, tolerance=2000, interval=0.05, stop_e
                 time_diff2 = abs(time.time() - v2.last_update_time)
                 if time_diff < 0.5 and time_diff2 < 0.5:  # Recent updates
                     diff = abs(v1.current_position - v2.current_position)
-                    if diff > tolerance:
+                    if diff > tolerance and v1.current_position != 0 and v2.current_position != 0:  # Avoid false trigger at zeroing
                         print(f"\n[!!!] VERTICAL SYNC ERROR: V1={v1.current_position}, V2={v2.current_position}, Diff={diff}")
                         emergency_stop_all(dev, motors_list)
                         break
@@ -511,6 +654,7 @@ def disable_stepper_28XTpdo(dev):
         dev.send(disable_tpdo1_frame)
         time.sleep(waitTime)
 
+        
 
 
 def tpdo_setup(motor_id, dev):
@@ -522,21 +666,30 @@ def tpdo_setup(motor_id, dev):
         dev: USB-CAN device object
     """
     try:
+        deactivate_tpdo_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+             data=bytes.fromhex("2300180181010080")  # Set number of mapped objects to 0
+        )
+        dev.send(deactivate_tpdo_frame)
+        time.sleep(waitTime)
+
+        deactivate_tpdoNumber_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+             data=bytes.fromhex("2F001A0000000000")  # Set number of mapped objects to 0
+        )
+        dev.send(deactivate_tpdoNumber_frame)
+        time.sleep(waitTime)
+
+
         # Set synchronous transmission type (0x01 = synchronous)
         sync_tpdo_frame = GsUsbFrame(
             can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F00180201")
+            data=bytes.fromhex("2F00180201000000")
         )
         dev.send(sync_tpdo_frame)
         time.sleep(waitTime)
 
-        # Disable TPDO mapping temporarily
-        disable_mapping_frame = GsUsbFrame(
-            can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F001A0000")  # Set number of mapped objects to 0
-        )
-        dev.send(disable_mapping_frame)
-        time.sleep(waitTime)
+
 
         # Map Actual Position (0x6064, 32-bit)
         map_pos_frame1 = GsUsbFrame(
@@ -557,9 +710,17 @@ def tpdo_setup(motor_id, dev):
         # Enable TPDO mapping with 2 objects
         enable_mapping_frame = GsUsbFrame(
             can_id=0x600 + motor_id,
-            data=bytes.fromhex("2F001A0002")  # 2 mapped objects
+            data=bytes.fromhex("2F001A0002000000")  # 2 mapped objects
         )
         dev.send(enable_mapping_frame)
+        time.sleep(waitTime)
+
+                # Enable TPDO mapping with 2 objects
+        enable_tpdo_frame = GsUsbFrame(
+            can_id=0x600 + motor_id,
+            data=bytes.fromhex("2300180181010000")  # 2 mapped objects
+        )
+        dev.send(enable_tpdo_frame)
         time.sleep(waitTime)
 
         print(f"TPDO setup completed for Motor {motor_id}: Actual Position (0x6064) and Statusword (0x6041)")
@@ -645,18 +806,17 @@ def zeroing_motor(motor_id, dev, motors_list, timeout=30.0):
 
 
         if(motor_id == pitch):
-            zeroing_speed_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2399600101000000"))
+            zeroing_speed_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2399600102000000"))
             zeroing_acc_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B9A600001000000"))
         else:
             zeroing_speed_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("239960010A000000"))
 
             zeroing_acc_frame = GsUsbFrame(can_id=0x600 + motor_id, data=bytes.fromhex("2B9A6000E8030000"))
-            print(f"Motor {motor_id} set zeroing acceleration")
-            time.sleep(waitTime)
         
         dev.send(zeroing_acc_frame)
+        time.sleep(waitTime)
         dev.send(zeroing_speed_frame)
-        print(f"Motor {motor_id} set zeroing speed")
+        print(f"Motor {motor_id} set zeroing acceleration")
         time.sleep(waitTime)
 
 
@@ -1080,7 +1240,7 @@ def can_reader_thread(dev, stop_event, motors_list):
                     continue  # Skip this frame
 
                 # Handle TPDO messages (0x180 to 0x1FF for TPDO1)
-                if 0x180 <= iframe.can_id <= 0x1FF:  # TPDO1 range
+                if 0x180 <= iframe.can_id <= 0x1FF and iframe.can_id != 0x181:  # TPDO1 range
                     node_id = iframe.can_id - 0x180
                     for motor in motors_list:
                         if motor.node_id == node_id and len(data_bytes) >= 6:
@@ -1088,11 +1248,19 @@ def can_reader_thread(dev, stop_event, motors_list):
                             statusword = int.from_bytes(data_bytes[0:2], 'little', signed=False)
                             motor.update_position_and_status(current_pos, statusword)
                             motor.last_update_time = time.time()
-                            print(f"Motor {motor.name}: Pos={current_pos}")
+                            # print(f"Motor {motor.name}: Pos={current_pos}")
 
-                            if debug_mode:
-                                print(f"Motor {motor.name}: Pos={current_pos}, Status=0x{statusword:04X}")
-
+                            # if debug_mode:
+                            #     print(f"Motor {motor.name}: Pos={current_pos}, Status=0x{statusword:04X}")
+                
+                elif 0x281 == iframe.can_id:  # Example: Rotary motor Position TPDO
+                    current_pos = int.from_bytes(data_bytes[0:4], 'little', signed=True)
+                    print(f"frame data: {data_bytes.hex().upper()}")
+                    motors_list[0].update_position_and_status(current_pos,0)
+                    motors_list[0].last_update_time = time.time()
+                    # print(f"Rotary Motor {motors_list[0].name}: Pos={current_pos}")
+                   
+ 
                 # Check for SDO server response range (0x580 to 0x5FF)
                 elif 0x580 <= iframe.can_id <= 0x5FF and len(data_bytes) >= 1:
                     if data_bytes[0] == 0x80:  # First byte is 0x80 (Abort SDO Transfer)
@@ -1164,6 +1332,23 @@ def sync_master(dev, stop_event, interval=0.1):
 
     print("SYNC master stopped.")
 
+
+def position_printer_thread(motors_list, stop_event, interval=1.0):
+    """Print the current position of all motors in one line repeatedly."""
+    while not stop_event.is_set():
+        try:
+            pos_line = " | ".join(f"{motor.name}:{motor.current_position_real_unit:.6f}" for motor in motors_list)
+            print(f"[Motor Positions] {pos_line}")
+            last_pos_line = " | ".join(f"{motor.name}:{motor.last_position_real_unit:.6f}" for motor in motors_list)
+            print(f"[Last Positions] {last_pos_line}")
+            is_stopped = " | ".join(f"{motor.name}:{'Stopped' if motor.is_stopped else 'Moving'}" for motor in motors_list)
+            # print(f"[Motor Status] {is_stopped}")
+            time.sleep(interval)
+        except Exception as e:
+            print(f"Position printer error: {e}")
+            time.sleep(0.1)
+
+
 def slowShutDown(dev,motors_list):
     for motor in motors_list:
         motor_id = motor.node_id
@@ -1208,14 +1393,14 @@ def rotateto1000(dev):
 
     
     rotary_travel = 20.0    # degrees (positive/negative)
-    pitch_travel = 84.0
+    pitch_travel = 111.0
     vert_travel = 15
     hori_travel   = 6
 
     motors_init_brakeRelease(dev, motors)
     setUpPitchMotorMove(dev, pitch, pitch_travel, 1, 1, 1) 
     launchMoveCommand(dev, motors)
-    time.sleep(0.5)  # Wait for pitch motor to start moving
+    time.sleep(3)  # Wait for pitch motor to start moving
 
     setUpVertMotorMove(dev, vert1, vert_travel, 10, 100, 100)
     setUpVertMotorMove(dev, vert2, vert_travel, 10, 100, 100)
@@ -1231,12 +1416,19 @@ def rotateto1000(dev):
     launchMoveCommand(dev, motors)
 
 def autoZeroing(dev,motors):
-    ## Zeroing pitch motor
-    zeroing_motor(pitch, dev, motors)
-    start_zeroing_frame = GsUsbFrame(can_id=0x600 + pitch, data=bytes.fromhex("2B4060001F000000"))
+
+    ## Zeroing hori motors
+    zeroing_motor(hori1, dev, motors)
+    zeroing_motor(hori2, dev, motors)
+    start_zeroing_frame = GsUsbFrame(can_id=0x600 + hori1, data=bytes.fromhex("2B4060001F000000"))
+    start_zeroing_frame1 = GsUsbFrame(can_id=0x600 + hori2, data=bytes.fromhex("2B4060001F000000"))
     dev.send(start_zeroing_frame)
-    print(f"Pitch Motor  zeroing started")
-    time.sleep(7)  # Wait for pitch motor to start zeroing
+    dev.send(start_zeroing_frame1)
+    print(f"hori Motor  zeroing started")
+    time.sleep(10)  # Wait for pitch motor to start zeroing
+
+
+
 
     ## Zeroing vert motors
     zeroing_motor(vert1, dev, motors)
@@ -1247,14 +1439,12 @@ def autoZeroing(dev,motors):
     dev.send(start_zeroing_frame1)
     print(f"Vert Motor  zeroing started")
 
-    ## Zeroing hori motors
-    zeroing_motor(hori1, dev, motors)
-    zeroing_motor(hori2, dev, motors)
-    start_zeroing_frame = GsUsbFrame(can_id=0x600 + hori1, data=bytes.fromhex("2B4060001F000000"))
-    start_zeroing_frame1 = GsUsbFrame(can_id=0x600 + hori2, data=bytes.fromhex("2B4060001F000000"))
+    ## Zeroing pitch motor
+    zeroing_motor(pitch, dev, motors)
+    start_zeroing_frame = GsUsbFrame(can_id=0x600 + pitch, data=bytes.fromhex("2B4060001F000000"))
     dev.send(start_zeroing_frame)
-    dev.send(start_zeroing_frame1)
-    print(f"hori Motor  zeroing started")
+    print(f"Pitch Motor  zeroing started")
+    time.sleep(1)  # Wait for pitch motor to start zeroing
 
 
     ## Zeroing rotary motor
@@ -1310,6 +1500,47 @@ def main():
                     reader_thread.daemon = True
                     reader_thread.start()
                     print("Reader thread started.")
+                    time.sleep(1)  # Give the reader thread a moment to start and read any initial frames
+
+                    disable_stepper_28XTpdo(dev)
+                    
+                    # # Set up TPDO for all motors
+                    #No need to use these, default tpdo0 is enough
+                    # tpdo_setup(vert1, dev)
+                    # tpdo_setup(vert2, dev) 
+                    
+                    # Start SYNC master thread
+                    sync_stop_event = threading.Event()
+                    sync_thread = threading.Thread(target=sync_master, args=(dev, sync_stop_event, 0.01))
+                    sync_thread.daemon = True
+                    sync_thread.start()
+                    print("SYNC master started.")
+                    
+                    # Start the background vertical sync monitor thread
+                    vert_sync_stop_event = threading.Event()
+                    t_poll = threading.Thread(
+                        target=vert_sync_monitoring,
+                        args=(dev, motors, 1000, 0.001, vert_sync_stop_event)
+                    )
+                    t_poll.daemon = True
+                    t_poll.start()
+                    print("Vertical sync monitoring is now RUNNING in the background.")
+
+                    time.sleep(1)  # Allow some time for threads to start and stabilize
+
+                    if any(name == 'position_printer' for name, _ in threads):
+                        print("Motor position printer is already running.")
+                        continue
+
+                    pos_printer_stop_event = threading.Event()
+                    pos_printer_thread_obj = threading.Thread(
+                        target=position_printer_thread,
+                        args=(motors, pos_printer_stop_event, 0.5)
+                    )
+                    pos_printer_thread_obj.daemon = True
+                    pos_printer_thread_obj.start()
+                    threads.append(('position_printer', pos_printer_stop_event))
+                    print("Motor position printer started. It will print current positions once per second.")
                     
                 else:
                     print("Device not found.")
@@ -1392,24 +1623,27 @@ def main():
 
                 # Initialize motors and release brakes
                 motors_init_brakeRelease(dev, motors)
+                relRotarySpeed = 200
+                relRotaryAcc = 150
+                relVertSpeed = 10
+                relVertAcc = 100
+                relHoriSpeed = 20
+                relHoriAcc = 100
+                relPitchSpeed = 30
+                relPitchAcc = 40
 
                 print("\nStarting movement sequence. Press Enter to start each movement, or 'q' for emergency stop.")
 
                 for i, movement in enumerate(movement_sequence):
                     print(f"\nPreparing movement {i+1}/{len(movement_sequence)}...")
 
-                    relRotaryDeg = movement[0][0]
-                    relRotarySpeed = movement[0][1]
-                    relRotaryAcc = movement[0][2]
-                    relVertDisp = movement[1][0]
-                    relVertSpeed = movement[1][1]
-                    relVertAcc = movement[1][2]
-                    relHoriDisp = movement[2][0] 
-                    relHoriSpeed = movement[2][1]
-                    relHoriAcc = movement[2][2]
-                    relPitchDeg = movement[3][0]
-                    relPitchSpeed = movement[3][1]
-                    relPitchAcc = movement[3][2]
+                    relRotaryDeg = movement[0]
+
+                    relVertDisp = movement[1]
+
+                    relHoriDisp = movement[2]
+
+                    relPitchDeg = movement[3]
 
                     # Set up motor movements
                     setUpRotaryMotorMove(dev, rotary, relRotaryDeg, relRotarySpeed, relRotaryAcc, relRotaryAcc)
@@ -1423,6 +1657,21 @@ def main():
 
                     # Wait for Enter or 'q'
                     while True:
+
+                        all_stop = True
+
+                        for motor in motors:
+                            if not motor.is_stopped:
+                                all_stop = False
+                                print(f"Motor {motor.node_id} ({motor.name}) is still moving.")
+                                
+                        print(f"all stop: {all_stop}")
+                        if all_stop:
+                            launchMoveCommand(dev, motors)
+                            print(f"Movement {i+1} launched.")
+                            time.sleep(1.0)  # Small delay to ensure command is sent before checking for next input
+                            break  # Proceed to next movement                                
+
                         if msvcrt.kbhit():  # Check if a key has been pressed
                             key = msvcrt.getch().decode('utf-8').lower()
                             if key == 'q':
@@ -1452,7 +1701,7 @@ def main():
                                 
                                 print("Movement sequence aborted due to emergency stop.")
                                 return  # Exit Option 10
-                            elif key == '\r':  # Enter key
+                            elif key == '\r' :  # Enter key
                                 launchMoveCommand(dev, motors)
                                 print(f"Movement {i+1} launched.")
                                 break  # Proceed to next movement
@@ -1471,10 +1720,10 @@ def main():
 
                 global rotaryDisplacement, vertDisplacement, horiDisplacement, pitchAngle, rollAngle , yawAngle
                 # Predefined travel amounts
-                rotary_travel = 60.0    # degrees (positive/negative)
+                rotary_travel = 30.0    # degrees (positive/negative)
                 vert_travel = 5      # cm (positive/negative, for vert1 and vert2)
                 hori_travel = 3      # cm (positive/negative, for hori1 and hori2)
-                pitch_travel = 20.0     # degrees (positive/negative)
+                pitch_travel = 10.0     # degrees (positive/negative)
 
                 vert_travel_fine = 0.05  # cm for fine control
                 pitch_travel_fine = 0.5  # degrees for fine control
@@ -1756,9 +2005,10 @@ def main():
                     continue
                 disable_stepper_28XTpdo(dev)
                 
-                # Set up TPDO for all motors
+                # # Set up TPDO for all motors
+                #No need to use these, default tpdo0 is enough
                 # tpdo_setup(vert1, dev)
-                # tpdo_setup(vert2, dev)
+                # tpdo_setup(vert2, dev) 
                 
                 # Start SYNC master thread
                 sync_stop_event = threading.Event()
@@ -1778,15 +2028,28 @@ def main():
                 print("Vertical sync monitoring is now RUNNING in the background.")
                 
                 # Store the stop events for cleanup
-                # threads.append(('sync', sync_stop_event))
-                # threads.append(('vert_sync', vert_sync_stop_event))
+                threads.append(('sync', sync_stop_event))
+                threads.append(('vert_sync', vert_sync_stop_event))
 
             elif user_input == "13":
-                disable_stepper_28XTpdo(dev)
 
+                if dev is None:
+                    print("Please scan for device first.")
+                    continue
 
+                if any(name == 'position_printer' for name, _ in threads):
+                    print("Motor position printer is already running.")
+                    continue
 
-
+                pos_printer_stop_event = threading.Event()
+                pos_printer_thread_obj = threading.Thread(
+                    target=position_printer_thread,
+                    args=(motors, pos_printer_stop_event, 0.5)
+                )
+                pos_printer_thread_obj.daemon = True
+                pos_printer_thread_obj.start()
+                threads.append(('position_printer', pos_printer_stop_event))
+                print("Motor position printer started. It will print current positions once per second.")
 
             elif user_input.lower() == "q":
                 # Stop all threads before quitting
