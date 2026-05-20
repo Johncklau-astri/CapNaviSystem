@@ -44,8 +44,8 @@ CAMERA_FRAME_HEIGHT = 500
 NUM_CALIBRATION_FRAMES = 50
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
-LOG_FILE = "magnetic_field_log.csv"
-
+# LOG_FILE = "magnetic_field_log.csv"
+LOG_FILE = "repeatability_test_log.csv"  # For repeatability testing, only log essential data
 
 ## if z= -0.1 and want to zero it, here should the offset should be cube2MagOffset_Z = -0.1
 cube2MagOffset_X = -0.002
@@ -55,7 +55,7 @@ cube2MagOffset_Z = -0.104
 top_R_1000_cube1_camera = None
 R_1000_cube1_camera = None
 
-q_mag_after_motorZeroing = [1.0, 0.001, -0.023, 0.003]  # Identity quaternion as initial value
+q_mag1000_global = [1.0, 0.001, -0.023, 0.003]  # Identity quaternion as initial value
 
 
 ##### Position weights
@@ -916,6 +916,21 @@ def rotation_matrix_to_quaternion(R):
     
     return [qw, qx, qy, qz]
 
+def multiply_quaternions(qa, qb):
+    """
+    Calculates the Hamilton product of two quaternions.
+    To rotate by qa then by qb relative to qa, use: multiply_quaternions(qa, qb)
+    """
+    w1, x1, y1, z1 = qa
+    w2, x2, y2, z2 = qb
+    
+    res_w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    res_x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    res_y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    res_z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return np.array([res_w, res_x, res_y, res_z])
+
 
 def quaternion_to_rotation_matrix(q):
     """Convert quaternion [qw, qx, qy, qz] to rotation matrix"""
@@ -1368,9 +1383,15 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     fused_cube2_pos_rel_origin = None
     fused_cube2_q_rel_origin = None
 
+
     cube1_center_camera_smoothed = None
     cube2_center_camera_smoothed = None
     q_cube1_cube1MotorZeroPose = None
+
+    top_cube1_center_camera_smoothed = None
+    top_cube2_center_camera_smoothed = None
+
+    fused_t_cube2_cube1 = None
     fused_q_cube2_cube1 = None
     
     
@@ -1467,8 +1488,12 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     try:
         with open(LOG_FILE, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_Pitch_deg', 'Cube2_Roll_deg', 'Cube2_Yaw_deg',
-                             'Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
+            # writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_Pitch_deg', 'Cube2_Roll_deg', 'Cube2_Yaw_deg',
+            #                  'Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
+            
+            ## for repeatability testing
+            writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz'])  
+            
             while not stop_event.is_set():
                 start_time = time.time()
                 ret, frame = cap.read()
@@ -1528,7 +1553,9 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 R_cube2_camera = np.eye(3)
                 
                 R_cube2_global = np.eye(3)
+                q_cube2_global = None
                 R_cube1_global = np.eye(3)
+                
                 R_cube1_cube2 = np.eye(3)
                 q_cube1_cube2 = None
 
@@ -1540,6 +1567,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 t_cube1_cube2_tag = None
                 q_btcap_cube2Actual = None
 
+                t_cube2_cube1_tag = None
+
 
                 # top cam data
                 top_tags = []
@@ -1549,6 +1578,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 top_R_cube2_camera = np.eye(3)
                 
                 top_R_cube2_global = np.eye(3)
+                top_q_cube2_global = None
                 top_R_cube1_global = np.eye(3)
                 top_R_cube1_cube2 = np.eye(3)
                 top_q_cube1_cube2 = None
@@ -1560,10 +1590,20 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 top_magnet_position_camera = None
                 top_t_cube1_cube2_tag = None
 
+                top_t_cube2_cube1_tag = None
+
                 # Fused data
                 fused_t_cube1_cube2_tag = None
                 fused_q_cube1_cube2 = None
                 q_cube2_cube2MotorZeroPose = None
+
+                fused_R_cube2_global = None
+                fused_q_cube2_global = None
+
+                q_cube2_origin_offset = None
+                q_cube2_recordedGlobal = None
+
+                recorded_q_cube2_origin = None
 
                 q_btcap_cube2Actual = None
 
@@ -1629,26 +1669,26 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ################################################################################################################################
                 if len(tags)>0: 
                         
-                    # worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
-                    # if worldCube_center_camera is not None:
-                    #     # print(f"World Cube Center Camera: {worldCube_center_camera}")
-                    #     worldCube_center_z_buffer.append(worldCube_center_camera[2])
-                    #     if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
-                    #         worldCube_center_z_buffer.pop(0)
-                    #     smoothed_z_world = np.mean(worldCube_center_z_buffer)
-                    #     worldCube_center_camera_smoothed = worldCube_center_camera.copy()
-                    #     worldCube_center_camera_smoothed[2] = smoothed_z_world
-                    #     worldCube_center_point = np.array([[worldCube_center_camera_smoothed]], dtype=np.float32)
-                    #     img_points, _ = cv2.projectPoints(worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                    #     img_worldCube_center = img_points[0][0].astype(int)
-                    #     cv2.circle(frame_undistorted, tuple(img_worldCube_center), 8, (255, 0, 255), -1)
-                    #     draw_text_with_background(frame_undistorted, "W.C.", (img_worldCube_center[0]+10, img_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    worldCube_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
+                    if worldCube_center_camera is not None:
+                        # print(f"World Cube Center Camera: {worldCube_center_camera}")
+                        worldCube_center_z_buffer.append(worldCube_center_camera[2])
+                        if len(worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                            worldCube_center_z_buffer.pop(0)
+                        smoothed_z_world = np.mean(worldCube_center_z_buffer)
+                        worldCube_center_camera_smoothed = worldCube_center_camera.copy()
+                        worldCube_center_camera_smoothed[2] = smoothed_z_world
+                        worldCube_center_point = np.array([[worldCube_center_camera_smoothed]], dtype=np.float32)
+                        img_points, _ = cv2.projectPoints(worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_worldCube_center = img_points[0][0].astype(int)
+                        cv2.circle(frame_undistorted, tuple(img_worldCube_center), 8, (255, 0, 255), -1)
+                        draw_text_with_background(frame_undistorted, "W.C.", (img_worldCube_center[0]+10, img_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                    #     R_worldCube_camera = compute_cube_orientation(tags, [7, 8, 9])
-                    #     worldCube_rvec, _ = cv2.Rodrigues(R_worldCube_camera)
-                    #     draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
+                        R_worldCube_camera = compute_cube_orientation(tags, [7, 8, 9])
+                        worldCube_rvec, _ = cv2.Rodrigues(R_worldCube_camera)
+                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, worldCube_rvec, worldCube_center_camera_smoothed, AXIS_LENGTH, img_worldCube_center)
                     
-                    ## CUBE 1
+                    # CUBE 1
 
                     cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1,2], reference_tag_id=1)
                     cube1_center_text = "Cube 1 Center: Not detected"
@@ -1707,24 +1747,24 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ## Extract cube positions and orientations from top cam
                 if len(top_tags) > 0:
 
-                    # top_worldCube_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
-                    # if top_worldCube_center_camera is not None:
-                    #     # print(f"World Cube Center Camera: {top_worldCube_center_camera}")
-                    #     top_worldCube_center_z_buffer.append(top_worldCube_center_camera[2])
-                    #     if len(top_worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
-                    #         top_worldCube_center_z_buffer.pop(0)
-                    #     smoothed_z_world = np.mean(top_worldCube_center_z_buffer)
-                    #     top_worldCube_center_camera_smoothed = top_worldCube_center_camera.copy()
-                    #     top_worldCube_center_camera_smoothed[2] = smoothed_z_world
-                    #     top_worldCube_center_point = np.array([[top_worldCube_center_camera_smoothed]], dtype=np.float32)
-                    #     img_points, _ = cv2.projectPoints(top_worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                    #     img_top_worldCube_center = img_points[0][0].astype(int)
-                    #     cv2.circle(top_frame_undistorted, tuple(img_top_worldCube_center), 8, (255, 0, 255), -1)
-                    #     draw_text_with_background(top_frame_undistorted, "W.C.", (img_top_worldCube_center[0]+10, img_top_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                    top_worldCube_center_camera, _ = compute_cube_center(top_tags, CUBE_SIZE, tag_ids=[7, 8, 9], reference_tag_id=8)
+                    if top_worldCube_center_camera is not None:
+                        # print(f"World Cube Center Camera: {top_worldCube_center_camera}")
+                        top_worldCube_center_z_buffer.append(top_worldCube_center_camera[2])
+                        if len(top_worldCube_center_z_buffer) > Z_SMOOTHING_WINDOW:
+                            top_worldCube_center_z_buffer.pop(0)
+                        smoothed_z_world = np.mean(top_worldCube_center_z_buffer)
+                        top_worldCube_center_camera_smoothed = top_worldCube_center_camera.copy()
+                        top_worldCube_center_camera_smoothed[2] = smoothed_z_world
+                        top_worldCube_center_point = np.array([[top_worldCube_center_camera_smoothed]], dtype=np.float32)
+                        img_points, _ = cv2.projectPoints(top_worldCube_center_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                        img_top_worldCube_center = img_points[0][0].astype(int)
+                        cv2.circle(top_frame_undistorted, tuple(img_top_worldCube_center), 8, (255, 0, 255), -1)
+                        draw_text_with_background(top_frame_undistorted, "W.C.", (img_top_worldCube_center[0]+10, img_top_worldCube_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                    #     top_R_worldCube_camera = compute_cube_orientation(top_tags, [7, 8, 9])
-                    #     top_worldCube_rvec, _ = cv2.Rodrigues(top_R_worldCube_camera)
-                    #     draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_worldCube_rvec, top_worldCube_center_camera_smoothed, AXIS_LENGTH, img_top_worldCube_center)
+                        top_R_worldCube_camera = compute_cube_orientation(top_tags, [7, 8, 9])
+                        top_worldCube_rvec, _ = cv2.Rodrigues(top_R_worldCube_camera)
+                        draw_axes(top_frame_undistorted, camera_matrix, dist_coeffs, top_worldCube_rvec, top_worldCube_center_camera_smoothed, AXIS_LENGTH, img_top_worldCube_center)
                     
                     ## CUBE 1
 
@@ -1806,9 +1846,16 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     cube2_euler = rotation_matrix_to_euler(R_cube1_cube2)
                     q_cube1_cube2 = rotation_matrix_to_quaternion(R_cube1_cube2) if R_cube1_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
 
+                    t_cube2_cube1_tag = transform_to_ref_cube_frame(
+                        magnet_position_camera,
+                        cube1_center_camera_smoothed,
+                        R_cube1_camera
+                    )
+
 
                 #Calcuate global orientation of cube 2 using world cube as reference
                 if R_cube2_camera is not None and R_worldCube_camera is not None:
+                    # print(f"R_worldCube_camera:\n{R_worldCube_camera}")
                     R_cube2_global = R_worldCube_camera.T @ R_cube2_camera
                     q_cube2_global = rotation_matrix_to_quaternion(R_cube2_global) if R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
 
@@ -1826,6 +1873,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     )
                     cube2_R_rel_origin = R_cube2_camera_origin.T @ R_cube2_camera
                     cube2_q_rel_origin = rotation_matrix_to_quaternion(cube2_R_rel_origin) if cube2_R_rel_origin is not None else [1.0, 0.0, 0.0, 0.0]
+
 
 
 
@@ -1855,9 +1903,16 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     top_cube2_euler = rotation_matrix_to_euler(top_R_cube1_cube2)
                     top_q_cube1_cube2 = rotation_matrix_to_quaternion(top_R_cube1_cube2) if top_R_cube1_cube2 is not None else [1.0, 0.0, 0.0, 0.0]
 
+                    top_t_cube2_cube1_tag = transform_to_ref_cube_frame(
+                        top_magnet_position_camera,
+                        top_cube1_center_camera_smoothed,
+                        top_R_cube1_camera
+                    )
+
 
                 #Calcuate global orientation of cube 2 using world cube as reference
                 if top_R_cube2_camera is not None and top_R_worldCube_camera is not None:
+                    # print(f"R_worldCube_camera:\n{top_R_worldCube_camera}")
                     top_R_cube2_global = top_R_worldCube_camera.T @ top_R_cube2_camera
                     top_q_cube2_global = rotation_matrix_to_quaternion(top_R_cube2_global) if top_R_cube2_global is not None else [1.0, 0.0, 0.0, 0.0]
 
@@ -1888,26 +1943,34 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 if(top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None) or (t_cube1_cube2_tag is not None and  q_cube1_cube2 is not None):
                     fused_t_cube1_cube2_tag = simple_position_fusion(t_cube1_cube2_tag, top_t_cube1_cube2_tag)
-                    
+                    fused_t_cube1_cube2_tag = t_cube1_cube2_tag
+
                     fused_q_cube1_cube2 = simple_orientation_fusion(q_cube1_cube2, top_q_cube1_cube2, 
                                                                     R_cube1_cube2, top_R_cube1_cube2)
                     
                     fused_q_cube2_cube1 = invert_pose(fused_q_cube1_cube2) if fused_q_cube1_cube2 is not None else None
-                    
+                
+ 
 
                 ################################################################################################################################
                 ###### Data fusing  to calculate relative position and orientation of cube2 against origin                 ######################
-                ################################################################################################################################               
+                ################################################################################################################################ 
+                
+                if (top_R_cube2_global is not None and R_cube2_global is not None):
+                    fused_q_cube2_global = simple_orientation_fusion(q_cube2_global, top_q_cube2_global, R_cube2_global, top_R_cube2_global)              
                     
                 if(top_cube2_pos_rel_origin is not None and top_cube2_q_rel_origin is not None) or (cube2_pos_rel_origin is not None and cube2_q_rel_origin is not None):
                     fused_cube2_pos_rel_origin = simple_position_fusion(cube2_pos_rel_origin, top_cube2_pos_rel_origin)
                     fused_cube2_q_rel_origin = simple_orientation_fusion(cube2_q_rel_origin, top_cube2_q_rel_origin,
                                                                         cube2_R_rel_origin, top_cube2_R_rel_origin)
-                    
-                    q_cube2_cube2MotorZeroPose = get_relative_quaternion(fused_cube2_q_rel_origin , q_mag_after_motorZeroing ) if fused_cube2_q_rel_origin is not None else None
-                    R_cube2_cube2MotorZeroPose = quaternion_to_rotation_matrix(q_cube2_cube2MotorZeroPose) if q_cube2_cube2MotorZeroPose is not None else None
-                    R_btcap_cube2Actual =  R_cube2_cube2MotorZeroPose.T @ quaternion_to_rotation_matrix(q_btcap_global) if R_cube2_cube2MotorZeroPose is not None and q_btcap_global is not None else None
-                    q_btcap_cube2Actual = rotation_matrix_to_quaternion(R_btcap_cube2Actual) if R_btcap_cube2Actual is not None else None
+                if( fused_q_cube2_global is not None):
+
+                    true_R_cube2_global_origin = get_relative_quaternion(fused_q_cube2_global, q_mag1000_global)
+
+                q_cube2_recordedGlobal = multiply_quaternions(fused_cube2_q_rel_origin, q_cube2_origin_offset) if fused_cube2_q_rel_origin is not None and q_cube2_origin_offset is not None else None
+                
+
+
 
                     
                     
@@ -2014,6 +2077,11 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 fused_q_cube1_cube2_text = f"Fused q_cube2_cube1: [{fused_q_cube2_cube1[0]:.3f}, {fused_q_cube2_cube1[1]:.3f}, {fused_q_cube2_cube1[2]:.3f}, {fused_q_cube2_cube1[3]:.3f}]" if fused_q_cube2_cube1 is not None else "Fused q_Cap_Mag: N/A"
                 q_cube2_cube2MotorZeroPose_text = f"q_Cube2_Cube2ZeroPose: [{q_cube2_cube2MotorZeroPose[0]:.3f}, {q_cube2_cube2MotorZeroPose[1]:.3f}, {q_cube2_cube2MotorZeroPose[2]:.3f}, {q_cube2_cube2MotorZeroPose[3]:.3f}]" if q_cube2_cube2MotorZeroPose is not None else "q_Cube2_Cube2ZeroPose: N/A"
                 q_btcap_cube2Actual_text = f"q_btcap_cube2Actual: [{q_btcap_cube2Actual[0]:.3f}, {q_btcap_cube2Actual[1]:.3f}, {q_btcap_cube2Actual[2]:.3f}, {q_btcap_cube2Actual[3]:.3f}]" if q_btcap_cube2Actual is not None else "q_btcap_cube2Actual: N/A"
+                fused_q_cube2_global_text = f"Fused q_cube2_global: [{fused_q_cube2_global[0]:.3f}, {fused_q_cube2_global[1]:.3f}, {fused_q_cube2_global[2]:.3f}, {fused_q_cube2_global[3]:.3f}]" if fused_q_cube2_global is not None else "Fused q_cube2_global: N/A"
+                q_cube2_origin_offset_text = f"q_cube2_origin_offset: [{q_cube2_origin_offset[0]:.3f}, {q_cube2_origin_offset[1]:.3f}, {q_cube2_origin_offset[2]:.3f}, {q_cube2_origin_offset[3]:.3f}]" if q_cube2_origin_offset is not None else "q_cube2_origin_offset: N/A"
+                q_cube2_recordedGlobal_text = f"q_cube2_recordedGlobal: [{q_cube2_recordedGlobal[0]:.3f}, {q_cube2_recordedGlobal[1]:.3f}, {q_cube2_recordedGlobal[2]:.3f}, {q_cube2_recordedGlobal[3]:.3f}]" if q_cube2_recordedGlobal is not None else "q_cube2_recordedGlobal: N/A"
+                t_cube2_cube1_text = f"t_cube2_cube1: x={t_cube2_cube1_tag[0]:.3f}, y={t_cube2_cube1_tag[1]:.3f}, z={t_cube2_cube1_tag[2]:.3f}" if t_cube2_cube1_tag is not None else "t_cube2_cube1: N/A"
+                top_t_cube2_cube1_text = f"Top t_cube2_cube1: x={top_t_cube2_cube1_tag[0]:.3f}, y={top_t_cube2_cube1_tag[1]:.3f}, z={top_t_cube2_cube1_tag[2]:.3f}" if top_t_cube2_cube1_tag is not None else "Top t_cube2_cube1: N/A"
                 intervalOffset = 1
                 FONT_SCALE = 1
                 draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
@@ -2021,20 +2089,19 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 draw_text_with_background(text_frame, top_cam_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, fused_q_cube1_cube2_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                # draw_text_with_background(text_frame, top_rel_origin_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                # draw_text_with_background(text_frame, top_rel_q_origin_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, fused_rel_origin_text, (50, int(310*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, fused_rel_q_origin_text, (50, int(350*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, q_cube2_cube2MotorZeroPose_text, (50, int(390*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, fused_q_cube2_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, q_cube2_origin_offset_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, q_cube2_recordedGlobal_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, t_cube2_cube1_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, top_t_cube2_cube1_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                # draw_text_with_background(text_frame, q_cube2_cube2MotorZeroPose_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
 
                 draw_text_with_background(text_frame, q_btcap_global_text, (50, int(450*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 0, 255, 255), 3)
                 draw_text_with_background(text_frame, q_btcap_cube2Actual_text, (50, int(490*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
                 draw_text_with_background(text_frame, est_pos_text, (50, int(530*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
                 draw_text_with_background(text_frame, pos_error_text, (50, int(570*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+
                 # print(fused_cam_text,serial_mag_text)
-
-
-                
                 # if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
                 #     with position_data_lock:
                 #         if latest_position_data:
@@ -2056,23 +2123,37 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('t') or auto_record_flag:
-                    if magX is not None and magY is not None and magZ is not None and q_cube1_cube2 is not None:
+                    # if magX is not None and magY is not None and magZ is not None and q_cube1_cube2 is not None:
+                    #     measurement_order += 1
+                    #     # q_cube1_cube2 = rotation_matrix_to_quaternion(rel_Rsensor)
+                    #     errorX = estX - t_cube1_cube2_tag[0]
+                    #     errorY = estY - t_cube1_cube2_tag[1]
+                    #     errorZ = estZ - t_cube1_cube2_tag[2]
+                    #     writer.writerow([
+                    #         measurement_order,
+                    #         f'{fused_t_cube1_cube2_tag[0]:.6f}', f'{fused_t_cube1_cube2_tag[1]:.6f}', f'{fused_t_cube1_cube2_tag[2]:.6f}',
+                    #         f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}',
+                    #         f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
+                    #         f'{serial_magX:.3f}', f'{serial_magY:.3f}', f'{serial_magZ:.3f}',
+                    #         f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
+                    #         f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
+                    #     ])
+                    #     csvfile.flush()
+                    #     draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+                    #     time.sleep(0.2)
+                    #     auto_record_flag = False
+
+                    ## for repeatability testing
+
+                    if fused_cube2_pos_rel_origin is not None and fused_cube2_q_rel_origin is not None:
                         measurement_order += 1
-                        # q_cube1_cube2 = rotation_matrix_to_quaternion(rel_Rsensor)
-                        errorX = estX - t_cube1_cube2_tag[0]
-                        errorY = estY - t_cube1_cube2_tag[1]
-                        errorZ = estZ - t_cube1_cube2_tag[2]
                         writer.writerow([
                             measurement_order,
-                            f'{fused_t_cube1_cube2_tag[0]:.6f}', f'{fused_t_cube1_cube2_tag[1]:.6f}', f'{fused_t_cube1_cube2_tag[2]:.6f}',
-                            f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}',
-                            f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
-                            f'{serial_magX:.3f}', f'{serial_magY:.3f}', f'{serial_magZ:.3f}',
-                            f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
-                            f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
+                            f'{fused_cube2_pos_rel_origin[0]:.5f}', f'{fused_cube2_pos_rel_origin[1]:.5f}', f'{fused_cube2_pos_rel_origin[2]:.5f}',
+                            f'{fused_cube2_q_rel_origin[0]:.5f}', f'{fused_cube2_q_rel_origin[1]:.5f}', f'{fused_cube2_q_rel_origin[2]:.5f}', f'{fused_cube2_q_rel_origin[3]:.5f}'
                         ])
                         csvfile.flush()
-                        draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+                        draw_text_with_background(text_frame, "REPEATABILITY DATA LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
                         time.sleep(0.2)
                         auto_record_flag = False
 
@@ -2086,6 +2167,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         top_cube2_center_camera_origin = top_cube2_center_camera.copy()
                         top_R_cube2_camera_origin = top_R_cube2_camera.copy()
                         print("Recorded top cam magnet origin position")
+                    q_cube2_origin_offset = fused_q_cube2_global if fused_q_cube2_global is not None else q_cube2_global
+
 
 
 
