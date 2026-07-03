@@ -15,8 +15,10 @@ import struct
 import threading
 import argparse
 import joblib
+from collections import deque
 from datetime import datetime
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.spatial.transform import Rotation as R
 
 # --- Configuration ---
 POSITION_SERVER_HOST = 'localhost'
@@ -28,6 +30,10 @@ ARROW_WIDTH = 0.002
 max_Bfield = 20000  # Maximum magnetic field in µT
 MODEL_FILE = 'correction_models.pkl'
 COMPARISON_LOG = 'ml_comparison_log.csv'
+
+POSITION_TIMING_PERIODS = deque(maxlen=100)
+POSITION_TIMING_LOCK = threading.Lock()
+POSITION_TIMING_LAST_PRINT = 0.0
 
 # Constants
 mu_0 = 4 * np.pi * 1e-7
@@ -72,6 +78,12 @@ def init_comparison_log():
         ])
         df.to_csv(COMPARISON_LOG, index=False)
         print(f"✅ Created comparison log: {COMPARISON_LOG}")
+
+def format_position_timing_summary(step_durations_ms, avg_hz):
+    """Format a compact timing summary for position estimation requests."""
+    parts = [f"{name}={value:.2f}ms" for name, value in step_durations_ms.items()]
+    return "Position timing | " + " | ".join(parts) + f" | avg_hz={avg_hz:.2f}"
+
 
 def log_comparison_result(B_custom, quat_sensor, r_physics, r_ml, true_pos=None):
     """Log comparison between physics-only and ML-corrected estimates"""
@@ -568,6 +580,7 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT,
 
 def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml=True):
     """Enhanced client handler with ML comparison and both quadratic/cubic comparison"""
+    global POSITION_TIMING_LAST_PRINT
     try:
         # Try to load quadratic model for comparison
         quad_params = None
@@ -585,6 +598,23 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
             pass
         
         while not STOP_EVENT.is_set():
+
+
+
+            # # --- FLUSH ACCUMULATED OLD DATA ---
+            # client_socket.setblocking(False)
+            # try:
+            #     while True:
+            #         # Keep reading chunks until the OS buffer is completely empty
+            #         dump = client_socket.recv(4096)
+            #         if not dump:
+            #             break
+            # except BlockingIOError:
+            #     pass  # Buffer is successfully cleared
+            # finally:
+            #     client_socket.setblocking(True)
+
+
             # Receive data length
             length_bytes = b''
             while len(length_bytes) < 4:
@@ -606,6 +636,8 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
             data = json.loads(data_bytes.decode('utf-8'))
             B_custom = [data['magX'], data['magY'], data['magZ']]
             quat_sensor = [data['qw'], data['qx'], data['qy'], data['qz']]
+
+
             
             # Validate inputs
             if any(abs(m) > max_Bfield for m in B_custom):
@@ -623,14 +655,19 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                 else:
                     quat_sensor = [x / quat_norm for x in quat_sensor]
                     
-                    start_time = time.time()
-                    
+                    start_time = time.perf_counter()
+                    step_names = ['validation', 'cubic_estimate', 'quadratic_estimate', 'ml_correct', 'response']
+                    step_durations_ms = {name: 0.0 for name in step_names}
+
+                    step_start = time.perf_counter()
                     # Cubic estimate (current model)
                     r_cubic, r_init = estimate_position_unified(
                         B_custom, quat_sensor, dipole_params, pos_bounds,
                         xgb_models=None
                     )
+                    step_durations_ms['cubic_estimate'] = (time.perf_counter() - step_start) * 1000.0
                     
+                    step_start = time.perf_counter()
                     # Quadratic estimate (if available)
                     r_quad = None
                     if quad_params is not None:
@@ -638,33 +675,47 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                             B_custom, quat_sensor, quad_params, pos_bounds,
                             xgb_models=None
                         )
+                    step_durations_ms['quadratic_estimate'] = (time.perf_counter() - step_start) * 1000.0
                     
-                    # ML-corrected estimate (if enabled)
-                    r_ml = r_cubic.copy()
-                    if enable_ml and xgb_models[0] is not None:
-                        r_ml, _ = estimate_position_unified(
-                            B_custom, quat_sensor, dipole_params, pos_bounds,
-                            xgb_models
-                        )
+                    # step_start = time.perf_counter()
+                    # # ML-corrected estimate (if enabled)
+                    # r_ml = r_cubic.copy()
+                    # if enable_ml and xgb_models[0] is not None:
+                    #     r_ml, _ = estimate_position_unified(
+                    #         B_custom, quat_sensor, dipole_params, pos_bounds,
+                    #         xgb_models
+                    #     )
+                    step_durations_ms['ml_correct'] = (time.perf_counter() - step_start) * 1000.0
                     
-                    estimation_time = time.time() - start_time
-                    
+                    step_start = time.perf_counter()
                     # Log comparison
-                    log_comparison_result(B_custom, quat_sensor, r_cubic, r_ml)
+                    # log_comparison_result(B_custom, quat_sensor, r_cubic, r_ml)
+                    step_durations_ms['response'] = (time.perf_counter() - step_start) * 1000.0
+                    
+                    request_period = time.perf_counter() - start_time
+                    with POSITION_TIMING_LOCK:
+                        POSITION_TIMING_PERIODS.append(request_period)
+                        avg_period = sum(POSITION_TIMING_PERIODS) / len(POSITION_TIMING_PERIODS)
+                        avg_hz = 1.0 / avg_period if avg_period > 0.0 else 0.0
+                        global POSITION_TIMING_LAST_PRINT
+                        if time.perf_counter() - POSITION_TIMING_LAST_PRINT >= 0.5:
+                            print(format_position_timing_summary(step_durations_ms, avg_hz))
+                            POSITION_TIMING_LAST_PRINT = time.perf_counter()
                     
                     # Print results
-                    print(f"\n📡 Client {addr}:")
-                    print(f"   Model: CUBIC (primary)")
-                    print(f"   Input: B = [{B_custom[0]:.3f}, {B_custom[1]:.3f}, {B_custom[2]:.3f}] µT")
-                    print(f"   cubic Physics: x={r_cubic[0]:.6f}, y={r_cubic[1]:.6f}, z={r_cubic[2]:.6f} m")
+                    # print(f"\n📡 Client {addr}:")
+                    # print(f"   Model: CUBIC (primary)")
+                    # print(f"   Input: B = [{B_custom[0]:.2f}, {B_custom[1]:.2f}, {B_custom[2]:.2f}] µT")
+                    # print(f"   Input q = [{quat_sensor[0]:.2f}, {quat_sensor[1]:.2f}, {quat_sensor[2]:.2f}, {quat_sensor[3]:.2f}]")
+                    # print(f"   cubic Physics: x={r_cubic[0]:.6f}, y={r_cubic[1]:.6f}, z={r_cubic[2]:.6f} m")
                     
                     if r_quad is not None:
-                        print(f"   quadratic physics: x={r_quad[0]:.6f}, y={r_quad[1]:.6f}, z={r_quad[2]:.6f} m")
+                        print(f"  In.B: [{B_custom[0]:.2f}, {B_custom[1]:.2f}, {B_custom[2]:.2f}] µT] phy. only: x={r_quad[0]:.3f}, y={r_quad[1]:.3f}, z={r_quad[2]:.3f} m Cur_Time: {time.time():3f}")
                     
-                    if enable_ml and xgb_models[0] is not None:
-                        print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")
-                        diff = r_ml - r_cubic
-                        print(f"   Δ: {diff[0]*1000:.2f}, {diff[1]*1000:.2f}, {diff[2]*1000:.2f} mm")
+                    # if enable_ml and xgb_models[0] is not None:
+                    #     print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")
+                    #     diff = r_ml - r_cubic
+                    #     print(f"   Δ: {diff[0]*1000:.2f}, {diff[1]*1000:.2f}, {diff[2]*1000:.2f} mm")
                     
                     response = {
                         'estX': float(r_cubic[0]),
@@ -853,7 +904,7 @@ def estimate_position_unified(B_custom, quat_sensor, dipole_params, pos_bounds, 
             result = least_squares(
                 residuals_position_cubic_wrapper, r_init,
                 args=(B_custom_T, dipole_params['m'], R_sensor, dipole_params),
-                bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+                bounds=pos_bounds, method='trf', ftol=1e-6, xtol=1e-6
             )
         else:
             # Use quadratic model
@@ -863,7 +914,7 @@ def estimate_position_unified(B_custom, quat_sensor, dipole_params, pos_bounds, 
                       dipole_params.get('a_x', 0.0), dipole_params.get('b_x', 1.0), dipole_params.get('c_x', 0.0),
                       dipole_params.get('a_y', 0.0), dipole_params.get('b_y', 1.0), dipole_params.get('c_y', 0.0),
                       dipole_params.get('a_z', 0.0), dipole_params.get('b_z', 1.0), dipole_params.get('c_z', 0.0)),
-                bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+                bounds=pos_bounds, method='trf', ftol=1e-6, xtol=1e-6
             )
         
         if not result.success or np.any(np.isnan(result.x)):
@@ -1564,7 +1615,7 @@ def estimate_position_with_cubic(B_custom, quat_sensor, m, pos_bounds,
             args=(B_custom_T, m, R_sensor,
                   a2_x, b2_x, c2_x, a2_y, b2_y, c2_y, a2_z, b2_z, c2_z,
                   a3_x, b3_x, c3_x, d3_x, a3_y, b3_y, c3_y, d3_y, a3_z, b3_z, c3_z, d3_z),
-            bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8
+            bounds=pos_bounds, method='trf', ftol=1e-6, xtol=1e-6
         )
         
         if not result.success or np.any(np.isnan(result.x)):
@@ -1788,7 +1839,7 @@ def estimate_position_custom(B_custom, quat_sensor, m, pos_bounds,
         result = least_squares(residuals_position_enhanced, r_init,
                               args=(B_custom_T, m, R_sensor, a_x, b_x, c_x, 
                                    a_y, b_y, c_y, a_z, b_z, c_z),
-                              bounds=pos_bounds, method='trf', ftol=1e-8, xtol=1e-8)
+                              bounds=pos_bounds, method='trf', ftol=1e-6, xtol=1e-6)
         
         if not result.success or np.any(np.isnan(result.x)):
             print(f"Optimization failed for B_custom={B_custom}")
@@ -2143,7 +2194,7 @@ def run_csv_interactive(dipole_params, pos_bounds, positions):
                                         dipole_params['a_x'], dipole_params['b_x'], dipole_params['c_x'],
                                         dipole_params['a_y'], dipole_params['b_y'], dipole_params['c_y'],
                                         dipole_params['a_z'], dipole_params['b_z'], dipole_params['c_z']),
-                                  bounds=pos_bounds, method='dogbox', ftol=1e-8, xtol=1e-8)
+                                  bounds=pos_bounds, method='dogbox', ftol=1e-6, xtol=1e-6)
             if not result.success or np.any(np.isnan(result.x)):
                 print(f"Optimization failed for point {i}: B={B / muT_to_T}")
                 r_estimated[i] = r_init
@@ -2664,6 +2715,157 @@ def analyze_ml_performance():
 
 
 
+#### BORESIGHT CALIBRATION
+def estimate_position_single(b_target, dipole_params, pos_bounds, R_sensor):
+    """
+    Helper function to estimate a single position based on a target B-field.
+    """
+    # Load polynomial distortion parameters
+    a_x = dipole_params.get('a_x', 0.0)
+    b_x = dipole_params.get('b_x', 1.0)
+    c_x = dipole_params.get('c_x', 0.0)
+    a_y = dipole_params.get('a_y', 0.0)
+    b_y = dipole_params.get('b_y', 1.0)
+    c_y = dipole_params.get('c_y', 0.0)
+    a_z = dipole_params.get('a_z', 0.0)
+    b_z = dipole_params.get('b_z', 1.0)
+    c_z = dipole_params.get('c_z', 0.0)
+    m_fixed = dipole_params['m']
+
+    def pos_objective(pos):
+        # Calculate theoretical B-field at given position 'pos'
+        b_theoretical = dipole_field_enhanced(
+            pos, m_fixed, R_sensor, 
+            a_x, b_x, c_x, 
+            a_y, b_y, c_y, 
+            a_z, b_z, c_z
+        )
+        b_theoretical *= 1e6  # Convert to microtesla
+        # print(f"Testing position: {pos}, Theoretical B: {b_theoretical}, Target B: {b_target}")
+        # return the raw residual vector. least_squares squares it automatically.
+        return b_theoretical - b_target
+    
+    # Correctly separate lower and upper limits
+    lower_bounds = np.array(pos_bounds[0])  # [xmin, ymin, zmin]
+    upper_bounds = np.array(pos_bounds[1])  # [xmax, ymax, zmax]
+    
+    # Calculate the midpoint across each axis for the initial guess
+    initial_guess = (lower_bounds + upper_bounds) / 2.0
+    
+    # Run trust-region reflective least_squares optimization to find position
+    res = least_squares(
+        pos_objective, 
+        x0=initial_guess, 
+        bounds=(lower_bounds, upper_bounds),
+        method='trf'
+    )
+    print(f"  Estimated position: {res.x}, Residual norm: {res.cost:.6f}")
+    return res.x
+
+
+def boresight_objective(boresight_angles, df, dipole_params, pos_bounds, return_stats=False):
+    r_boresight = R.from_euler('xyz', boresight_angles, degrees=True)
+    
+    errors = []
+    
+    for _, row in df.iterrows():
+        b_raw = np.array([row['Mag_X_uT'], row['Mag_Y_uT'], row['Mag_Z_uT']])
+        r_sensor_base = R.from_quat([row['Cube2_Qx'], row['Cube2_Qy'], row['Cube2_Qz'], row['Cube2_Qw']])
+        
+        r_sensor_corrected = r_sensor_base * r_boresight
+        R_sensor_input = r_sensor_corrected.as_matrix() 
+        
+        b_target = b_raw 
+        pos_gt = np.array([row['Rel_X_m'], row['Rel_Y_m'], row['Rel_Z_m']])
+        
+        pos_est = estimate_position_single(b_target, dipole_params, pos_bounds, R_sensor_input)
+        error = np.linalg.norm(pos_est - pos_gt)
+        errors.append(error)
+        
+    errors = np.array(errors)
+    mean_error = np.mean(errors)
+    std_error = np.std(errors)
+    rmse_error = np.sqrt(np.mean(errors**2))
+    
+    if return_stats:
+        return mean_error, std_error, rmse_error
+    
+    return rmse_error
+def run_dynamic_calibration(csv_file, dipole_params, pos_bounds, subsample_rate):
+    """
+    Main function to execute the boresight calibration.
+    """
+    print(f"Loading data from {csv_file} for dynamic calibration...")
+    try:
+        df = pd.read_csv(csv_file)
+    except FileNotFoundError:
+        print(f"Error: Could not find {csv_file}.")
+        return
+
+    # Subsample data to speed up optimization (O(N) operation inside the optimizer)
+    if subsample_rate > 1:
+        df = df.iloc[::subsample_rate, :]
+        print(f"Subsampled data by a factor of {subsample_rate}. Using {len(df)} points for calibration.")
+
+    # Initial guess for boresight angles (0, 0, 0 degrees)
+    initial_boresight = np.array([1.0, 2.0, 1.0])
+    
+    # Boresight bounds (e.g., +/- 45 degrees maximum misalignment)
+    bounds = [(-45.0, 45.0), (-45.0, 45.0), (-45.0, 45.0)]
+
+    print("Calculating initial error metrics before boresight calibration...")
+   # --- Inside your calibration setup function ---
+
+    print("Calculating initial error metrics before boresight calibration...")
+    initial_angles = [0.0, 0.0, 0.0]
+
+    # Unpack all 3 metrics for baseline tracking
+    initial_mean, initial_std, initial_rmse = boresight_objective(
+        initial_angles, df, dipole_params, pos_bounds, return_stats=True
+    )
+    print(f"Initial Metrics (No Boresight):")
+    print(f"  Mean Error: {initial_mean:.4f} m")
+    print(f"  Std Dev:    {initial_std:.4f} m")
+    print(f"  RMSE:       {initial_rmse:.4f} m\n")
+
+    print("Starting optimization to minimize RMSE...")
+    start_time = time.time()
+
+    # Pass False so the optimizer receives only the scalar RMSE value
+    result = minimize(
+        boresight_objective, 
+        initial_angles, 
+        method='Nelder-Mead', 
+        args=(df, dipole_params, pos_bounds, False)
+    )
+
+    end_time = time.time()
+
+    if result.success:
+        # Evaluate the optimized angles to get the final statistics
+        final_mean, final_std, final_rmse = boresight_objective(
+            result.x, df, dipole_params, pos_bounds, return_stats=True
+        )
+        
+        print("\n--- Calibration Successful ---")
+        print(f"Optimization took {end_time - start_time:.2f} seconds.\n")
+        
+        print(f"Initial RMSE:                 {initial_rmse:.4f} m")
+        print(f"Final RMSE:                   {final_rmse:.4f} m")
+        print(f"RMSE Improvement:             {(initial_rmse - final_rmse)*1000:.1f} mm\n")
+        
+        print(f"Initial Mean Position Error:  {initial_mean:.4f} m (± {initial_std:.4f} m)")
+        print(f"Final Mean Position Error:    {final_mean:.4f} m (± {final_std:.4f} m)")
+        print(f"Mean Error Improvement:       {(initial_mean - final_mean)*1000:.1f} mm\n")
+        
+        print(f"Best Boresight Offsets (Degrees):")
+        print(f"  Roll:  {result.x[0]:.8f}°")
+        print(f"  Pitch: {result.x[1]:.8f}°")
+        print(f"  Yaw:   {result.x[2]:.8f}°")
+
+
+
+
 # --- Main Execution Block ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Position estimation server with ML comparison")
@@ -2678,6 +2880,7 @@ if __name__ == "__main__":
     parser.add_argument('--force-train', action='store_true', help="Force retraining of ML models")
     parser.add_argument('--cubic', action='store_true', help="Use cubic model instead of quadratic")
     parser.add_argument('--compare-models', action='store_true', help="Compare quadratic vs cubic performance")
+    parser.add_argument('--calibrate-boresight', action='store_true', help="Run dynamic boresight calibration using Mag_Field_log.csv to minimize position error")
     args = parser.parse_args()
 
     # Initialize comparison log
@@ -2832,6 +3035,18 @@ if __name__ == "__main__":
         server_thread.start()
         
         run_csv_interactive(dipole_params, pos_bounds, positions)
+    if args.calibrate_boresight:
+    # Assumes pos_bounds and dipole_params are already loaded/defined in main scope
+        best_boresight = run_dynamic_calibration(
+            'Mag_Field_log.csv', 
+            dipole_params, 
+            np.array(pos_bounds), 
+            subsample_rate=1  # Change this to 1 to use ALL data (will take much longer)
+        )
+        if best_boresight is not None:
+            print("\nTo use these offsets, apply them before your position estimation loop:")
+            print(f"boresight_matrix = R.from_euler('xyz', {list(np.round(best_boresight, 3))}, degrees=True)")
+            # You can also add logic here to save these to a JSON config file.
     else:
         # Normal server mode with ML enabled by default
         run_position_server(

@@ -20,12 +20,226 @@ from concurrent.futures import ThreadPoolExecutor, Future
 import asyncio
 import select
 import serial
+import argparse
+from collections import deque
+import matplotlib.pyplot as plt
+import math
+
+
+
+class RealTimePlotter:
+    def __init__(self, maxlen=200, refresh_s=0.05):
+        self.maxlen = maxlen
+        self.refresh_s = refresh_s
+
+        self.t_buf = deque(maxlen=maxlen)
+
+        # Ground truth Euler buffers
+        self.roll_buf = deque(maxlen=maxlen)
+        self.pitch_buf = deque(maxlen=maxlen)
+        self.yaw_buf = deque(maxlen=maxlen)
+
+        # Bluetooth Euler buffers (to overlay for delay comparison)
+        self.BT_roll_buf = deque(maxlen=maxlen)
+        self.BT_pitch_buf = deque(maxlen=maxlen)
+        self.BT_yaw_buf = deque(maxlen=maxlen)
+
+        self.lock = threading.Lock()
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, euler_rpy, BT_euler_rpy):
+        """
+        Pushes new data frames into the rolling history buffers.
+        euler_rpy: [roll, pitch, yaw] ground truth array or None
+        BT_euler_rpy: [roll, pitch, yaw] bluetooth telemetry array or None
+        """
+        ts = time.time()
+        with self.lock:
+            self.t_buf.append(ts)
+
+            # Handle Ground Truth Euler
+            if euler_rpy is None:
+                self.roll_buf.append(0.0); self.pitch_buf.append(0.0); self.yaw_buf.append(0.0)
+            else:
+                self.roll_buf.append(euler_rpy[0]); self.pitch_buf.append(euler_rpy[1]); self.yaw_buf.append(euler_rpy[2])
+
+            # Handle Bluetooth Euler
+            if BT_euler_rpy is None:
+                self.BT_roll_buf.append(0.0); self.BT_pitch_buf.append(0.0); self.BT_yaw_buf.append(0.0)
+            else:
+                self.BT_roll_buf.append(BT_euler_rpy[0]); self.BT_pitch_buf.append(BT_euler_rpy[1]); self.BT_yaw_buf.append(BT_euler_rpy[2])
+
+    def _run(self):
+        plt.ion()
+        fig, ax_ori = plt.subplots(1, 1, figsize=(9, 5))
+        
+        # Orientation Setup (Ground Truth vs Bluetooth Overlay)
+        # Solid lines = Ground Truth
+        ln_r, = ax_ori.plot([], [], label='Roll (GT)', color='r', linestyle='-')
+        ln_p, = ax_ori.plot([], [], label='Pitch (GT)', color='g', linestyle='-')
+        ln_yaw, = ax_ori.plot([], [], label='Yaw (GT)', color='b', linestyle='-')
+        
+        # Dashed lines = Bluetooth Telemetry
+        ln_bt_r, = ax_ori.plot([], [], label='Roll (BT)', color='r', linestyle='--')
+        ln_bt_p, = ax_ori.plot([], [], label='Pitch (BT)', color='g', linestyle='--')
+        ln_bt_yaw, = ax_ori.plot([], [], label='Yaw (BT)', color='b', linestyle='--')
+        
+        ax_ori.legend(loc='upper right', ncol=2)  # 2 columns to cleanly separate GT vs BT references
+        ax_ori.set_ylabel('Euler Angle (deg)')
+        ax_ori.set_xlabel('Relative Time (s)')
+        ax_ori.set_ylim(-100, 100)
+        ax_ori.grid(True, linestyle=':', alpha=0.6)
+
+        while self._running:
+            with self.lock:
+                t = list(self.t_buf)
+                if len(t) == 0:
+                    time.sleep(self.refresh_s)
+                    continue
+                
+                t0 = t[0]
+                t_rel = [tt - t0 for tt in t]
+                
+                r = list(self.roll_buf)
+                p = list(self.pitch_buf)
+                yaw = list(self.yaw_buf)
+                
+                bt_r = list(self.BT_roll_buf)
+                bt_p = list(self.BT_pitch_buf)
+                bt_yaw = list(self.BT_yaw_buf)
+
+            # Update ground truth lines
+            ln_r.set_data(t_rel, r)
+            ln_p.set_data(t_rel, p)
+            ln_yaw.set_data(t_rel, yaw)
+            
+            # Update bluetooth overlay lines
+            ln_bt_r.set_data(t_rel, bt_r)
+            ln_bt_p.set_data(t_rel, bt_p)
+            ln_bt_yaw.set_data(t_rel, bt_yaw)
+
+            # Handle dynamic horizontal time axis scaling
+            # Handle dynamic horizontal time axis scaling
+            ax_ori.relim()
+            
+            # --- SET THE TIME SCALE WINDOW ---
+            WINDOW_SIZE_SECONDS = 10.0  # <--- Adjust this to set your timeline length
+            
+            current_max_time = t_rel[-1]
+            current_min_time = max(0.0, current_max_time - WINDOW_SIZE_SECONDS)
+            
+            ax_ori.set_xlim(current_min_time, current_max_time)            
+            ax_ori.autoscale_view(scalex=False, scaley=False)  # Keep Y locked at [-180, 180]
+
+            try:
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+            except Exception:
+                pass
+            time.sleep(self.refresh_s)
+
+    def stop(self):
+        self._running = False
+
+
+class PositionLatencyPlotter:
+    def __init__(self, maxlen=200, refresh_s=0.05):
+        self.maxlen = maxlen
+        self.refresh_s = refresh_s
+        self.t_buf = deque(maxlen=maxlen)
+        self.motor_x_buf = deque(maxlen=maxlen)
+        self.motor_y_buf = deque(maxlen=maxlen)
+        self.motor_z_buf = deque(maxlen=maxlen)
+        self.est_x_buf = deque(maxlen=maxlen)
+        self.est_y_buf = deque(maxlen=maxlen)
+        self.est_z_buf = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, motor_data, est_position):
+        ts = time.time()
+        with self.lock:
+            self.t_buf.append(ts)
+            self.motor_x_buf.append(motor_data.get('x', 0.0) if motor_data else 0.0)
+            self.motor_y_buf.append(motor_data.get('y', 0.0) if motor_data else 0.0)
+            self.motor_z_buf.append(motor_data.get('z', 0.0) if motor_data else 0.0)
+            if est_position is None:
+                self.est_x_buf.append(0.0)
+                self.est_y_buf.append(0.0)
+                self.est_z_buf.append(0.0)
+            else:
+                self.est_x_buf.append(est_position[0])
+                self.est_y_buf.append(est_position[1])
+                self.est_z_buf.append(est_position[2])
+
+    def _run(self):
+        plt.ion()
+        fig, ax = plt.subplots(1, 1, figsize=(9, 5))
+        ax.set_title('Motor vs Estimated Position Latency')
+        ax.set_xlabel('Relative Time (s)')
+        ax.set_ylabel('Position (m)')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        lines = []
+        lines.append(ax.plot([], [], label='Motor X', color='tab:blue', linestyle='-')[0])
+        lines.append(ax.plot([], [], label='Motor Y', color='tab:orange', linestyle='-')[0])
+        lines.append(ax.plot([], [], label='Motor Z', color='tab:green', linestyle='-')[0])
+        lines.append(ax.plot([], [], label='Est X', color='tab:blue', linestyle='--')[0])
+        lines.append(ax.plot([], [], label='Est Y', color='tab:orange', linestyle='--')[0])
+        lines.append(ax.plot([], [], label='Est Z', color='tab:green', linestyle='--')[0])
+        ax.legend(loc='upper right')
+
+        while self._running:
+            with self.lock:
+                if not self.t_buf:
+                    time.sleep(self.refresh_s)
+                    continue
+                t0 = self.t_buf[0]
+                t_rel = [tt - t0 for tt in self.t_buf]
+                motor_x = list(self.motor_x_buf)
+                motor_y = list(self.motor_y_buf)
+                motor_z = list(self.motor_z_buf)
+                est_x = list(self.est_x_buf)
+                est_y = list(self.est_y_buf)
+                est_z = list(self.est_z_buf)
+
+            lines[0].set_data(t_rel, motor_x)
+            lines[1].set_data(t_rel, motor_y)
+            lines[2].set_data(t_rel, motor_z)
+            lines[3].set_data(t_rel, est_x)
+            lines[4].set_data(t_rel, est_y)
+            lines[5].set_data(t_rel, est_z)
+
+            ax.relim()
+            if t_rel:
+                ax.set_xlim(max(0.0, t_rel[-1] - 10.0), t_rel[-1])
+                # ax.set_ylim(-5, 5)
+            ax.autoscale_view(scalex=False)
+
+            try:
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+            except Exception:
+                pass
+            time.sleep(self.refresh_s)
+
+    def stop(self):
+        self._running = False
+
+
+# instantiate global plotter
+# plotter = RealTimePlotter()
+position_latency_plotter = None
 
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 1
-camera_id = 1
-top_camera_id = 0
+camera_id = 0
+top_camera_id = 1
 
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
@@ -45,12 +259,42 @@ NUM_CALIBRATION_FRAMES = 50
 Z_SMOOTHING_WINDOW = 5
 TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 # LOG_FILE = "magnetic_field_log.csv"
-LOG_FILE = "repeatability_test_log.csv"  # For repeatability testing, only log essential data
+LOG_FILE = "Mag_Field_log.csv"  # For repeatability testing, only log essential data
+LOG_REPEAT_TEST_FILE = "repeatability_test_log.csv"  # For repeatability testing, only log essential data
 
+
+def write_to_shared_file(t_xyz, q_wxyz):
+    """Writes tracking parameters safely to a shared disk file using atomic replacement."""
+    if t_xyz is None or q_wxyz is None:
+        return
+    try:
+        if len(t_xyz) < 3 or len(q_wxyz) < 4:
+            return
+
+        # Convert AprilTag metrics from meters to visualizer millimeters
+        x, y, z = t_xyz[0] * 1000.0, t_xyz[1] * 1000.0, t_xyz[2] * 1000.0
+        qw, qx, qy, qz = q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3]
+
+        # 1. Write telemetry data cleanly to a temporary file
+        with open(TELEMETRY_TMP, "w") as f:
+            f.write(f"{x:.4f},{y:.4f},{z:.4f},{qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}\n")
+        
+        # 2. Perform an atomic overwrite operation to avoid read-write collisions
+        if os.path.exists(TELEMETRY_PATH):
+            os.remove(TELEMETRY_PATH)
+        os.rename(TELEMETRY_TMP, TELEMETRY_PATH)
+
+    except Exception as e:
+        print(f"File writing warning: {e}")
+
+
+# --- FILE SHARE CONFIGURATION ---
+TELEMETRY_PATH = r"C:\Users\johncklau\Desktop\CapNaviSystem\telemetry.txt"
+TELEMETRY_TMP  = r"C:\Users\johncklau\Desktop\CapNaviSystem\telemetry.tmp"
 ## if z= -0.1 and want to zero it, here should the offset should be cube2MagOffset_Z = -0.1
 cube2MagOffset_X = -0.002
 cube2MagOffset_Y = -0.0535
-cube2MagOffset_Z = -0.104 
+cube2MagOffset_Z = -0.096
 
 top_R_1000_cube1_camera = None
 R_1000_cube1_camera = None
@@ -74,15 +318,15 @@ TOP_POS_WEIGHTS = {
 # Orientation weights
 ## ROLL IS ACTUALLY PITCH
 SIDE_ORI_WEIGHTS = {
-    'roll': 0.9,   # actually is pitch since its x axis rotation (X rotation)
-    'pitch': 0.5,  # Side camera good at pitch (Y rotation)
-    'yaw': 0.1     # Side camera bad at yaw (Z rotation)
+    'roll': 0.95,   # actually is pitch since its x axis rotation (X rotation)
+    'pitch': 0.95,  # Side camera good at pitch (Y rotation)
+    'yaw': 0.05     # Side camera bad at yaw (Z rotation)
 }
 
 TOP_ORI_WEIGHTS = {
-    'roll': 0.1,   # Top camera bad at roll
-    'pitch': 0.5,  # Top camera bad at pitch
-    'yaw': 0.9     # Top camera good at yaw
+    'roll': 0.05,   # Top camera bad at roll
+    'pitch': 0.05,  # Top camera bad at pitch
+    'yaw': 0.95     # Top camera good at yaw
 }
 
 POSITION_SERVER_HOST = 'localhost'
@@ -304,11 +548,16 @@ def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
                 client_socket.close()
             except socket.timeout:
                 continue
-            except (ConnectionError, socket.error, json.JSONDecodeError) as e:
-                print(f"Motor client error: {e}")
+            except ConnectionError:
                 if 'client_socket' in locals():
                     client_socket.close()
                 continue
+            except (socket.error, json.JSONDecodeError) as e:
+                            print(f"CRITICAL Motor client error: {e}")
+                            if 'client_socket' in locals():
+                                client_socket.close()
+                            continue
+            
         server_socket.close()
     except Exception as e:
         print(f"Motor TCP server error: {e}")
@@ -639,6 +888,145 @@ def resize_frame(frame, max_height=CAMERA_FRAME_HEIGHT):
         padded_frame = cv2.copyMakeBorder(resized_frame, 0, 0, border_left, border_right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
         return padded_frame
     return resized_frame
+
+
+def compute_bt_only_quaternion(motor_data, bt_quat):
+    """Compute the BT-to-cube quaternion using motor encoder orientation as the reference."""
+    if motor_data is None or bt_quat is None:
+        return None
+
+    try:
+        motor_quat = np.array([
+            motor_data.get('qw', 1.0),
+            motor_data.get('qx', 0.0),
+            motor_data.get('qy', 0.0),
+            motor_data.get('qz', 0.0),
+        ], dtype=float)
+        bt_quat_arr = np.array(bt_quat, dtype=float)
+        motor_rot = quaternion_to_rotation_matrix(motor_quat)
+        bt_rot = quaternion_to_rotation_matrix(bt_quat_arr)
+        rel_rot = motor_rot.T @ bt_rot
+        rel_quat = rotation_matrix_to_quaternion(rel_rot)
+        return rel_quat
+    except Exception as exc:
+        print(f"BT-only quaternion computation failed: {exc}")
+        return None
+
+
+def format_bt_only_timing_summary(step_durations_ms, avg_hz):
+    """Return a compact timing summary for the BT-only loop."""
+    parts = [f"{name}={value:.2f}ms" for name, value in step_durations_ms.items()]
+    return "BT-only timing | " + " | ".join(parts) + f" | avg_hz={avg_hz:.2f}"
+
+
+def run_bt_only_loop(args):
+    """Run a lightweight loop that ignores cameras and uses BT + motor data only."""
+    global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ
+    global bt_quat_global, position_thread_running, R_senToCube
+    global serial_magX, serial_magY, serial_magZ, serial_mag_lock
+    global position_latency_plotter
+
+    print("BT-only mode enabled; camera and AprilTag processing are skipped.")
+
+    # global position_latency_plotter
+    # position_latency_plotter = PositionLatencyPlotter()
+
+    motor_data = None
+    last_motor_update = 0.0
+    MOTOR_UPDATE_INTERVAL = 0.1
+    last_position_update = 0.0
+    POSITION_UPDATE_INTERVAL = 0.03
+    loop_periods = deque(maxlen=100)
+    last_stats_print = 0.0
+    step_names = ['bt_fetch', 'motor_update', 'quat_compute', 'position_update', 'plot_update']
+
+    position_thread = threading.Thread(target=position_estimation_worker, daemon=True)
+    position_thread_running = True
+    position_thread.start()
+
+    server_thread = threading.Thread(target=run_tcp_server, args=('localhost', MOTOR_SERVER_PORT, stop_event))
+    server_thread.daemon = True
+    server_thread.start()
+
+    bt_receiver_thread = threading.Thread(target=run_bt_data_receiver, args=('localhost', BT_ANGLE_EST_PORT, stop_event))
+    bt_receiver_thread.daemon = True
+    bt_receiver_thread.start()
+
+    if serial_port is not None:
+        serial_thread = threading.Thread(target=run_serial_data_receiver, args=(stop_event,))
+        serial_thread.daemon = True
+        serial_thread.start()
+
+    try:
+        while not stop_event.is_set():
+            loop_start = time.perf_counter()
+            step_durations_ms = {name: 0.0 for name in step_names}
+
+            step_start = time.perf_counter()
+            latest_bt_data = get_latest_bt_data()
+            if latest_bt_data:
+                with bt_data_lock:
+                    magX = -latest_bt_data.get('magY', 0.0)
+                    magY = -latest_bt_data.get('magX', 0.0)
+                    magZ = -latest_bt_data.get('magZ', 0.0)
+                    bt_quat_global = [
+                        latest_bt_data.get('qw', 1.0),
+                        latest_bt_data.get('qx', 0.0),
+                        latest_bt_data.get('qy', 0.0),
+                        latest_bt_data.get('qz', 0.0),
+                    ]
+            step_durations_ms['bt_fetch'] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
+                with position_data_lock:
+                    if latest_position_data:
+                        motor_data = latest_position_data.copy()
+                last_motor_update = time.time()
+            step_durations_ms['motor_update'] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            current_time = time.time()
+            if (current_time - last_position_update > POSITION_UPDATE_INTERVAL and
+                motor_data is not None and bt_quat_global is not None and
+                magX != 0.0 and magY != 0.0 and magZ != 0.0):
+                q_btcap_cube2Encode = compute_bt_only_quaternion(motor_data, bt_quat_global)
+                if q_btcap_cube2Encode is not None:
+                    update_position_estimation(q_btcap_cube2Encode, magX, magY, magZ)
+                    last_position_update = current_time
+            step_durations_ms['quat_compute'] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            latest_estimate = get_latest_position_estimate()
+            if latest_estimate is not None:
+                estX, estY, estZ = latest_estimate
+            step_durations_ms['position_update'] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
+            if position_latency_plotter is not None:
+                position_latency_plotter.push(motor_data, [estX, estY, estZ])
+            step_durations_ms['plot_update'] = (time.perf_counter() - step_start) * 1000.0
+
+            loop_period = time.perf_counter() - loop_start
+            loop_periods.append(loop_period)
+            avg_loop_period = sum(loop_periods) / len(loop_periods)
+            avg_hz = 1.0 / avg_loop_period if avg_loop_period > 0.0 else 0.0
+            if time.perf_counter() - last_stats_print >= 0.5 or not loop_periods:
+                print(format_bt_only_timing_summary(step_durations_ms, avg_hz))
+                last_stats_print = time.perf_counter()
+
+            time.sleep(0.01)
+    finally:
+        position_thread_running = False
+        if position_latency_plotter is not None:
+            position_latency_plotter.stop()
+            position_latency_plotter = None
+        if 'server_thread' in locals():
+            server_thread.join(timeout=1.0)
+        if 'bt_receiver_thread' in locals():
+            bt_receiver_thread.join(timeout=1.0)
+        if 'position_thread' in locals():
+            position_thread.join(timeout=1.0)
 
 # def load_calibration():
 #     if os.path.exists(CALIBRATION_FILE):
@@ -1356,11 +1744,17 @@ def sensor_to_mounting_frame(sensor_reading):
     return np.zeros(3)
 
 
-def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coeffs):
+def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coeffs,args):
     global auto_record_flag, rel_Rsensor, estX, estY, estZ, magX, magY, magZ
     global bt_quat_global, position_thread_running, R_worldCube_camera, top_R_worldCube_camera, top_R_1000_cube1_camera,R_1000_cube1_camera,R_senToCube
     global serial_magX, serial_magY, serial_magZ, serial_mag_lock
 
+    if getattr(args, 'bt_only', False):
+        run_bt_only_loop(args)
+        return
+
+    repeatability_test_mode = args.repeat
+    verticality_test_mode = args.vert
     ## Sen to cube Calibration
     x_meas = np.array([12.3, 45.6, -7.8])
     y_meas = np.array([-8.9, 52.1, 3.4])
@@ -1390,7 +1784,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
     top_cube1_center_camera_smoothed = None
     top_cube2_center_camera_smoothed = None
-
+    worldCube_center_camera_smoothed    = None
     fused_t_cube2_cube1 = None
     fused_q_cube2_cube1 = None
     
@@ -1484,15 +1878,21 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     cv2.resizeWindow("AprilTag Localization", DISPLAY_WIDTH, DISPLAY_HEIGHT)
     
     text_frame = np.zeros((TEXT_FRAME_HEIGHT, TEXT_FRAME_WIDTH, 3), dtype=np.uint8)
+
+    if repeatability_test_mode:
+        TARGET_FILE = LOG_REPEAT_TEST_FILE
+    else:
+        TARGET_FILE = LOG_FILE
     
     try:
-        with open(LOG_FILE, 'w', newline='') as csvfile:
+        with open(TARGET_FILE, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            # writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_Pitch_deg', 'Cube2_Roll_deg', 'Cube2_Yaw_deg',
-            #                  'Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
+            if repeatability_test_mode:
+                writer.writerow(['Order', 'X_m', 'Y_m', 'Z_m', 'Qw', 'Qx', 'Qy', 'Qz','C2_C1_X_m', 'C2_C1_Y_m', 'C2_C1_Z_m', 'C2_C1_Qw', 'C2_C1_Qx', 'C2_C1_Qy', 'C2_C1_Qz'])  
+            else:
+                writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz', 'Cube2_Pitch_deg', 'Cube2_Roll_deg', 'Cube2_Yaw_deg',
+                                'Mag_X_uT', 'Mag_Y_uT', 'Mag_Z_uT', 'Est_Xm', 'Est_Ym', 'Est_Zm', 'Error_Xm', 'Error_Ym', 'Error_Zm'])
             
-            ## for repeatability testing
-            writer.writerow(['Order', 'Rel_X_m', 'Rel_Y_m', 'Rel_Z_m', 'Cube2_Qw', 'Cube2_Qx', 'Cube2_Qy', 'Cube2_Qz'])  
             
             while not stop_event.is_set():
                 start_time = time.time()
@@ -1566,9 +1966,10 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 magnet_position_camera = None
                 t_cube1_cube2_tag = None
                 q_btcap_cube2Actual = None
-
                 t_cube2_cube1_tag = None
-
+                t_cube1_worldCube = None
+                R_cube1_worldCube = None
+                q_cube1_worldCube = None
 
                 # top cam data
                 top_tags = []
@@ -1605,7 +2006,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 recorded_q_cube2_origin = None
 
-                q_btcap_cube2Actual = None
+                R_btcap_global = None
+
 
                 b_global = None
                 # Non-camera specific data
@@ -1690,7 +2092,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                     
                     # CUBE 1
 
-                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[1,2], reference_tag_id=1)
+                    cube1_center_camera, _ = compute_cube_center(tags, CUBE_SIZE, tag_ids=[0,1,2], reference_tag_id=0)
                     cube1_center_text = "Cube 1 Center: Not detected"
                     if cube1_center_camera is not None:
                         # print(f"Cube 1 Center Camera: {cube1_center_camera}")
@@ -1705,7 +2107,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                         img_cube1_center = img_points[0][0].astype(int)
                         cv2.circle(frame_undistorted, tuple(img_cube1_center), 8, (255, 255, 0), -1)
 
-                        R_cube1_camera = compute_cube_orientation(tags, [1,2])
+                        R_cube1_camera = compute_cube_orientation(tags, [0,1,2])
                         cube1_rvec_camera, _ = cv2.Rodrigues(R_cube1_camera)
                         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, cube1_rvec_camera, cube1_center_camera_smoothed, AXIS_LENGTH, img_cube1_center)
                         # draw_text_with_background(frame_undistorted, "CAP", (img_cube1_center[0]+10, img_cube1_center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
@@ -1863,7 +2265,36 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 if R_cube1_camera is not None and R_worldCube_camera is not None:
                     R_cube1_global = R_worldCube_camera.T @ R_cube1_camera    
                     q_cube1_global = rotation_matrix_to_quaternion(R_cube1_global) if R_cube1_global is not None else [1.0, 0.0, 0.0, 0.0]
-                
+
+                ## Cap Global position relative to World cube
+
+                if cube1_center_camera_smoothed is not None and worldCube_center_camera_smoothed is not None and R_worldCube_camera is not None:
+                    t_cube1_worldCube = transform_to_ref_cube_frame(
+                        cube1_center_camera_smoothed,
+                        worldCube_center_camera_smoothed,
+                        R_worldCube_camera
+                    )
+                    R_cube1_worldCube = R_worldCube_camera.T @ R_cube1_camera
+                    q_cube1_worldCube = rotation_matrix_to_quaternion(R_cube1_worldCube) if R_cube1_worldCube is not None else [1.0, 0.0, 0.0, 0.0]
+                    
+
+                    # ##For promo video
+                    # if t_cube1_worldCube is not None and q_cube1_worldCube is not None:
+                    #     print(f"t_cube1_worldCube: {t_cube1_worldCube}, q_cube1_worldCube: {q_cube1_worldCube}")
+                    #     write_to_shared_file(t_cube1_worldCube, q_cube1_worldCube)
+                    #     # push to real-time plotter (position + Euler angles)
+                    #     try:
+                    #         if plotter is not None and R_cube1_worldCube is not None:
+                    #             euler_rpy = rotation_matrix_to_euler(R_cube1_worldCube)
+                    #             print(f"Euler: {euler_rpy}")
+                    #             t_cube1_worldCube[1] += 0.2 
+                    #             plotter.push(t_cube1_worldCube, euler_rpy)
+                    #     except Exception as e:
+                    #         print(f"Plot push warning: {e}")
+
+
+
+
                 ## For encoder-only position estimation test: calculate cube 2 position relative to initial position (origin)
                 if cube2_center_camera_origin is not None and R_cube2_camera_origin is not None and cube2_center_camera_smoothed is not None:
                     cube2_pos_rel_origin = transform_to_ref_cube_frame(
@@ -1943,7 +2374,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 if(top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None) or (t_cube1_cube2_tag is not None and  q_cube1_cube2 is not None):
                     fused_t_cube1_cube2_tag = simple_position_fusion(t_cube1_cube2_tag, top_t_cube1_cube2_tag)
-                    fused_t_cube1_cube2_tag = t_cube1_cube2_tag
+                    # fused_t_cube1_cube2_tag = t_cube1_cube2_tag
 
                     fused_q_cube1_cube2 = simple_orientation_fusion(q_cube1_cube2, top_q_cube1_cube2, 
                                                                     R_cube1_cube2, top_R_cube1_cube2)
@@ -1972,23 +2403,6 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
 
 
-                    
-                    
-                    # fused_q_cube1_cube2 = q_cube1_cube2
-                    
-
-                # # Print for debugging
-                # if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
-                #     print(f"Fused pos: x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f}")
-                #     print(f"Fused ori: qx={fused_q_cube1_cube2[0]:.3f}, qy={fused_q_cube1_cube2[1]:.3f}, qz={fused_q_cube1_cube2[2]:.3f}, qw={fused_q_cube1_cube2[3]:.3f}")
-
-
-
-
-
-
-
-
 
                 ################################################################################################################################
                 #################################################### handling BT DATA      #####################################################
@@ -2010,103 +2424,181 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 # serial_magY = np.sqrt(serial_magY**2)  # Combine Y and Z for a more stable reading
 
+                ################################################################################################################################
+                ################################## Plotting graph to compare lag of q calculation against Tag     ##############################
+                ################################################################################################################################
+
+
+
+                tag_euler = rotation_matrix_to_euler(quaternion_to_rotation_matrix(fused_q_cube1_cube2)) if fused_q_cube1_cube2 is not None else [0.0, 0.0, 0.0]
+                bt_euler = rotation_matrix_to_euler(R_btcap_global) if R_btcap_global is not None else [0.0, 0.0, 0.0]
+                # plotter.push(tag_euler, bt_euler)  # Push both tag and BT Euler angles to the plotter for comparison
+
+
+
+
+                ################################################################################################################################
+                #################################################### MOTOR     #####################################################
+                ################################################################################################################################
+                
+                if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
+                    with position_data_lock:
+                        if latest_position_data:
+                            motor_data = latest_position_data.copy()
+                    last_motor_update = time.time()
+
+                R_btcap_cube2Encode = None
+                q_btcap_cube2Encode = None
+                R_cube2Encode_global = None
+                
+                if motor_data is not None and R_btcap_global is not None:
+                    R_cube2Encode_global = quaternion_to_rotation_matrix([motor_data['qw'], motor_data['qx'], motor_data['qy'], motor_data['qz']])
+                    R_btcap_cube2Encode = R_cube2Encode_global.T @ R_btcap_global
+                    q_btcap_cube2Encode = rotation_matrix_to_quaternion(R_btcap_cube2Encode) if R_btcap_cube2Encode is not None else [1.0, 0.0, 0.0, 0.0]
+                
+
+                error_Encodeq = [x-y for x, y in zip(q_btcap_cube2Encode, fused_q_cube1_cube2)] if q_btcap_cube2Encode is not None and fused_q_cube1_cube2 is not None else None
+            
+
+                ################################################################################################################################
+                ####################################################        Pos   Est     #####################################################
+                ################################################################################################################################
+
                 # Update position estimation at controlled rate (NON-BLOCKING)
                 current_time = time.time()
-                if current_time - last_position_update > POSITION_UPDATE_INTERVAL and q_btcap_cube2Actual is not None and magX != 0.0 and magY != 0.0 and magZ != 0.0:
-                    update_position_estimation(q_btcap_cube2Actual, magX, magY, magZ)  # This is now non-blocking
+                if current_time - last_position_update > POSITION_UPDATE_INTERVAL and q_btcap_cube2Encode is not None and magX != 0.0 and magY != 0.0 and magZ != 0.0:
+                    update_position_estimation(q_btcap_cube2Encode, magX, magY, magZ)  # This is now non-blocking
                     last_position_update = current_time
 
-                # # Draw estimated position and axes
-                # if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and q_btcap_global is not None and R_worldCube_camera is not None:
+
+
+
+                
+                # Draw estimated position and axes
+                if cube2_center_camera is not None and R_cube2_camera is not None and (estX != 0 or estY != 0 or estZ != 0) and q_btcap_global is not None and R_worldCube_camera is not None:
                     
-                #     # Step 1: Get magnet position in camera frames
-                #     magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
+                    # Step 1: Get magnet position in camera frames
+                    magnet_position_camera = cube2_center_camera_smoothed + R_cube2_camera @ MAG_OFFSET_FROM_CUBE
                     
-                #     # Step 2: estX, estY, estZ are in magnet's coordinate frame
-                #     # Transform this vector to camera frame
-                #     est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
+                    # Step 2: estX, estY, estZ are in magnet's coordinate frame
+                    # Transform this vector to camera frame
+                    est_vector_camera = R_cube2_camera @ np.array([estX, estY, estZ])
                     
-                #     # Step 3: Estimated position in camera frame = magnet position + transformed vector
-                #     est_pos_camera = magnet_position_camera + est_vector_camera
+                    # Step 3: Estimated position in camera frame = magnet position + transformed vector
+                    est_pos_camera = magnet_position_camera + est_vector_camera
                     
-                #     # Project to image coordinates
-                #     est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
-                #     img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
-                #     img_est_pos = img_points[0][0].astype(int)
+                    # Project to image coordinates
+                    est_pos_point = np.array([[est_pos_camera]], dtype=np.float32)
+                    img_points, _ = cv2.projectPoints(est_pos_point, np.zeros(3), np.zeros(3), camera_matrix, dist_coeffs)
+                    img_est_pos = img_points[0][0].astype(int)
                     
-                #     # Draw if within bounds
-                #     if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
-                #         0 <= img_est_pos[1] < frame_undistorted.shape[0]):
-                #         cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
+                    # Draw if within bounds
+                    if (0 <= img_est_pos[0] < frame_undistorted.shape[1] and 
+                        0 <= img_est_pos[1] < frame_undistorted.shape[0]):
+                        cv2.circle(frame_undistorted, tuple(img_est_pos), 8, (255, 0, 0), -1)
                         
-                #         R_bt = quaternion_to_rotation_matrix(q_btcap_global)
-                #         R_btcap_cam = R_worldCube_camera @ R_bt
-                #         draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
-                #     else:
-                #         print(f"Estimated position projected outside image: {img_est_pos}")
+                        R_bt = quaternion_to_rotation_matrix(q_btcap_global)
+                        R_btcap_cam = R_worldCube_camera @ R_bt
+                        draw_axes(frame_undistorted, camera_matrix, dist_coeffs, R_btcap_cam, est_pos_camera, AXIS_LENGTH, img_est_pos)
+                    else:
+                        print(f"Estimated position projected outside image: {img_est_pos}")
+
+
+
+
+
 
 
                 calculation_time = time.time()
 
                 mag_magnitude = np.sqrt(magX**2 + magY**2 + magZ**2)
-                tag_euler = rotation_matrix_to_euler(quaternion_to_rotation_matrix(fused_q_cube1_cube2)) if fused_q_cube1_cube2 is not None else [0.0, 0.0, 0.0]
-                bt_euler = rotation_matrix_to_euler(R_btcap_cube2) if R_btcap_cube2 is not None else [0.0, 0.0, 0.0]
+
 
                 # Draw text on text_frame with semi-transparent backgrounds
-                mag_text = f"Mag: X={magX:.2f} uT Y={magY:.2f} uT Z={magZ:.2f} uT M={mag_magnitude:.2f} uT"
-                q_Mag_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
+                ## TAG 
                 q_cube1_global_text =     f"q_Cap_global: [{q_cube1_global[0]:.3f}, {q_cube1_global[1]:.3f}, {q_cube1_global[2]:.3f}, {q_cube1_global[3]:.3f}]" if q_cube1_global is not None else "Cube2 Quat Cap: N/A"
-                q_TAG_Cap_Mag_text =    f"q_Cap_Mag: [{q_cube1_cube2[0]:.3f}, {q_cube1_cube2[1]:.3f}, {q_cube1_cube2[2]:.3f}, {q_cube1_cube2[3]:.3f}]" if q_cube1_cube2 is not None else "Rel Relsensor: N/A"
-                q_btcap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
-                q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
-                est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
-                pos_error_text =        f"Pos Err: x={estX-fused_t_cube1_cube2_tag[0]:.3f} m, y={estY-fused_t_cube1_cube2_tag[1]:.3f} m, z={estZ-fused_t_cube1_cube2_tag[2]:.3f} m" if fused_t_cube1_cube2_tag is not None else "Pos Err: N/A"
-                bglobal_text =     f"bglobal: x={b_global[0]:.3f} uT, y={b_global[1]:.3f} uT, z={b_global[2]:.3f} uT" if b_global is not None else "Global mag vector: N/A"
-                diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
-                diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
-                side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
+                q_cube2_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
                 top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f}" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
+                side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
                 fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f}" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
-                serial_mag_text = f"Serial Mag: X={serial_magX:.2f} uT, Y={serial_magY:.2f} uT, Z={serial_magZ:.2f} uT" if serial_magX is not None else "Serial Mag: N/A"
+                t_cube1_worldCube_text = f"Cube1 Global: x={t_cube1_worldCube[0]:.3f}, y={t_cube1_worldCube[1]:.3f}, z={t_cube1_worldCube[2]:.3f} q:x={q_cube1_worldCube[0]:.3f},{q_cube1_worldCube[1]:.3f},{q_cube1_worldCube[2]:.3f},{q_cube1_worldCube[3]:.3f}" if t_cube1_worldCube is not None and q_cube1_worldCube is not None else "Cube1 Global: N/A"
+                q_cube1_worldCube_text = f"Cube1 Global: qx={q_cube1_worldCube[0]:.3f}, qy={q_cube1_global[1]:.3f}, qz={q_cube1_global[2]:.3f}, qw={q_cube1_global[3]:.3f}" if q_cube1_worldCube is not None else "Cube1 Global: N/A"
+                ## Repeat Test
                 rel_origin_text = f"Rel Origin: x={cube2_pos_rel_origin[0]:.3f} m, y={cube2_pos_rel_origin[1]:.3f} m, z={cube2_pos_rel_origin[2]:.3f} m" if cube2_pos_rel_origin is not None else "Rel Origin: N/A"
                 rel_q_origin_text = f"Rel Q Origin: qx={cube2_q_rel_origin[0]:.3f}, qy={cube2_q_rel_origin[1]:.3f}, qz={cube2_q_rel_origin[2]:.3f}, qw={cube2_q_rel_origin[3]:.3f}" if cube2_q_rel_origin is not None else "Rel Q Origin: N/A"
                 top_rel_origin_text = f"Top Rel Origin: x={top_cube2_pos_rel_origin[0]:.3f} m, y={top_cube2_pos_rel_origin[1]:.3f} m, z={top_cube2_pos_rel_origin[2]:.3f} m" if top_cube2_pos_rel_origin is not None else "Top Rel Origin: N/A"
                 top_rel_q_origin_text = f"Top Rel Q Origin: qx={top_cube2_q_rel_origin[0]:.3f}, qy={top_cube2_q_rel_origin[1]:.3f}, qz={top_cube2_q_rel_origin[2]:.3f}, qw={top_cube2_q_rel_origin[3]:.3f}" if top_cube2_q_rel_origin is not None else "Top Rel Q Origin: N/A"
                 fused_rel_origin_text = f"Fused Rel Origin: x={fused_cube2_pos_rel_origin[0]:.3f} m, y={fused_cube2_pos_rel_origin[1]:.3f} m, z={fused_cube2_pos_rel_origin[2]:.3f} m" if fused_cube2_pos_rel_origin is not None else "Fused Rel Origin: N/A"
                 fused_rel_q_origin_text = f"Fused Rel Q Origin: qx={fused_cube2_q_rel_origin[0]:.3f}, qy={fused_cube2_q_rel_origin[1]:.3f}, qz={fused_cube2_q_rel_origin[2]:.3f}, qw={fused_cube2_q_rel_origin[3]:.3f}" if fused_cube2_q_rel_origin is not None else "Fused Rel Q Origin: N/A"
-                fused_q_cube1_cube2_text = f"Fused q_cube2_cube1: [{fused_q_cube2_cube1[0]:.3f}, {fused_q_cube2_cube1[1]:.3f}, {fused_q_cube2_cube1[2]:.3f}, {fused_q_cube2_cube1[3]:.3f}]" if fused_q_cube2_cube1 is not None else "Fused q_Cap_Mag: N/A"
-                q_cube2_cube2MotorZeroPose_text = f"q_Cube2_Cube2ZeroPose: [{q_cube2_cube2MotorZeroPose[0]:.3f}, {q_cube2_cube2MotorZeroPose[1]:.3f}, {q_cube2_cube2MotorZeroPose[2]:.3f}, {q_cube2_cube2MotorZeroPose[3]:.3f}]" if q_cube2_cube2MotorZeroPose is not None else "q_Cube2_Cube2ZeroPose: N/A"
-                q_btcap_cube2Actual_text = f"q_btcap_cube2Actual: [{q_btcap_cube2Actual[0]:.3f}, {q_btcap_cube2Actual[1]:.3f}, {q_btcap_cube2Actual[2]:.3f}, {q_btcap_cube2Actual[3]:.3f}]" if q_btcap_cube2Actual is not None else "q_btcap_cube2Actual: N/A"
+                
+                ## Verticality Test
+                t_cube2_cube1_text = f"t_cube2_cube1: x={t_cube2_cube1_tag[0]:.3f}, y={t_cube2_cube1_tag[1]:.3f}, z={t_cube2_cube1_tag[2]:.3f}" if t_cube2_cube1_tag is not None else "t_cube2_cube1: N/A"
+                top_t_cube2_cube1_text = f"Top t_cube2_cube1: x={top_t_cube2_cube1_tag[0]:.3f}, y={top_t_cube2_cube1_tag[1]:.3f}, z={top_t_cube2_cube1_tag[2]:.3f}" if top_t_cube2_cube1_tag is not None else "Top t_cube2_cube1: N/A"
+                
+                ## Mag and BT
+                mag_text = f"Mag: X={magX:.2f} uT Y={magY:.2f} uT Z={magZ:.2f} uT M={mag_magnitude:.2f} uT"
+                q_btcap_Mag_text =        f"q_btcap_cube2: [{q_btcap_cube2[0]:.3f}, {q_btcap_cube2[1]:.3f}, {q_btcap_cube2[2]:.3f}, {q_btcap_cube2[3]:.3f}]" if q_btcap_cube2 is not None else "Cube2 Quat Cap: N/A"
+                q_btcap_global_text =   f"q_btcap_global: [{q_btcap_global[0]:.3f}, {q_btcap_global[1]:.3f}, {q_btcap_global[2]:.3f}, {q_btcap_global[3]:.3f}]" if q_btcap_global is not None else "BT Quat Global: N/A"
+                
+                ## Estimation
+                est_pos_text =          f"Est Pos:        x={estX:.3f} m, y={estY:.3f} m, z={estZ:.3f} m"
+                pos_error_text =        f"Pos Err: x={estX-fused_t_cube1_cube2_tag[0]:.3f} m, y={estY-fused_t_cube1_cube2_tag[1]:.3f} m, z={estZ-fused_t_cube1_cube2_tag[2]:.3f} m" if fused_t_cube1_cube2_tag is not None else "Pos Err: N/A"
+                bglobal_text =     f"bglobal: x={b_global[0]:.3f} uT, y={b_global[1]:.3f} uT, z={b_global[2]:.3f} uT" if b_global is not None else "Global mag vector: N/A"
+                diff_euler = [tag_euler[i] - bt_euler[i] for i in range(3)]
+                diff_euler_text = f"Euler Diff: Pitch={diff_euler[0]:.1f}deg, Roll={diff_euler[1]:.1f}deg, Yaw={diff_euler[2]:.1f}deg"
+                serial_mag_text = f"Serial Mag: X={serial_magX:.2f} uT, Y={serial_magY:.2f} uT, Z={serial_magZ:.2f} uT" if serial_magX is not None else "Serial Mag: N/A"
+                
+                ## Motor Pos by encoder
+                motor_pos_text = f"Motor Pos x: {motor_data['x']:.3f} y: {motor_data['y']:.3f} z: {motor_data['z']:.3f} q: [{motor_data['qw']:.3f}, {motor_data['qx']:.3f}, {motor_data['qy']:.3f}, {motor_data['qz']:.3f}]" if motor_data is not None else "Motor Pos: N/A"
+                btcap_motorEncode_text = f"BT Cap Motor Encode q: [{q_btcap_cube2Encode[0]:.3f}, {q_btcap_cube2Encode[1]:.3f}, {q_btcap_cube2Encode[2]:.3f}, {q_btcap_cube2Encode[3]:.3f}]" if q_btcap_cube2Encode is not None else "BT Cap Motor Encode: N/A"
+                motor_encode_error_text = f"Motor Encode Error: [{error_Encodeq[0]:.3f}, {error_Encodeq[1]:.3f}, {error_Encodeq[2]:.3f}, {error_Encodeq[3]:.3f}]" if error_Encodeq is not None else "Motor Encode Error: N/A"
+                
+                ## Other
+                fused_q_cube2_cube1_text = f"Fused q_cube2_cube1: [{fused_q_cube2_cube1[0]:.3f}, {fused_q_cube2_cube1[1]:.3f}, {fused_q_cube2_cube1[2]:.3f}, {fused_q_cube2_cube1[3]:.3f}]" if fused_q_cube2_cube1 is not None else "Fused q_Cap_Mag: N/A"
                 fused_q_cube2_global_text = f"Fused q_cube2_global: [{fused_q_cube2_global[0]:.3f}, {fused_q_cube2_global[1]:.3f}, {fused_q_cube2_global[2]:.3f}, {fused_q_cube2_global[3]:.3f}]" if fused_q_cube2_global is not None else "Fused q_cube2_global: N/A"
                 q_cube2_origin_offset_text = f"q_cube2_origin_offset: [{q_cube2_origin_offset[0]:.3f}, {q_cube2_origin_offset[1]:.3f}, {q_cube2_origin_offset[2]:.3f}, {q_cube2_origin_offset[3]:.3f}]" if q_cube2_origin_offset is not None else "q_cube2_origin_offset: N/A"
                 q_cube2_recordedGlobal_text = f"q_cube2_recordedGlobal: [{q_cube2_recordedGlobal[0]:.3f}, {q_cube2_recordedGlobal[1]:.3f}, {q_cube2_recordedGlobal[2]:.3f}, {q_cube2_recordedGlobal[3]:.3f}]" if q_cube2_recordedGlobal is not None else "q_cube2_recordedGlobal: N/A"
-                t_cube2_cube1_text = f"t_cube2_cube1: x={t_cube2_cube1_tag[0]:.3f}, y={t_cube2_cube1_tag[1]:.3f}, z={t_cube2_cube1_tag[2]:.3f}" if t_cube2_cube1_tag is not None else "t_cube2_cube1: N/A"
-                top_t_cube2_cube1_text = f"Top t_cube2_cube1: x={top_t_cube2_cube1_tag[0]:.3f}, y={top_t_cube2_cube1_tag[1]:.3f}, z={top_t_cube2_cube1_tag[2]:.3f}" if top_t_cube2_cube1_tag is not None else "Top t_cube2_cube1: N/A"
+
                 intervalOffset = 1
                 FONT_SCALE = 1
-                draw_text_with_background(text_frame, mag_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, side_cam_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, top_cam_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, fused_q_cube1_cube2_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                draw_text_with_background(text_frame, fused_cam_text, (50, int(50*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+                draw_text_with_background(text_frame, top_cam_text, (50, int(90*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
+                draw_text_with_background(text_frame, side_cam_text, (50, int(130*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
+
+                draw_text_with_background(text_frame, motor_pos_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255),3)
+
+                # draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255),3)
+                # draw_text_with_background(text_frame, fused_q_cube2_cube1_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
+
                 # draw_text_with_background(text_frame, fused_q_cube2_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                 # draw_text_with_background(text_frame, q_cube2_origin_offset_text, (50, int(290*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
                 # draw_text_with_background(text_frame, q_cube2_recordedGlobal_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, t_cube2_cube1_text, (50, int(330*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                draw_text_with_background(text_frame, top_t_cube2_cube1_text, (50, int(370*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
-                # draw_text_with_background(text_frame, q_cube2_cube2MotorZeroPose_text, (50, int(410*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                if verticality_test_mode:
+                    draw_text_with_background(text_frame, t_cube2_cube1_text, (50, int(300*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, top_t_cube2_cube1_text, (50, int(340*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    
+                elif repeatability_test_mode:
+                    draw_text_with_background(text_frame, fused_rel_origin_text, (50, int(300*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, fused_rel_q_origin_text, (50, int(340*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3) 
+                    # draw_text_with_background(text_frame, rel_origin_text, (50, int(380*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    # draw_text_with_background(text_frame, rel_q_origin_text, (50, int(420*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    # draw_text_with_background(text_frame, top_rel_origin_text, (50, int(460*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    # draw_text_with_background(text_frame, top_rel_q_origin_text, (50, int(500*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
+                    draw_text_with_background(text_frame, motor_pos_text, (50, int(440*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, q_btcap_global_text, (50, int(480*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, btcap_motorEncode_text, (50, int(520*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, motor_encode_error_text, (50, int(560*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
 
-                draw_text_with_background(text_frame, q_btcap_global_text, (50, int(450*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 0, 255, 255), 3)
-                draw_text_with_background(text_frame, q_btcap_cube2Actual_text, (50, int(490*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 3)
-                draw_text_with_background(text_frame, est_pos_text, (50, int(530*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
-                draw_text_with_background(text_frame, pos_error_text, (50, int(570*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
 
-                # print(fused_cam_text,serial_mag_text)
-                # if time.time() - last_motor_update > MOTOR_UPDATE_INTERVAL:
-                #     with position_data_lock:
-                #         if latest_position_data:
-                #             motor_data = latest_position_data.copy()
-                #     last_motor_update = time.time()
+                else:
+                    draw_text_with_background(text_frame, motor_pos_text, (50, int(300*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, btcap_motorEncode_text, (50, int(340*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+                    draw_text_with_background(text_frame, motor_encode_error_text, (50, int(380*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+
+                    draw_text_with_background(text_frame, q_btcap_global_text, (50, int(420*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, ( 0, 255, 255), 3)
+                    draw_text_with_background(text_frame, est_pos_text, (50, int(460*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255), 2)
+                    draw_text_with_background(text_frame, pos_error_text, (50, int(500*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
+
 
                 drawtext_time = time.time()
 
@@ -2123,39 +2615,46 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('t') or auto_record_flag:
-                    # if magX is not None and magY is not None and magZ is not None and q_cube1_cube2 is not None:
-                    #     measurement_order += 1
-                    #     # q_cube1_cube2 = rotation_matrix_to_quaternion(rel_Rsensor)
-                    #     errorX = estX - t_cube1_cube2_tag[0]
-                    #     errorY = estY - t_cube1_cube2_tag[1]
-                    #     errorZ = estZ - t_cube1_cube2_tag[2]
-                    #     writer.writerow([
-                    #         measurement_order,
-                    #         f'{fused_t_cube1_cube2_tag[0]:.6f}', f'{fused_t_cube1_cube2_tag[1]:.6f}', f'{fused_t_cube1_cube2_tag[2]:.6f}',
-                    #         f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}',
-                    #         f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
-                    #         f'{serial_magX:.3f}', f'{serial_magY:.3f}', f'{serial_magZ:.3f}',
-                    #         f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
-                    #         f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
-                    #     ])
-                    #     csvfile.flush()
-                    #     draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
-                    #     time.sleep(0.2)
-                    #     auto_record_flag = False
 
-                    ## for repeatability testing
+                    if repeatability_test_mode:
+                        if fused_cube2_pos_rel_origin is not None and fused_cube2_q_rel_origin is not None and fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None:
+                            measurement_order += 1
+                            writer.writerow([
+                                measurement_order,
+                                f'{fused_cube2_pos_rel_origin[0]:.5f}', f'{fused_cube2_pos_rel_origin[1]:.5f}', f'{fused_cube2_pos_rel_origin[2]:.5f}',
+                                f'{fused_cube2_q_rel_origin[0]:.5f}', f'{fused_cube2_q_rel_origin[1]:.5f}', f'{fused_cube2_q_rel_origin[2]:.5f}', f'{fused_cube2_q_rel_origin[3]:.5f}',
+                                f'{fused_t_cube1_cube2_tag[0]:.5f}', f'{fused_t_cube1_cube2_tag[1]:.5f}', f'{fused_t_cube1_cube2_tag[2]:.5f}',
+                                f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}'
+                            ])
+                            csvfile.flush()
+                            draw_text_with_background(text_frame, "REPEATABILITY DATA LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+                            time.sleep(0.2)
+                            auto_record_flag = False
+                        else:
+                            print("Skipping data")                    
+                    else:
+                        if magX is not None and magY is not None and magZ is not None and q_cube1_cube2 is not None:
+                            measurement_order += 1
+                            # q_cube1_cube2 = rotation_matrix_to_quaternion(rel_Rsensor)
+                            errorX = estX - t_cube1_cube2_tag[0]
+                            errorY = estY - t_cube1_cube2_tag[1]
+                            errorZ = estZ - t_cube1_cube2_tag[2]
+                            writer.writerow([
+                                measurement_order,
+                                f'{fused_t_cube1_cube2_tag[0]:.6f}', f'{fused_t_cube1_cube2_tag[1]:.6f}', f'{fused_t_cube1_cube2_tag[2]:.6f}',
+                                f'{fused_q_cube1_cube2[0]:.5f}', f'{fused_q_cube1_cube2[1]:.5f}', f'{fused_q_cube1_cube2[2]:.5f}', f'{fused_q_cube1_cube2[3]:.5f}',
+                                f'{cube2_euler[0]:.5f}', f'{cube2_euler[1]:.5f}', f'{cube2_euler[2]:.5f}',
+                                f'{serial_magX:.3f}', f'{serial_magY:.3f}', f'{serial_magZ:.3f}',
+                                f'{estX:.3f}', f'{estY:.3f}', f'{estZ:.3f}',
+                                f'{errorX:.3f}', f'{errorY:.3f}', f'{errorZ:.3f}'
+                            ])
+                            csvfile.flush()
+                            draw_text_with_background(text_frame, "MAG FIELD & POS LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
+                            time.sleep(0.2)
+                            auto_record_flag = False
 
-                    if fused_cube2_pos_rel_origin is not None and fused_cube2_q_rel_origin is not None:
-                        measurement_order += 1
-                        writer.writerow([
-                            measurement_order,
-                            f'{fused_cube2_pos_rel_origin[0]:.5f}', f'{fused_cube2_pos_rel_origin[1]:.5f}', f'{fused_cube2_pos_rel_origin[2]:.5f}',
-                            f'{fused_cube2_q_rel_origin[0]:.5f}', f'{fused_cube2_q_rel_origin[1]:.5f}', f'{fused_cube2_q_rel_origin[2]:.5f}', f'{fused_cube2_q_rel_origin[3]:.5f}'
-                        ])
-                        csvfile.flush()
-                        draw_text_with_background(text_frame, "REPEATABILITY DATA LOGGED", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 2)
-                        time.sleep(0.2)
-                        auto_record_flag = False
+
+
 
                 elif key == ord ('f'):
                     ## record the magnet origin position so as to check accuracy of encoder only magnet pose estimation
@@ -2221,10 +2720,20 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
 if __name__ == "__main__":
     try:
-        
-        camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs = calibrate_camera()
-        if camera_matrix is not None and dist_coeffs is not None and top_camera_matrix is not None and top_dist_coeffs is not None:
-            detect_apriltags(camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs)
+        parser = argparse.ArgumentParser(description="AprilTag Localization with Magnetometer Fusion")
+        parser.add_argument('--repeat', action='store_true', help='Run in repeatability test mode (logs cube2 position relative to origin)')
+        parser.add_argument('--vert', action='store_true', help='Run in verticality test mode (logs cube2 global orientation)')
+        parser.add_argument('--bt_only', action='store_true', help='Skip AprilTag processing and use BT + motor data only')
+        args = parser.parse_args()
+
+
+
+        if args.bt_only:
+            detect_apriltags(None, None, None, None, args)
+        else:
+            camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs = calibrate_camera()
+            if camera_matrix is not None and dist_coeffs is not None and top_camera_matrix is not None and top_dist_coeffs is not None:
+                detect_apriltags(camera_matrix, dist_coeffs, top_camera_matrix, top_dist_coeffs, args)
     except Exception as e:
         print(f"Main program error: {e}")
     finally:
