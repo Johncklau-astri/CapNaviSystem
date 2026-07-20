@@ -28,9 +28,9 @@ shutdown_event = threading.Event()  # Add this line
 observers = []  # Move this to global scope
 
 # Constants
-DATA_DIRECTORY = r"R:\FX3_PCApp\FX3DisplayImage\Release_Internal_V1A\output"  # Directory to monitor for txt files
+DATA_DIRECTORY = r"R:\Release_Internal_V1A\output"  # Directory to monitor for txt files
 TIMESTAMP_FILE = "last_processed.txt"  # File to store last processed file number
-LOG_FILENAME = "orientation_log.txt"
+LOG_FILENAME = "calibration_log.txt"
 
 # TCP Server for sending data to aprilTagLocalization
 TCP_SERVER_HOST = 'localhost'
@@ -60,7 +60,62 @@ data_queue = queue.Queue()
 forced_invert_signs = False
 logging_enabled = False
 log_file = None
+logging_source = "magnetometer"
+one_shot_logging_trigger = threading.Event()
+logging_lock = threading.Lock()
 q_prev = None  # Global reference tracking for gyro-predicted field direction
+
+
+def get_log_filename():
+    """Return the calibration file associated with the selected sensor."""
+    return LOG_FILENAME
+
+
+def log_sensor_sample(sample, one_shot=False):
+    """Write one raw X,Y,Z sensor sample in the calibration tool format."""
+    global log_file, logging_enabled
+    values = np.asarray(sample, dtype=float)
+    if values.shape != (3,):
+        raise ValueError(f"Expected a three-axis sample, received shape {values.shape}")
+
+    with logging_lock:
+        if one_shot:
+            with open(get_log_filename(), "a") as output_file:
+                output_file.write(f"{values[0]:.6f},{values[1]:.6f},{values[2]:.6f}\n")
+            print(f"Logged one {logging_source} sample to {get_log_filename()}")
+        elif logging_enabled and log_file:
+            log_file.write(f"{values[0]:.6f},{values[1]:.6f},{values[2]:.6f}\n")
+            log_file.flush()
+
+
+def start_logging():
+    """Start continuous raw data logging for the selected sensor."""
+    global log_file, logging_enabled
+    with logging_lock:
+        log_file = open(get_log_filename(), "w")
+        logging_enabled = True
+    print(f"Started continuous {logging_source} logging to {get_log_filename()}")
+
+
+def stop_logging():
+    """Stop continuous data logging."""
+    global log_file, logging_enabled
+    with logging_lock:
+        if log_file:
+            log_file.close()
+            log_file = None
+        logging_enabled = False
+    print("Stopped continuous logging")
+
+
+# def toggle_logging_source():
+#     """Switch the sensor whose samples are captured by the logging controls."""
+#     global logging_source
+#     if logging_enabled:
+#         print("Stop continuous logging before switching the logging source")
+#         return
+#     logging_source = "imu" if logging_source == "magnetometer" else "magnetometer"
+#     print(f"Logging source set to {logging_source} ({get_log_filename()})")
 
 def quaternion_to_rotation_matrix(q):
     """Convert a quaternion [qw, qx, qy, qz] to a 3x3 rotation matrix."""
@@ -211,99 +266,7 @@ class MadgwickFilter:
         
         return self.filtered_q, error, corrected_gyro
     
-# class MadgwickFilter:
-#     def __init__(self, beta=0.5):
-#         """Initialize Madgwick filter parameters."""
-#         self.beta = beta
-#         self.q = np.array([1.0, 0.0, 0.0, 0.0])
-#         self.last_time = None
-#         self.gravity_ref = np.array([0.0, 0.0, 1.0])
-#         self.magnetic_ref = np.array([0.0, -1.0, 0.0])
 
-#     def quaternion_multiply(self, q1, q2):
-#         """Multiply two quaternions."""
-#         w1, x1, y1, z1 = q1
-#         w2, x2, y2, z2 = q2
-#         return np.array([
-#             w1*w2 - x1*x2 - y1*y2 - z1*z2,
-#             w1*x2 + x1*w2 + y1*z2 - z1*y2,
-#             w1*y2 - x1*z2 + y1*w2 + z1*x2,
-#             w1*z2 + x1*y2 - y1*x2 + z1*w2
-#         ])
-
-#     def quaternion_conjugate(self, q):
-#         return np.array([q[0], -q[1], -q[2], -q[3]])
-
-#     def normalize_quaternion(self, q):
-#         norm = np.linalg.norm(q)
-#         return q / norm if norm > 0 else q
-
-#     def normalize_vector(self, v):
-#         norm = np.linalg.norm(v)
-#         return v / norm if norm > 0 else v
-
-#     def init(self):
-#         self.q = np.array([1.0, 0.0, 0.0, 0.0])
-#         return self.q
-
-#     def update(self, gyro, accel, mag, current_time=None):
-#         """Update Madgwick filter with gyro, accelerometer and magnetometer data."""
-#         if current_time is None:
-#             current_time = time.time()
-            
-#         if self.last_time is None:
-#             dt = 0.01
-#         else:
-#             dt = current_time - self.last_time
-            
-#         self.last_time = current_time
-        
-#         accel_normalized = self.normalize_vector(accel)
-#         mag_normalized = self.normalize_vector(mag)
-        
-#         q0, q1, q2, q3 = self.q
-        
-#         h = self.quaternion_multiply(
-#             self.quaternion_multiply(self.q, np.array([0.0, *mag_normalized])),
-#             self.quaternion_conjugate(self.q)
-#         )[1:]
-        
-#         b = np.array([0.0, np.linalg.norm([self.magnetic_ref[0], self.magnetic_ref[1]]), 
-#                         0.0, self.magnetic_ref[2]])
-        
-#         f = np.array([
-#             2.0 * (q1*q3 - q0*q2) - accel_normalized[0],
-#             2.0 * (q0*q1 + q2*q3) - accel_normalized[1],
-#             2.0 * (0.5 - q1*q1 - q2*q2) - accel_normalized[2],
-#             2.0 * b[1] * (0.5 - q2*q2 - q3*q3) + 2.0 * b[3] * (q1*q3 - q0*q2) - mag_normalized[0],
-#             2.0 * b[1] * (q1*q2 - q0*q3) + 2.0 * b[3] * (q0*q1 + q2*q3) - mag_normalized[1],
-#             2.0 * b[1] * (q0*q2 + q1*q3) + 2.0 * b[3] * (0.5 - q1*q1 - q2*q2) - mag_normalized[2]
-#         ])
-        
-#         J = np.array([
-#             [-2.0*q2, 2.0*q3, -2.0*q0, 2.0*q1],
-#             [2.0*q1, 2.0*q0, 2.0*q3, 2.0*q2],
-#             [0.0, -4.0*q1, -4.0*q2, 0.0],
-#             [-2.0*b[3]*q2, 2.0*b[3]*q3, -4.0*b[1]*q2 - 2.0*b[3]*q0, -4.0*b[1]*q3 + 2.0*b[3]*q1],
-#             [-2.0*b[1]*q3 + 2.0*b[3]*q1, 2.0*b[1]*q2 + 2.0*b[3]*q0, 2.0*b[1]*q1 + 2.0*b[3]*q3, -2.0*b[1]*q0 + 2.0*b[3]*q2],
-#             [2.0*b[1]*q2, 2.0*b[1]*q3 - 4.0*b[3]*q1, 2.0*b[1]*q0 - 4.0*b[3]*q2, 2.0*b[1]*q1]
-#         ])
-        
-#         gradient = J.T @ f
-#         if np.linalg.norm(gradient) > 0:
-#             gradient = gradient / np.linalg.norm(gradient)
-        
-#         q_dot_gyro = 0.5 * self.quaternion_multiply(self.q, np.array([0.0, *gyro]))
-#         q_dot_gradient = self.beta * gradient
-        
-#         corrected_gyro = gyro - 2.0 * self.beta * gradient[1:]
-        
-#         q_dot = q_dot_gyro - q_dot_gradient
-#         self.q = self.q + q_dot * dt
-#         self.q = self.normalize_quaternion(self.q)
-        
-#         error = gradient[1:] * self.beta
-#         return self.q, error, corrected_gyro
 
 class LockInAmplifier:
     def __init__(self, target_freq, alpha, hp_alpha):
@@ -516,6 +479,7 @@ class DataProcessor:
         self.ac_lowpass_mag = None
         self.mod_q_lowpass = None
         self.last_file_num = -1
+        self.last_packet_timestamp = -1.0
         self.data_buffer = []
         self.packet_timestamps = deque(maxlen=100)
         self.input_rate_hz = 0.0
@@ -554,36 +518,140 @@ class DataProcessor:
                 self.file_rate_window_file_count = 0
         return self.file_extraction_rate_hz
     
-    def calibrate_magnetometer(self, mag_raw):
-        """Apply magnetometer calibration."""
-        mag_corrected = [
-            mag_raw[0] - self.HARD_IRON_BIAS[0],
-            mag_raw[1] - self.HARD_IRON_BIAS[1],
-            mag_raw[2] - self.HARD_IRON_BIAS[2]
-        ]
-        return mag_corrected
+    def calibrate_magnetometer(self, mag_raw, pitch_deg=0, roll_deg=0, yaw_deg=0):
+        """
+        Calibrate raw magnetometer data using hard iron bias, soft iron matrix,
+        and a dynamically generated boresight rotation matrix from Euler angles.
+        
+        The boresight matrix uses the ZYX (Yaw-Pitch-Roll) intrinsic sequence:
+        R = R_x(roll) @ R_y(pitch) @ R_z(yaw)
+        
+        Args: 
+            mag_raw: Raw magnetometer readings [x, y, z] in microTesla
+            pitch_deg: Physical tilt around Y-axis in degrees
+            roll_deg: Physical tilt around X-axis in degrees
+            yaw_deg: Physical tilt around Z-axis in degrees
+            
+        Returns:
+            Calibrated and structurally aligned readings [x, y, z] in microTesla
+        """
+        # Convert to numpy array for vectorized operations
+        mag_raw = np.array(mag_raw)
+        
+        # 1. HARD IRON BIAS (Offset correction)
+        magnet_bias = np.array([0, 0, 0])
+        hard_iron_bias = np.array([19.744134, -7.018865, 14.425593])
+        soft_iron_matrix = np.array([
+            [1.000023, -0.037484, -0.004686],
+            [-0.037484, 1.005176, 0.007214],
+            [-0.004686, 0.007214, 0.991864]
+        ])
+        
+        # 3. GENERATE BORESIGHT CORRECTION MATRIX (R_mc) FROM EULER ANGLES
+        # Convert angles from degrees to radians
+        alpha = np.radians(yaw_deg)    # Rotation around Z
+        beta  = np.radians(pitch_deg)  # Rotation around Y
+        gamma = np.radians(roll_deg)   # Rotation around X
+        
+        # Individual axis rotation matrices
+        R_z = np.array([
+            [np.cos(alpha), -np.sin(alpha), 0],
+            [np.sin(alpha),  np.cos(alpha), 0],
+            [0,              0,             1]
+        ])
+        
+        R_y = np.array([
+            [ np.cos(beta), 0, np.sin(beta)],
+            [ 0,            1, 0           ],
+            [-np.sin(beta), 0, np.cos(beta)]
+        ])
+        
+        R_x = np.array([
+            [1, 0,              0             ],
+            [0, np.cos(gamma), -np.sin(gamma)],
+            [0, np.sin(gamma),  np.cos(gamma)]
+        ])
+        
+        # Combined ZYX transformation matrix
+        R_mc = R_x @ R_y @ R_z
+        
+        # --- Execute Calibration Pipeline ---
+        
+        # Step A: Apply ellipsoid correction (Raw -> Corrected Sensor Frame)
+        mag_ellipsoid_corrected = (mag_raw - hard_iron_bias - magnet_bias) @ soft_iron_matrix.T
+        
+        # Step B: Apply Boresight Alignment (Corrected Sensor Frame -> Physical Board Frame)
+        mag_final = R_mc @ mag_ellipsoid_corrected
+        
+        
+        return mag_final.tolist()
     
-    def calibrate_accelerometer(self, accel_raw):
-        """Apply accelerometer calibration."""
+    def calibrate_accelerometer(self, accel_raw, tune_roll_deg=0, tune_pitch_deg=0):
+        """
+        Calibrate raw accelerometer data using bias parameters, a static calibration matrix,
+        and a dynamically calculated boresight correction matrix based on custom tuning angles.
+        """
+        # Bias parameters (offset correction)
+        bias_x = -0.011205
+        bias_y = -0.012890
+        bias_z = 0.024886
+        
+        # Calibration matrix (scale and misalignment correction)
+        cal_matrix_xx = 0.989532; cal_matrix_xy = -0.001051; cal_matrix_xz = 0.001429
+        cal_matrix_yx = -0.001051; cal_matrix_yy = 0.989770; cal_matrix_yz = -0.001372
+        cal_matrix_zx = 0.001429; cal_matrix_zy = -0.001372; cal_matrix_zz = 1.003220
+
+        # Dynamic Boresight Matrix Calculation
+        # Convert tuning parameters to radians and invert signs to rotate backwards
+        alpha = -np.radians(tune_roll_deg)
+        beta = -np.radians(tune_pitch_deg)
+        
+        # Rotation about X-axis (Roll)
+        R_x = np.array([
+            [1, 0, 0],
+            [0, np.cos(alpha), -np.sin(alpha)],
+            [0, np.sin(alpha), np.cos(alpha)]
+        ])
+        
+        # Rotation about Y-axis (Pitch)
+        R_y = np.array([
+            [np.cos(beta), 0, np.sin(beta)],
+            [0, 1, 0],
+            [-np.sin(beta), 0, np.cos(beta)]
+        ])
+        
+        # Combine matrices using the Roll-then-Pitch order (R_y * R_x)
+        R_correct = np.dot(R_y, R_x)
+        
+        # Map the generated elements directly to your variables
+        cor_matrix_xx, cor_matrix_xy, cor_matrix_xz = R_correct[0]
+        cor_matrix_yx, cor_matrix_yy, cor_matrix_yz = R_correct[1]
+        cor_matrix_zx, cor_matrix_zy, cor_matrix_zz = R_correct[2]
+
+        # Step 1: Apply bias correction (remove offset)
         accel_biased = [
-            accel_raw[0] - self.ACCEL_BIAS[0],
-            accel_raw[1] - self.ACCEL_BIAS[1],
-            accel_raw[2] - self.ACCEL_BIAS[2]
+            accel_raw[0] - bias_x,
+            accel_raw[1] - bias_y,
+            accel_raw[2] - bias_z
         ]
         
+        # Step 2: Apply calibration matrix (correct scale and alignment)
         accel_calibrated = [
-            self.ACCEL_MATRIX[0][0] * accel_biased[0] + 
-            self.ACCEL_MATRIX[0][1] * accel_biased[1] + 
-            self.ACCEL_MATRIX[0][2] * accel_biased[2],
-            self.ACCEL_MATRIX[1][0] * accel_biased[0] + 
-            self.ACCEL_MATRIX[1][1] * accel_biased[1] + 
-            self.ACCEL_MATRIX[1][2] * accel_biased[2],
-            self.ACCEL_MATRIX[2][0] * accel_biased[0] + 
-            self.ACCEL_MATRIX[2][1] * accel_biased[1] + 
-            self.ACCEL_MATRIX[2][2] * accel_biased[2]
+            cal_matrix_xx * accel_biased[0] + cal_matrix_xy * accel_biased[1] + cal_matrix_xz * accel_biased[2],
+            cal_matrix_yx * accel_biased[0] + cal_matrix_yy * accel_biased[1] + cal_matrix_yz * accel_biased[2],
+            cal_matrix_zx * accel_biased[0] + cal_matrix_zy * accel_biased[1] + cal_matrix_zz * accel_biased[2]
         ]
-        
-        return accel_calibrated
+        # print(f"Calibrated Accel: [X: {accel_calibrated[0]:.4f}g,\tY: {accel_calibrated[1]:.4f}g,\tZ: {accel_calibrated[2]:.4f}g]")
+
+        # Step 3: Apply correction matrix (final adjustment)
+        accel_corrected = [
+            cor_matrix_xx * accel_calibrated[0] + cor_matrix_xy * accel_calibrated[1] + cor_matrix_xz * accel_calibrated[2],
+            cor_matrix_yx * accel_calibrated[0] + cor_matrix_yy * accel_calibrated[1] + cor_matrix_yz * accel_calibrated[2],
+            cor_matrix_zx * accel_calibrated[0] + cor_matrix_zy * accel_calibrated[1] + cor_matrix_zz * accel_calibrated[2]
+        ]
+        # print(f"Corrected Accel:  [X: {accel_corrected[0]:.4f}g,\tY: {accel_corrected[1]:.4f}g,\tZ: {accel_corrected[2]:.4f}g]")
+
+        return accel_corrected
     
     def parse_data_packet(self, data_bytes, base_time):
         """Parse a single data packet of 4+12+7=23 bytes."""
@@ -605,19 +673,27 @@ class DataProcessor:
         mag_uT = [x * 1.1 for x in mag_data]
 
         # Apply coordinate transformations
-        temp = accel_g[0]
-        accel_g[0] = -accel_g[1]
-        accel_g[1] = -temp
+
+        temp = accel_g[2]
+        accel_g[2] = -accel_g[0]
+        accel_g[0] = -temp
+
         
-        temp = -gyro_dps[0]
-        gyro_dps[0] = gyro_dps[1]
-        gyro_dps[1] = -temp
-        gyro_dps[2] = -gyro_dps[2]
-        
-        temp = mag_uT[0]
-        mag_uT[0] = -mag_uT[2]
-        mag_uT[2] = temp
-        mag_uT[1] = -mag_uT[1]
+        temp = gyro_dps[2]
+        gyro_dps[2] = gyro_dps[0]
+        gyro_dps[0] = temp
+
+        gyro_dps[1] = -gyro_dps[1]
+
+        temp = mag_uT[2]
+        mag_uT[2] = mag_uT[1]
+        mag_uT[1] = -temp
+
+        mag_uT[0] = -mag_uT[0]
+
+
+
+
         
         return timestamp, accel_g, gyro_dps, mag_uT
     
@@ -678,31 +754,58 @@ class DataProcessor:
             hex_string = ''.join(content.split())
             data = bytes.fromhex(hex_string)
 
-            new_data_count = data[5]
             data = data[6:131] + data[131+8:244]
-            
-            if len(data) < 6 or new_data_count == 0:
-                return
-            
-            data_start = 0
             packet_size = 23
-            
-            for i in range(min(new_data_count, 10)):
-                packet_offset = data_start + i * packet_size
+            num_packets = len(data) // packet_size
+            if num_packets == 0:
+                return
+
+            parsed_packets = []
+            for i in range(num_packets):
+                packet_offset = i * packet_size
                 if packet_offset + packet_size > len(data):
                     break
-                
+
                 packet_data = data[packet_offset:packet_offset + packet_size]
                 result = self.parse_data_packet(packet_data, 0)
-                
-                if result:
-                    timestamp, accel_g, gyro_dps, mag_uT = result
-                    self.update_sensor_input_rate(timestamp)
-                    mag_calibrated = self.calibrate_magnetometer(mag_uT)
-                    accel_calibrated = self.calibrate_accelerometer(accel_g)
+                if not result:
+                    continue
+
+                timestamp, accel_g, gyro_dps, mag_uT = result
+                if timestamp <= self.last_packet_timestamp:
+                    continue
+
+                parsed_packets.append((timestamp, accel_g, gyro_dps, mag_uT))
+
+            if not parsed_packets:
+                self.last_file_num = file_num
+                self.update_file_extraction_rate()
+                handler = next((h for h in observers if isinstance(h, DataFileHandler)), None)
+                if handler:
+                    handler.save_last_processed(file_num)
+                return
+
+            parsed_packets.sort(key=lambda item: item[0])
+            for timestamp, accel_g, gyro_dps, mag_uT in parsed_packets:
+                self.last_packet_timestamp = timestamp
+                self.update_sensor_input_rate(timestamp)
+
+                sample_to_log = mag_uT if logging_source == "magnetometer" else accel_g
+
+                ## For "l" one shot logging
+                if one_shot_logging_trigger.is_set():
+                    log_sensor_sample(sample_to_log, one_shot=True)
+                    one_shot_logging_trigger.clear()
                     
-                    data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated, 0))
-                    self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated))
+                ## For "m" continuous logging
+                log_sensor_sample(sample_to_log)
+
+
+                mag_calibrated = self.calibrate_magnetometer(mag_uT)
+                accel_calibrated = self.calibrate_accelerometer(accel_g)
+
+                data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated, 0))
+                self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated))
             
             self.update_file_extraction_rate()
             self.last_file_num = file_num
@@ -741,7 +844,7 @@ def processing_thread(processor):
         while not shutdown_event.is_set():
             try:
                 current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get(timeout=1.0)
-                print(f" Raw Data: aX: {accel_g[0]:.3f} g, aY: {accel_g[1]:.3f} g, aZ: {accel_g[2]:.3f} g, gX: {gyro_dps[0]:.3f} dps, gY: {gyro_dps[1]:.3f} dps, gZ: {gyro_dps[2]:.3f} dps, mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT")
+                # print(f"Sign Corrected Raw a[0]: {accel_g[0]:.3f} g, a[1]: {accel_g[1]:.3f} g, a[2]: {accel_g[2]:.3f} g, m[0]: {mag_uT[0]:.3f} uT, m[1]: {mag_uT[1]:.3f} uT, m[2]: {mag_uT[2]:.3f} uT, gyro[0]: {gyro_dps[0]:.3f} dps, gyro[1]: {gyro_dps[1]:.3f} dps, gyro[2]: {gyro_dps[2]:.3f} dps")
 
                 # Track calculation update frequency
                 packet_count += 1
@@ -812,15 +915,18 @@ def processing_thread(processor):
                 # Print results (Now includes current data update rate)
                 mag_magnitude = np.sqrt(mag_array[0]**2 + mag_array[1]**2 + mag_array[2]**2)
                 ac_magnitude = np.sqrt(mag_amplitudes[0]**2 + mag_amplitudes[1]**2 + mag_amplitudes[2]**2)
-                
-                print(f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\t"
+
+                print(
+                    # f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\t"
                     #   f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
-                      f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
-                    #   f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
-                    #   f"Processed files: {processor.files_completed}\t"
-                    #   f"Process rate: {update_rate:.2f} Hz\t"
-                    #   f"D.P. Timestamp: {current_time:.3f}s"
-                      )
+                    # f" Raw  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT"
+                    f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\t"
+                    f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
+                    f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
+                    f"files #: {processor.files_completed}\t"
+                    f"Processing: {update_rate:.2f} Hz\t"
+                    f"D.P. Timestamp: {current_time:.3f}s"
+                    )
                 
                 # Update plots
                 plot_time.append(current_time)
@@ -924,6 +1030,9 @@ def keyboard_listener():
     global forced_invert_signs
     print("Press 'c' to correct phase / invert signs using dynamic tracking context")
     print("Press 'r' to reset DC offsets")
+    print("Press 's' to switch logging source (magnetometer or IMU accelerometer)")
+    print("Press 'l' to log one sample from the selected source")
+    print("Press 'm' to start/stop continuous logging for the selected source")
     print("Press 'q' to quit")
     
     while not shutdown_event.is_set():
@@ -937,6 +1046,22 @@ def keyboard_listener():
                 lockin = next((th for th in threading.enumerate() if hasattr(th, 'lockin')), None)
                 if lockin:
                     lockin.reset_dc_offsets()
+                time.sleep(0.5)
+
+            # if keyboard.is_pressed('s'):
+            #     toggle_logging_source()
+            #     time.sleep(0.5)
+
+            if keyboard.is_pressed('l'):
+                one_shot_logging_trigger.set()
+                print(f"One {logging_source} sample will be logged to {get_log_filename()}")
+                time.sleep(0.5)
+
+            if keyboard.is_pressed('m'):
+                if logging_enabled:
+                    stop_logging()
+                else:
+                    start_logging()
                 time.sleep(0.5)
                 
             if keyboard.is_pressed('q'):
@@ -1041,6 +1166,7 @@ def cleanup():
             pass
     
     tcp_server_running = False
+    stop_logging()
     
     try:
         while not data_queue.empty():
