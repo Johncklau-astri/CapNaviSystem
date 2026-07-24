@@ -129,6 +129,13 @@ def get_image_revision(path):
     except FileNotFoundError:
         return None
 
+
+def load_capsule_frame(path):
+    frame = cv2.imread(path)
+    if frame is None:
+        return None
+    return cv2.rotate(frame, cv2.ROTATE_180)
+
 # -----------------------------------------------------------------------------
 # PHASE 1: INTRINSIC CALIBRATION
 # -----------------------------------------------------------------------------
@@ -143,6 +150,8 @@ def run_intrinsic_calibration():
     all_corners = []
     all_ids = []
     imsize = None
+    last_valid_frame = None
+    frame_size_wh = None
     
     cv2.namedWindow("Capsule Camera Feed", cv2.WINDOW_NORMAL)
     last_processed_img = None
@@ -152,10 +161,12 @@ def run_intrinsic_calibration():
         img_path = get_latest_image(DATA_DIRECTORY)
         image_revision = get_image_revision(img_path) if img_path else None
         if image_revision is not None and image_revision != last_processed_revision:
-            frame = cv2.imread(img_path)
+            frame = load_capsule_frame(img_path)
             if frame is not None:
+                last_valid_frame = frame.copy()
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 imsize = gray.shape[::-1]
+                frame_size_wh = imsize
                 charuco_corners, charuco_ids, _, _ = detector.detectBoard(gray)
                 
                 vis_frame = frame.copy()
@@ -209,6 +220,65 @@ def run_intrinsic_calibration():
         np.savez(INTRINSIC_FILE, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
         print(f"\n✅ Intrinsic dataset compiled successfully and cached to: '{INTRINSIC_FILE}'")
         print("Camera Matrix:\n", camera_matrix)
+
+        fx = float(camera_matrix[0, 0])
+        fy = float(camera_matrix[1, 1])
+        cx = float(camera_matrix[0, 2])
+        cy = float(camera_matrix[1, 2])
+
+        if frame_size_wh is None:
+            frame_size_wh = imsize
+        width_px, height_px = frame_size_wh
+        center_offset_x_px = cx - (width_px / 2.0)
+        center_offset_y_px = cy - (height_px / 2.0)
+        pixel_pitch_um = 1.4
+
+        dist = dist_coeffs.ravel().astype(float)
+        k1 = float(dist[0]) if dist.size > 0 else 0.0
+        k2 = float(dist[1]) if dist.size > 1 else 0.0
+        p1 = float(dist[2]) if dist.size > 2 else 0.0
+        p2 = float(dist[3]) if dist.size > 3 else 0.0
+        k3 = float(dist[4]) if dist.size > 4 else 0.0
+
+        pitch_deg = np.degrees(-p2 / (2.0 * fx))
+        yaw_deg = np.degrees(p1 / (2.0 * fy))
+
+        print("\n=== Calibration Diagnostic Summary ===")
+        print(f"fx: {fx:.6f} px ({fx * pixel_pitch_um:.6f} µm)")
+        print(f"fy: {fy:.6f} px ({fy * pixel_pitch_um:.6f} µm)")
+        print(f"cx: {cx:.6f} px ({cx * pixel_pitch_um:.6f} µm)")
+        print(f"cy: {cy:.6f} px ({cy * pixel_pitch_um:.6f} µm)")
+        print(
+            "Center offset: "
+            f"({center_offset_x_px:.6f}, {center_offset_y_px:.6f}) px "
+            f"({center_offset_x_px * pixel_pitch_um:.6f}, {center_offset_y_px * pixel_pitch_um:.6f}) µm"
+        )
+        print(f"k1: {k1:.8f}")
+        print(f"k2: {k2:.8f}")
+        print(f"k3: {k3:.8f}")
+        print(f"p1: {p1:.8f}")
+        print(f"p2: {p2:.8f}")
+        print(f"RMS reprojection error: {float(ret):.8f}")
+        print(f"Estimated lens tilt pitch: {pitch_deg:.6f} deg")
+        print(f"Estimated lens tilt yaw:   {yaw_deg:.6f} deg")
+
+        if abs(pitch_deg) > 5.0 or abs(yaw_deg) > 5.0:
+            print(
+                "WARNING: Estimated lens tilt magnitude exceeds 5.0 deg. "
+                "Consider re-calibrating with cv2.CALIB_ZERO_TANGENT_DIST."
+            )
+
+        if last_valid_frame is not None:
+            undistorted = cv2.undistort(last_valid_frame, camera_matrix, dist_coeffs)
+            side_by_side = cv2.hconcat([last_valid_frame, undistorted])
+            cv2.namedWindow("Raw vs Undistorted Feed", cv2.WINDOW_NORMAL)
+            cv2.imshow("Raw vs Undistorted Feed", side_by_side)
+            print("Displaying visual verification in window: 'Raw vs Undistorted Feed'")
+            print("Press any key while the image window is focused to continue...")
+            cv2.waitKey(0)
+            cv2.destroyWindow("Raw vs Undistorted Feed")
+        else:
+            print("Visual verification skipped: no valid frame was captured.")
     else:
         print("Calibration engine processing exception error.")
 
@@ -268,7 +338,7 @@ def run_boresight_calibration():
             
             if image_revision is not None and image_revision != last_processed_revision:
                 time.sleep(0.05)
-                frame = cv2.imread(img_path)
+                frame = load_capsule_frame(img_path)
                 if frame is not None:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     current_corners, current_ids, _, _ = detector.detectBoard(gray)
@@ -414,7 +484,7 @@ def run_eccentricity_check():
         
         if image_revision is not None and image_revision != last_processed_revision:
             time.sleep(0.05)
-            frame = cv2.imread(img_path)
+            frame = load_capsule_frame(img_path)
             if frame is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 current_corners, current_ids, _, _ = detector.detectBoard(gray)
