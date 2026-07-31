@@ -125,6 +125,14 @@ def quaternion_to_rotation_matrix(q):
         [    2*qx*qy + 2*qw*qz, 1 - 2*qx**2 - 2*qz**2,     2*qy*qz - 2*qw*qx],
         [    2*qx*qz - 2*qw*qy,     2*qy*qz + 2*qw*qx, 1 - 2*qx**2 - 2*qy**2]
     ])
+
+
+def quaternion_ned_to_seu(q):
+    """Express a body-to-world quaternion in the SEU world frame instead of NED."""
+    qw, qx, qy, qz = q
+    return np.array([-qy, qz, qw, -qx])
+
+
 class MadgwickFilter:
     def __init__(self, alpha, beta):
         """
@@ -142,7 +150,7 @@ class MadgwickFilter:
         
         # Reference vectors in Earth frame
         self.gravity_ref = np.array([0.0, 0.0, 1.0])  # Gravity points down
-        self.magnetic_ref = np.array([0.0, 1.0, 0.0])  # Magnetic field points North
+        self.magnetic_ref = np.array([1.0, 0.0, 0.0])  # Magnetic field points North
 
     def quaternion_multiply(self, q1, q2):
         """Multiply two quaternions."""
@@ -457,19 +465,7 @@ class DataProcessor:
     # Magnetometer calibration parameters
     HARD_IRON_BIAS = [-24.425272, -9.840492, 16.169081]
     
-    SOFT_IRON_MATRIX = np.array([
-        [19.096303, -0.080634, -0.013220],
-        [-0.080634, 19.686204, 0.048664],
-        [-0.013220, 0.048664, 19.386885]
-    ])
-    
-    # Accelerometer calibration parameters
-    ACCEL_BIAS = [-0.016082, -0.018219, 0.152182]
-    ACCEL_MATRIX = np.array([
-        [1.009967, 0.007280, -0.029018],
-        [0.007280, 1.020470, 0.057813],
-        [-0.029018, 0.057813, 1.183160]
-    ])
+
     
     def __init__(self):
         self.filter = MadgwickFilter( alpha=1.0, beta=0.3)
@@ -540,11 +536,11 @@ class DataProcessor:
         
         # 1. HARD IRON BIAS (Offset correction)
         magnet_bias = np.array([0, 0, 0])
-        hard_iron_bias = np.array([19.744134, -7.018865, 14.425593])
+        hard_iron_bias = np.array([-131.191364, 13729.563502, 2404.219664])
         soft_iron_matrix = np.array([
-            [1.000023, -0.037484, -0.004686],
-            [-0.037484, 1.005176, 0.007214],
-            [-0.004686, 0.007214, 0.991864]
+            [1.024690, 0.047071, -0.005928],
+            [0.047071, 0.919793, 0.065566],
+            [-0.005928, 0.065566, 1.006852]
         ])
         
         # 3. GENERATE BORESIGHT CORRECTION MATRIX (R_mc) FROM EULER ANGLES
@@ -674,22 +670,25 @@ class DataProcessor:
 
         # Apply coordinate transformations
 
-        temp = accel_g[2]
-        accel_g[2] = -accel_g[0]
-        accel_g[0] = -temp
+        tmp_ax, tmp_ay, tmp_az = accel_g[0], accel_g[1], accel_g[2]
 
+        accel_g[0] = -tmp_ay
+        accel_g[1] = tmp_az
+        accel_g[2] = tmp_ax
+
+        tmp_gx, tmp_gy, tmp_gz = gyro_dps[0], gyro_dps[1], gyro_dps[2]
+
+        gyro_dps[0] = tmp_gy
+        gyro_dps[2] = -tmp_gx
+        gyro_dps[1] = -tmp_gz
         
-        temp = gyro_dps[2]
-        gyro_dps[2] = gyro_dps[0]
-        gyro_dps[0] = temp
 
-        gyro_dps[1] = -gyro_dps[1]
 
-        temp = mag_uT[2]
-        mag_uT[2] = mag_uT[1]
-        mag_uT[1] = -temp
+        temp = mag_uT[0]
+        mag_uT[0] = -mag_uT[1]
+        mag_uT[1] = temp
 
-        mag_uT[0] = -mag_uT[0]
+        mag_uT[2] = -mag_uT[2]
 
 
 
@@ -736,8 +735,8 @@ class DataProcessor:
         t4 = +1.0 - 2.0 * (y * y + z * z)
         yaw_z = np.degrees(np.arctan2(t3, t4))
         
-        roll_x = -roll_x
-        pitch_y = -pitch_y
+        # roll_x = -roll_x
+        # pitch_y = -pitch_y
         
         return roll_x, pitch_y, yaw_z
     
@@ -790,7 +789,12 @@ class DataProcessor:
                 self.last_packet_timestamp = timestamp
                 self.update_sensor_input_rate(timestamp)
 
-                sample_to_log = mag_uT if logging_source == "magnetometer" else accel_g
+                mag_calibrated = self.calibrate_magnetometer(mag_uT)
+                accel_calibrated = self.calibrate_accelerometer(accel_g)
+
+
+                sample_to_log = mag_calibrated if logging_source == "magnetometer" else accel_g
+
 
                 ## For "l" one shot logging
                 if one_shot_logging_trigger.is_set():
@@ -801,8 +805,7 @@ class DataProcessor:
                 log_sensor_sample(sample_to_log)
 
 
-                mag_calibrated = self.calibrate_magnetometer(mag_uT)
-                accel_calibrated = self.calibrate_accelerometer(accel_g)
+
 
                 data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated, 0))
                 self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated))
@@ -832,7 +835,7 @@ def processing_thread(processor):
     ac_lowpass_mag = None
     mod_q_lowpass = None
     alpha = 0.08
-    alpha_amp = 0.002
+    alpha_amp = 0.4
     alpha_q = 0.01
     
     # Update rate counters
@@ -868,7 +871,7 @@ def processing_thread(processor):
 
                 # Calculate expected AC field orientation relative to the sensor body frame
                 if q_prev is not None:
-                    ac_field_global = np.array([1.0, 0.0, 0.0])  # Transmitter coils orientation
+                    ac_field_global = np.array([-1.0, 0.0, 0.0])  # North is world -X in SEU
                     R = quaternion_to_rotation_matrix(q_prev)
                     gyro_predicted_field = R.T @ ac_field_global
                 else:
@@ -878,12 +881,13 @@ def processing_thread(processor):
                 mag_amplitudes, mag_phases, highpass_mag, _ = lockin.update(mag_uT, current_time)
                 
                 # Update Madgwick filter with calculated signed amplitudes
-                q, error, omega_corrected = filter.update(
+                q_filter, error, omega_corrected = filter.update(
                     np.radians(gyro_dps),
                     np.array(accel_g),
                     np.array(mag_amplitudes),
                     current_time=current_time
                 )
+                q = quaternion_ned_to_seu(q_filter)
                 q_prev = q.copy()  # Cache target frame for next iteration loop prediction
                 
                 # Apply low-pass filters
@@ -893,9 +897,9 @@ def processing_thread(processor):
                 else:
                     lowpass_mag = alpha * mag_array + (1 - alpha) * lowpass_mag
                 
-                # Rotate quaternion
-                mod_q = processor.rotate_quaternion_z_neg90_manual(q)
-                mod_q = processor.quaternion_a_to_b(mod_q)
+                # # Rotate quaternion
+
+                mod_q = q
                 
                 # Apply quaternion low-pass
                 if mod_q_lowpass is None:
@@ -918,14 +922,15 @@ def processing_thread(processor):
 
                 print(
                     # f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\t"
-                    #   f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
+                    # f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
                     # f" Raw  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT"
-                    f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\t"
-                    f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
-                    f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
-                    f"files #: {processor.files_completed}\t"
-                    f"Processing: {update_rate:.2f} Hz\t"
-                    f"D.P. Timestamp: {current_time:.3f}s"
+                    f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\tYaw: {yaw:.3f}°\t Pitch: {pitch:.3f}°\tRoll: {roll:.3f}°"
+                    # f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
+                    # f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
+                    # f"files #: {processor.files_completed}\t"
+                    # f"Processing: {update_rate:.2f} Hz\t"
+                    # f"D.P. Timestamp: {current_time:.3f}s"
+                    # f"Mag: {mag_uT[0]:.3f} uT, {mag_uT[1]:.3f} uT, {mag_uT[2]:.3f} uT\tAccel: {accel_g[0]:.3f} g, {accel_g[1]:.3f} g, {accel_g[2]:.3f} g\tGyro: {gyro_dps[0]:.3f} dps, {gyro_dps[1]:.3f} dps, {gyro_dps[2]:.3f} dps"
                     )
                 
                 # Update plots
