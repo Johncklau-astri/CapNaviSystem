@@ -29,7 +29,6 @@ import json
 import os
 import sys
 import numpy as np
-import pandas as pd
 from scipy import linalg
 from matplotlib import pyplot as plt
 
@@ -82,6 +81,8 @@ class MagnetometerCalibrator:
     
     def _load_csv(self, filename):
         """Load data from CSV file."""
+        import pandas as pd
+
         df = pd.read_csv(filename)
         
         # Try to find expected columns
@@ -125,6 +126,12 @@ class MagnetometerCalibrator:
         # Calculate hard iron bias first (center of the ellipsoid)
         M_1 = linalg.inv(M)
         self.b = -np.dot(M_1, n)
+
+        if not np.isrealobj(self.b):
+            raise ValueError(
+                "Ellipsoid fit produced complex bias values. Capture readings across "
+                "the full range of sensor orientations and recalibrate."
+            )
         
         # If no target field strength was explicitly passed, estimate it 
         # from the average radius of the de-biased (centered) points
@@ -135,8 +142,20 @@ class MagnetometerCalibrator:
         else:
             print(f"Target magnetic field strength: {self.F}")
         
-        # Calculate soft iron transformation matrix
-        self.A_1 = np.real(self.F / np.sqrt(np.dot(n.T, np.dot(M_1, n)) - d) * linalg.sqrtm(M))
+        # Calculate a real, positive-definite soft iron transformation matrix.
+        scale = (n.T @ M_1 @ n).item() - d
+        if scale <= 0:
+            raise ValueError(
+                "Ellipsoid fit is not physically valid. Capture readings across the "
+                "full range of sensor orientations and recalibrate."
+            )
+        self.A_1 = self.F / np.sqrt(scale) * linalg.sqrtm(M)
+        self.A_1 = np.real_if_close(self.A_1, tol=1_000)
+        if not np.isrealobj(self.A_1):
+            raise ValueError(
+                "Ellipsoid fit produced a complex correction matrix. Capture readings "
+                "across the full range of sensor orientations and recalibrate."
+            )
         
         print("\nCalibration completed!")
         print("Hard iron bias:")
@@ -326,23 +345,43 @@ class MagnetometerCalibrator:
                       [ 0,  0,  0,  0, -4,  0],
                       [ 0,  0,  0,  0,  0, -4]])
 
-        E = np.dot(linalg.inv(C),
-                   S_11 - np.dot(S_12, np.dot(linalg.inv(S_22), S_21)))
+        # Solve instead of explicitly inverting these poorly scaled matrices. The
+        # equations are equivalent, but solving avoids numerical noise that can
+        # turn an otherwise real physical eigenpair into a complex one.
+        reduced_scatter = S_11 - S_12 @ linalg.solve(S_22, S_21)
+        E = linalg.solve(C, reduced_scatter)
 
         E_w, E_v = np.linalg.eig(E)
-        v_1 = E_v[:, np.argmax(E_w)]
-        if v_1[0] < 0: v_1 = -v_1
+        candidates = []
+        for index, eigenvalue in enumerate(E_w):
+            eigenvector = np.real_if_close(E_v[:, index], tol=1_000)
+            if not np.isrealobj(eigenvector):
+                continue
 
-        v_2 = np.dot(np.dot(-np.linalg.inv(S_22), S_21), v_1)
+            v_1 = np.asarray(eigenvector, dtype=float)
+            v_2 = -np.linalg.solve(S_22, S_21 @ v_1)
+            M = np.array([[v_1[0], v_1[5], v_1[4]],
+                          [v_1[5], v_1[1], v_1[3]],
+                          [v_1[4], v_1[3], v_1[2]]])
+            n = np.array([[v_2[0]], [v_2[1]], [v_2[2]]])
+            d = float(v_2[3])
 
-        M = np.array([[v_1[0], v_1[5], v_1[4]],
-                      [v_1[5], v_1[1], v_1[3]],
-                      [v_1[4], v_1[3], v_1[2]]])
-        n = np.array([[v_2[0]],
-                      [v_2[1]],
-                      [v_2[2]]])
-        d = v_2[3]
+            # The quadratic form must describe an ellipsoid, so M must be positive
+            # definite. Its overall sign is arbitrary, hence test both signs.
+            for sign in (1.0, -1.0):
+                signed_M = sign * M
+                signed_n = sign * n
+                signed_d = sign * d
+                if np.all(np.linalg.eigvalsh(signed_M) > 0):
+                    candidates.append((abs(eigenvalue), signed_M, signed_n, signed_d))
 
+        if not candidates:
+            raise ValueError(
+                "Unable to fit a real ellipsoid. The capture does not span enough "
+                "independent sensor orientations for calibration."
+            )
+
+        _, M, n, d = max(candidates, key=lambda candidate: candidate[0])
         return M, n, d
 
 
@@ -365,7 +404,7 @@ and soft iron distortions. Supports CSV and TXT input formats.
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument('-f', '--file', type=str, default='magnetometer_log.txt',
+    parser.add_argument('-f', '--file', type=str, default='calibration_log.txt',
                        help='Input data file (CSV or TXT format)')
     parser.add_argument('--apply', type=str, nargs='?', const='default',
                        help='Apply existing calibration from JSON file instead of calibrating.')
@@ -438,11 +477,13 @@ and soft iron distortions. Supports CSV and TXT input formats.
             if file_ext == '.csv':
                 output_file = f"{base_name}_calibrated.csv"
                 if check_overwrite(output_file):
+                    import pandas as pd
+
                     df = pd.DataFrame(calibrated_data, columns=['mag_x', 'mag_y', 'mag_z'])
                     df.to_csv(output_file, index=False)
                     print(f"Calibrated data saved to {output_file}")
             else:
-                output_file = "out.txt"
+                output_file = f"{base_name}_calibrated.txt"
                 if check_overwrite(output_file):
                     np.savetxt(output_file, calibrated_data, fmt='%.6f', delimiter=',')
                     print(f"Calibrated data saved to {output_file}")

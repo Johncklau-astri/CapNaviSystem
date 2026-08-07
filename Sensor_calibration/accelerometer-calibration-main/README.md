@@ -54,6 +54,16 @@ Once you are satisfied with the number of measurements, type 'q' to save the mea
 
 ![Magneto software interface](imgs/Magneto_Result.jpg)
 
+### Local Ellipsoid Calibration
+
+`accelerometer_ellipsoid_calibration.py` provides the same ellipsoid-fit calibration without Magneto. Capture stationary samples spanning many sensor orientations, then run:
+
+```bash
+python accelerometer_ellipsoid_calibration.py accelerometer_single_log.txt --json accelerometer_calibration.json --plot
+```
+
+The module prints and saves the bias `b` and correction matrix `A` used by the existing visualization equation `a_calibrated = A @ (a_raw - b)`. Use `--gravity 9.80665` when the input is in m/s^2 rather than G's.
+
 ## Step 6: Visualize Results
 
 Open `plot-calibration-data.py` in a text editor. Copy the A^-1 matrix and bias vector values to the Python code and specify the tab-delimited text file of uncalibrated measurements. Run the code and compare uncalibrated and calibrated data!

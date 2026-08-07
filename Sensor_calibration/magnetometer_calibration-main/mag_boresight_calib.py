@@ -268,6 +268,11 @@ def main():
     print("ROTATION MATRIX R^{mc}")
     print("="*60)
     print(R_mc)
+    print("\nCopy this into capsule_orientation.py:")
+    print("BORESIGHT_R_MC = np.array([")
+    for row in R_mc:
+        print(f"    [{row[0]:.10f}, {row[1]:.10f}, {row[2]:.10f}],")
+    print("])" )
     
     print("\n" + "="*60)
     print("AXIS UNIT VECTORS (in calibration frame coordinates)")

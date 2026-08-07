@@ -5,6 +5,8 @@ import socket
 import json
 import struct
 import threading
+import csv
+import shutil
 import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation as R
@@ -12,6 +14,14 @@ from scipy.spatial.transform import Rotation as R
 # --- SYSTEM CONFIGURATION ---
 DATA_DIRECTORY = r"R:\Release_Internal_V1A\output"
 INTRINSIC_FILE = "capsule_intrinsics.npz"
+STAGE_KINEMATICS_FILE = "stage_kinematics.npz"
+STAGE_ARUCO_ID = 0
+# Use the black marker side length, not the full paper patch with white margins.
+STAGE_ARUCO_MARKER_SIZE_MM = 17.0
+STAGE_MEASUREMENT_SAMPLES = 10
+TAG_POSE_OUTPUT_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainingData")
+TAG_POSE_LOG_FILE = os.path.join(TAG_POSE_OUTPUT_DIRECTORY, "camera_pose_relative_to_tag.csv")
+TAG_POSE_IMAGE_DIRECTORY = TAG_POSE_OUTPUT_DIRECTORY
 TCP_HOST = 'localhost'
 TCP_PORT = 12347
 
@@ -583,15 +593,670 @@ def run_eccentricity_check():
     print("="*70 + "\n")
 
 # -----------------------------------------------------------------------------
+# PHASE 4: STAGE KINEMATIC CALIBRATION
+# -----------------------------------------------------------------------------
+def _prompt_vector3_with_default(prompt, default_vec):
+    default_str = f"{default_vec[0]}, {default_vec[1]}, {default_vec[2]}"
+    user_in = input(f"{prompt} [{default_str}]: ").strip()
+    if not user_in:
+        return np.array(default_vec, dtype=np.float64)
+    try:
+        parts = [float(v.strip()) for v in user_in.split(',')]
+        if len(parts) != 3:
+            raise ValueError
+        return np.array(parts, dtype=np.float64)
+    except ValueError:
+        print("Invalid input. Using default values.")
+        return np.array(default_vec, dtype=np.float64)
+
+
+def _prompt_nonzero_float(prompt):
+    user_in = input(prompt).strip()
+    try:
+        val = float(user_in)
+    except ValueError:
+        print("Error: value must be numeric.")
+        return None
+    if abs(val) < 1e-9:
+        print("Error: displacement must be non-zero.")
+        return None
+    return val
+
+
+def _average_rotation_matrices(rotation_matrices):
+    """Average rotation matrices using quaternion eigen averaging."""
+    if len(rotation_matrices) == 0:
+        raise ValueError("Cannot average an empty rotation set.")
+
+    quats_xyzw = R.from_matrix(np.asarray(rotation_matrices)).as_quat()
+    accum = np.zeros((4, 4), dtype=np.float64)
+    for q in quats_xyzw:
+        q = q / np.linalg.norm(q)
+        accum += np.outer(q, q)
+    accum /= float(len(quats_xyzw))
+
+    eig_vals, eig_vecs = np.linalg.eigh(accum)
+    q_mean = eig_vecs[:, np.argmax(eig_vals)]
+    if q_mean[3] < 0:
+        q_mean = -q_mean
+
+    return R.from_quat(q_mean).as_matrix()
+
+
+def _capture_tag_pose_mm(camera_matrix, dist_coeffs, window_name="Capsule Camera Feed"):
+    print("Press [SPACEBAR] on the camera window to capture this pose.")
+    print("Press [Q] to abort this stage calibration mode.")
+    print(f"Each measurement now captures {STAGE_MEASUREMENT_SAMPLES} photos and averages them.")
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    last_processed_revision = None
+    marker_corners, marker_ids = None, None
+    vis_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    found_target = False
+    current_rvec = None
+    current_tvec = None
+    marker_size_m = STAGE_ARUCO_MARKER_SIZE_MM / 1000.0
+    obj_pts = np.array([
+        [-marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
+        [ marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
+        [ marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
+        [-marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
+    ], dtype=np.float32)
+    axis_length_m = marker_size_m * 0.75
+    solvepnp_flag = getattr(cv2, 'SOLVEPNP_IPPE_SQUARE', cv2.SOLVEPNP_ITERATIVE)
+    stage_detector = cv2.aruco.ArucoDetector(ARUCO_DICT)
+    Rz_180 = R.from_euler('z', 180.0, degrees=True).as_matrix()
+
+    def _solve_pose_from_detection(corners, ids):
+        if ids is None or len(ids) == 0:
+            return None
+        ids_flat = ids.flatten()
+        if STAGE_ARUCO_ID not in ids_flat:
+            return None
+
+        target_idx = int(np.where(ids_flat == STAGE_ARUCO_ID)[0][0])
+        img_pts = corners[target_idx].reshape(4, 2).astype(np.float32)
+        retval, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, camera_matrix, dist_coeffs,
+            flags=solvepnp_flag
+        )
+        if not retval:
+            return None
+        return rvec, tvec
+
+    while True:
+        img_path = get_latest_image(DATA_DIRECTORY)
+        image_revision = get_image_revision(img_path) if img_path else None
+
+        if image_revision is not None and image_revision != last_processed_revision:
+            time.sleep(0.05)
+            frame = load_capsule_frame(img_path)
+            if frame is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                marker_corners, marker_ids, _ = stage_detector.detectMarkers(gray)
+
+                vis_frame = frame.copy()
+                found_target = False
+                current_rvec = None
+                current_tvec = None
+                if marker_ids is not None and len(marker_ids) > 0:
+                    ids_flat = marker_ids.flatten()
+                    found_target = np.any(ids_flat == STAGE_ARUCO_ID)
+                    cv2.aruco.drawDetectedMarkers(vis_frame, marker_corners, marker_ids)
+                    solved_pose = _solve_pose_from_detection(marker_corners, marker_ids)
+                    if solved_pose is not None:
+                        current_rvec, current_tvec = solved_pose
+
+                if found_target and current_rvec is not None:
+                    R_tag_to_cam, _ = cv2.Rodrigues(current_rvec)
+                    R_axis_display = R_tag_to_cam @ Rz_180
+                    rvec_axis_display, _ = cv2.Rodrigues(R_axis_display)
+                    cv2.drawFrameAxes(
+                        vis_frame,
+                        camera_matrix,
+                        dist_coeffs,
+                        rvec_axis_display,
+                        current_tvec,
+                        axis_length_m,
+                        2,
+                    )
+                    cv2.putText(vis_frame, "Ready: SPACE to capture", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv2.putText(vis_frame, f"Marker ID {STAGE_ARUCO_ID} not detected", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                last_processed_revision = image_revision
+
+        cv2.imshow(window_name, vis_frame)
+        key = cv2.waitKey(15) & 0xFF
+
+        if key == ord('q'):
+            cv2.destroyWindow(window_name)
+            return None
+
+        if key == ord(' '):
+            if marker_ids is None or len(marker_ids) == 0 or not found_target:
+                print("--> Capture denied: no target marker pose available.")
+                continue
+
+            measurement_positions_mm = []
+            measurement_rotations = []
+            sample_count = 0
+
+            if current_rvec is not None and current_tvec is not None:
+                R_tag_to_cam_now, _ = cv2.Rodrigues(current_rvec)
+                measurement_positions_mm.append(current_tvec.flatten() * 1000.0)
+                measurement_rotations.append(R_tag_to_cam_now @ Rz_180)
+                sample_count += 1
+                print(f"   Sample {sample_count}/{STAGE_MEASUREMENT_SAMPLES} captured")
+
+            retry_limit = STAGE_MEASUREMENT_SAMPLES * 60
+            retries = 0
+            while sample_count < STAGE_MEASUREMENT_SAMPLES and retries < retry_limit:
+                retries += 1
+                next_path = get_latest_image(DATA_DIRECTORY)
+                next_revision = get_image_revision(next_path) if next_path else None
+                if next_revision is None or next_revision == last_processed_revision:
+                    cv2.waitKey(10)
+                    continue
+
+                time.sleep(0.02)
+                next_frame = load_capsule_frame(next_path)
+                if next_frame is None:
+                    last_processed_revision = next_revision
+                    continue
+
+                next_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY)
+                next_corners, next_ids, _ = stage_detector.detectMarkers(next_gray)
+                solved_pose = _solve_pose_from_detection(next_corners, next_ids)
+
+                vis_frame = next_frame.copy()
+                marker_corners = next_corners
+                marker_ids = next_ids
+                found_target = solved_pose is not None
+                current_rvec, current_tvec = (solved_pose if solved_pose is not None else (None, None))
+
+                if next_ids is not None and len(next_ids) > 0:
+                    cv2.aruco.drawDetectedMarkers(vis_frame, next_corners, next_ids)
+
+                if solved_pose is not None:
+                    sample_rvec, sample_tvec = solved_pose
+                    R_tag_to_cam_sample, _ = cv2.Rodrigues(sample_rvec)
+                    R_axis_display = R_tag_to_cam_sample @ Rz_180
+                    rvec_axis_display, _ = cv2.Rodrigues(R_axis_display)
+                    cv2.drawFrameAxes(
+                        vis_frame,
+                        camera_matrix,
+                        dist_coeffs,
+                        rvec_axis_display,
+                        sample_tvec,
+                        axis_length_m,
+                        2,
+                    )
+
+                    measurement_positions_mm.append(sample_tvec.flatten() * 1000.0)
+                    measurement_rotations.append(R_axis_display)
+                    sample_count += 1
+                    print(f"   Sample {sample_count}/{STAGE_MEASUREMENT_SAMPLES} captured")
+
+                cv2.putText(
+                    vis_frame,
+                    f"Averaging {sample_count}/{STAGE_MEASUREMENT_SAMPLES}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.imshow(window_name, vis_frame)
+                last_processed_revision = next_revision
+                cv2.waitKey(1)
+
+            if sample_count < STAGE_MEASUREMENT_SAMPLES:
+                print("--> Capture denied: insufficient valid samples to average. Please hold steady and retry.")
+                continue
+
+            P_tag_in_cam_mm = np.mean(np.asarray(measurement_positions_mm), axis=0)
+            R_tag_to_cam = _average_rotation_matrices(measurement_rotations)
+            print(
+                f"--> Captured averaged tag pose ({STAGE_MEASUREMENT_SAMPLES} frames): "
+                f"X={P_tag_in_cam_mm[0]:.3f} mm, "
+                f"Y={P_tag_in_cam_mm[1]:.3f} mm, Z={P_tag_in_cam_mm[2]:.3f} mm"
+            )
+            cv2.destroyWindow(window_name)
+            return P_tag_in_cam_mm, R_tag_to_cam
+
+
+def run_stage_kinematic_calibration():
+    print("\n--- PHASE 4: STAGE KINEMATIC CALIBRATION ---")
+
+    if not os.path.exists(INTRINSIC_FILE):
+        print(f"Error: Missing profile config dependency '{INTRINSIC_FILE}'. Run intrinsic pass first.")
+        return
+
+    data = np.load(INTRINSIC_FILE)
+    camera_matrix = data['camera_matrix']
+    dist_coeffs = data['dist_coeffs']
+
+    print(
+        f"Using stage marker ID {STAGE_ARUCO_ID} "
+        f"with side length {STAGE_ARUCO_MARKER_SIZE_MM:.2f} mm."
+    )
+    print("\nStep 0: Enter known offset from temporary stage marker center to model landmark origin.")
+    P_tag_to_model = _prompt_vector3_with_default(
+        "P_tag_to_model [off_x, off_y, off_z] in mm (comma-separated)",
+        [0.0, -45.0, -1.0]
+    )
+    euler_tag_to_model_deg = _prompt_vector3_with_default(
+        "Tag->Model Euler angles [roll, pitch, yaw] in deg (comma-separated, blank for identity)",
+        [0.0, 0.0, 0.0]
+    )
+    R_tag_to_model = R.from_euler('xyz', euler_tag_to_model_deg, degrees=True).as_matrix()
+
+    print("\nStep 1: Baseline pose at stage origin [0, 0, 0].")
+    print("Set stage to [0, 0, 0] with CharUco attached to the model, then capture.")
+    baseline_capture = _capture_tag_pose_mm(camera_matrix, dist_coeffs)
+    if baseline_capture is None:
+        print("Stage kinematic calibration aborted by user.")
+        return
+
+    P0, R_base = baseline_capture
+    P_model_base_in_cam = P0 + (R_base @ P_tag_to_model)
+    R_model_base_in_cam = R_base @ R_tag_to_model
+
+    print("\nStep 2: X-axis motion vector.")
+    Dx = _prompt_nonzero_float("Enter stage displacement Dx (mm): ")
+    if Dx is None:
+        return
+    print(f"Move stage by +X = {Dx} mm, then capture.")
+    x_capture = _capture_tag_pose_mm(camera_matrix, dist_coeffs)
+    if x_capture is None:
+        print("Stage kinematic calibration aborted by user.")
+        return
+    Px, _ = x_capture
+    u_X = (Px - P0) / Dx
+    print("Return stage to baseline [0, 0, 0] before next step.")
+
+    print("\nStep 3: Y-axis motion vector.")
+    Dy = _prompt_nonzero_float("Enter stage displacement Dy (mm): ")
+    if Dy is None:
+        return
+    print(f"Move stage by +Y = {Dy} mm, then capture.")
+    y_capture = _capture_tag_pose_mm(camera_matrix, dist_coeffs)
+    if y_capture is None:
+        print("Stage kinematic calibration aborted by user.")
+        return
+    Py, _ = y_capture
+    u_Y = (Py - P0) / Dy
+    print("Return stage to baseline [0, 0, 0] before next step.")
+
+    print("\nStep 4: Z-axis motion vector.")
+    Dz = _prompt_nonzero_float("Enter stage displacement Dz (mm): ")
+    if Dz is None:
+        return
+    print(f"Move stage by +Z = {Dz} mm, then capture.")
+    z_capture = _capture_tag_pose_mm(camera_matrix, dist_coeffs)
+    if z_capture is None:
+        print("Stage kinematic calibration aborted by user.")
+        return
+    Pz, _ = z_capture
+    u_Z = (Pz - P0) / Dz
+
+    R_stage_to_cam = np.column_stack((u_X, u_Y, u_Z))
+
+    R_cam_in_model = R_model_base_in_cam.T
+    P_cam_in_model = -R_cam_in_model @ P_model_base_in_cam
+
+    euler_cam_in_model_xyz = R.from_matrix(R_cam_in_model).as_euler('xyz', degrees=True)
+    roll_deg = float(euler_cam_in_model_xyz[0])
+    pitch_deg = float(euler_cam_in_model_xyz[1])
+    yaw_deg = float(euler_cam_in_model_xyz[2])
+
+    print("\n" + "=" * 70)
+    print("STAGE KINEMATIC CALIBRATION DIAGNOSTIC REPORT")
+    print("=" * 70)
+    print(f"u_X: {u_X} | ||u_X|| = {np.linalg.norm(u_X):.6f}")
+    print(f"u_Y: {u_Y} | ||u_Y|| = {np.linalg.norm(u_Y):.6f}")
+    print(f"u_Z: {u_Z} | ||u_Z|| = {np.linalg.norm(u_Z):.6f}")
+    print("-" * 70)
+    print(f"u_X · u_Y = {float(np.dot(u_X, u_Y)):.6f}")
+    print(f"u_Y · u_Z = {float(np.dot(u_Y, u_Z)):.6f}")
+    print(f"u_X · u_Z = {float(np.dot(u_X, u_Z)):.6f}")
+    print("-" * 70)
+    print(f"Baseline tag position P0 (mm): [{P0[0]:.3f}, {P0[1]:.3f}, {P0[2]:.3f}]")
+    print("Camera pose relative to Model Landmark Frame at baseline:")
+    print(
+        f"Position (mm): X={P_cam_in_model[0]:.3f}, "
+        f"Y={P_cam_in_model[1]:.3f}, Z={P_cam_in_model[2]:.3f}"
+    )
+    print(
+        f"Orientation (deg): Pitch={pitch_deg:.4f}, "
+        f"Yaw={yaw_deg:.4f}, Roll={roll_deg:.4f}"
+    )
+    print("=" * 70)
+
+    np.savez(
+        STAGE_KINEMATICS_FILE,
+        R_stage_to_cam=R_stage_to_cam,
+        P_tag_base=P0,
+        R_tag_base=R_base,
+        P_tag_to_model=P_tag_to_model,
+        R_tag_to_model=R_tag_to_model,
+        stage_marker_id=STAGE_ARUCO_ID,
+        stage_marker_size_mm=STAGE_ARUCO_MARKER_SIZE_MM,
+    )
+    print(f"Saved stage kinematic calibration to '{STAGE_KINEMATICS_FILE}'.")
+
+
+def convert_stage_to_camera_relative_to_model(delta_x, delta_y, delta_z):
+    if not os.path.exists(STAGE_KINEMATICS_FILE):
+        raise FileNotFoundError(
+            f"Missing '{STAGE_KINEMATICS_FILE}'. Run stage kinematic calibration first."
+        )
+
+    data = np.load(STAGE_KINEMATICS_FILE)
+    R_stage_to_cam = data['R_stage_to_cam']
+    P_tag_base = data['P_tag_base']
+    R_tag_base = data['R_tag_base']
+    P_tag_to_model = data['P_tag_to_model']
+    R_tag_to_model = data['R_tag_to_model']
+
+    delta_stage = np.array([delta_x, delta_y, delta_z], dtype=np.float64)
+    P_tag_in_cam = P_tag_base + (R_stage_to_cam @ delta_stage)
+
+    R_model_in_cam = R_tag_base @ R_tag_to_model
+    P_model_in_cam = P_tag_in_cam + (R_tag_base @ P_tag_to_model)
+
+    R_cam_in_model = R_model_in_cam.T
+    P_cam_in_model = -R_cam_in_model @ P_model_in_cam
+
+    euler_xyz = R.from_matrix(R_cam_in_model).as_euler('xyz', degrees=True)
+    result = {
+        'camera_position_mm': P_cam_in_model,
+        'camera_orientation_deg_xyz': euler_xyz,
+        'pitch_yaw_roll_deg': np.array([euler_xyz[1], euler_xyz[2], euler_xyz[0]], dtype=np.float64),
+        'R_cam_in_model': R_cam_in_model,
+    }
+    return result
+
+
+def run_tag_pose_logger():
+    """Log camera poses relative to the configured stage tag in an Excel-compatible CSV."""
+    print("\n--- TAG POSE LOGGER ---")
+    if not os.path.exists(INTRINSIC_FILE):
+        print(f"Error: Missing profile config dependency '{INTRINSIC_FILE}'. Run intrinsic pass first.")
+        return
+
+    data = np.load(INTRINSIC_FILE)
+    camera_matrix = data['camera_matrix']
+    dist_coeffs = data['dist_coeffs']
+    marker_size_m = STAGE_ARUCO_MARKER_SIZE_MM / 1000.0
+    obj_pts = np.array([
+        [-marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
+        [ marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
+        [ marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
+        [-marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
+    ], dtype=np.float32)
+    axis_length_m = marker_size_m * 0.75
+    solvepnp_flag = getattr(cv2, 'SOLVEPNP_IPPE_SQUARE', cv2.SOLVEPNP_ITERATIVE)
+    stage_detector = cv2.aruco.ArucoDetector(ARUCO_DICT)
+    log_exists = os.path.exists(TAG_POSE_LOG_FILE)
+    log_count = 0
+    os.makedirs(TAG_POSE_IMAGE_DIRECTORY, exist_ok=True)
+    existing_capture_numbers = []
+    for image_path in glob.glob(os.path.join(TAG_POSE_IMAGE_DIRECTORY, "Photo*_tag.jpg")):
+        image_name = os.path.basename(image_path)
+        number_text = image_name[len("Photo"):-len("_tag.jpg")]
+        if number_text.isdigit():
+            existing_capture_numbers.append(int(number_text))
+    next_capture_number = max(existing_capture_numbers, default=0) + 1
+    last_processed_revision = None
+    current_pose = None
+    live_camera_position_mm = None
+    live_camera_orientation_deg = None
+    current_image_path = None
+    vis_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    print(f"Detecting marker ID {STAGE_ARUCO_ID}; marker side length: {STAGE_ARUCO_MARKER_SIZE_MM:.2f} mm.")
+    print("The displayed axes are the tag coordinate system. Press [SPACEBAR] to log; [Q] to finish.")
+    cv2.namedWindow("Tag Pose Logger", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            img_path = get_latest_image(DATA_DIRECTORY)
+            image_revision = get_image_revision(img_path) if img_path else None
+            if image_revision is not None and image_revision != last_processed_revision:
+                time.sleep(0.05)
+                frame = load_capsule_frame(img_path)
+                if frame is not None:
+                    current_image_path = img_path
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    marker_corners, marker_ids, _ = stage_detector.detectMarkers(gray)
+                    vis_frame = frame.copy()
+                    current_pose = None
+                    live_camera_position_mm = None
+                    live_camera_orientation_deg = None
+
+                    if marker_ids is not None and STAGE_ARUCO_ID in marker_ids.flatten():
+                        target_idx = int(np.where(marker_ids.flatten() == STAGE_ARUCO_ID)[0][0])
+                        img_pts = marker_corners[target_idx].reshape(4, 2).astype(np.float32)
+                        success, rvec, tvec = cv2.solvePnP(
+                            obj_pts, img_pts, camera_matrix, dist_coeffs, flags=solvepnp_flag
+                        )
+                        cv2.aruco.drawDetectedMarkers(vis_frame, marker_corners, marker_ids)
+                        if success:
+                            current_pose = (rvec, tvec)
+                            R_tag_to_cam, _ = cv2.Rodrigues(rvec)
+                            R_cam_to_tag = R_tag_to_cam.T
+                            live_camera_position_mm = (-R_cam_to_tag @ tvec).flatten() * 1000.0
+                            live_camera_orientation_deg = R.from_matrix(R_cam_to_tag).as_euler(
+                                'xyz', degrees=True
+                            )
+                            cv2.drawFrameAxes(
+                                vis_frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length_m, 2
+                            )
+                            cv2.putText(vis_frame, "Tag tracked: SPACE to log", (10, 30),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(vis_frame, f"Marker ID {STAGE_ARUCO_ID} not detected", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    last_processed_revision = image_revision
+
+            display_frame = vis_frame.copy()
+            if live_camera_position_mm is not None:
+                cv2.putText(
+                    display_frame,
+                    "Camera in tag (mm): "
+                    f"X={live_camera_position_mm[0]:.2f} "
+                    f"Y={live_camera_position_mm[1]:.2f} "
+                    f"Z={live_camera_position_mm[2]:.2f}",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2,
+                )
+                cv2.putText(
+                    display_frame,
+                    "Camera in tag (deg): "
+                    f"Roll={live_camera_orientation_deg[0]:.2f} "
+                    f"Pitch={live_camera_orientation_deg[1]:.2f} "
+                    f"Yaw={live_camera_orientation_deg[2]:.2f}",
+                    (10, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2,
+                )
+            cv2.putText(display_frame, f"Logged poses: {log_count}", (10, 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.imshow("Tag Pose Logger", display_frame)
+            key = cv2.waitKey(15) & 0xFF
+
+            if key == ord('q'):
+                break
+            if key != ord(' '):
+                continue
+            if current_pose is None:
+                print("--> Capture denied: target marker pose unavailable.")
+                continue
+
+            sample_positions_mm = []
+            sample_rotations = []
+            sample_count = 0
+
+            while sample_count < STAGE_MEASUREMENT_SAMPLES:
+                if sample_count == 0:
+                    sample_path = current_image_path
+                    rvec, tvec = current_pose
+                else:
+                    next_path = get_latest_image(DATA_DIRECTORY)
+                    next_revision = get_image_revision(next_path) if next_path else None
+                    if next_revision is None or next_revision == last_processed_revision:
+                        cv2.waitKey(10)
+                        continue
+
+                    time.sleep(0.02)
+                    sample_frame = load_capsule_frame(next_path)
+                    last_processed_revision = next_revision
+                    if sample_frame is None:
+                        continue
+
+                    sample_gray = cv2.cvtColor(sample_frame, cv2.COLOR_BGR2GRAY)
+                    sample_corners, sample_ids, _ = stage_detector.detectMarkers(sample_gray)
+                    if sample_ids is None or STAGE_ARUCO_ID not in sample_ids.flatten():
+                        continue
+
+                    target_idx = int(np.where(sample_ids.flatten() == STAGE_ARUCO_ID)[0][0])
+                    sample_img_pts = sample_corners[target_idx].reshape(4, 2).astype(np.float32)
+                    success, rvec, tvec = cv2.solvePnP(
+                        obj_pts, sample_img_pts, camera_matrix, dist_coeffs, flags=solvepnp_flag
+                    )
+                    if not success:
+                        continue
+
+                    sample_path = next_path
+                    current_image_path = next_path
+                    vis_frame = sample_frame.copy()
+                    cv2.aruco.drawDetectedMarkers(vis_frame, sample_corners, sample_ids)
+
+                R_tag_to_cam, _ = cv2.Rodrigues(rvec)
+                R_cam_to_tag = R_tag_to_cam.T
+                sample_positions_mm.append((-R_cam_to_tag @ tvec).flatten() * 1000.0)
+                sample_rotations.append(R_cam_to_tag)
+                sample_count += 1
+
+                cv2.putText(
+                    vis_frame,
+                    f"Averaging {sample_count}/{STAGE_MEASUREMENT_SAMPLES}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+                )
+                cv2.imshow("Tag Pose Logger", vis_frame)
+                cv2.waitKey(1)
+                current_image_path = sample_path
+                print(f"   Sample {sample_count}/{STAGE_MEASUREMENT_SAMPLES} captured")
+
+            P_cam_in_tag_mm = np.mean(np.asarray(sample_positions_mm), axis=0)
+            R_cam_to_tag = _average_rotation_matrices(sample_rotations)
+            euler_cam_in_tag_deg = R.from_matrix(R_cam_to_tag).as_euler('xyz', degrees=True)
+            quaternion_cam_in_tag_xyzw = R.from_matrix(R_cam_to_tag).as_quat()
+            write_header = not log_exists
+            tag_snapshot_name = f"Photo{next_capture_number}_tag.jpg"
+            tag_snapshot_path = os.path.join(TAG_POSE_IMAGE_DIRECTORY, tag_snapshot_name)
+            no_tag_snapshot_name = f"Photo{next_capture_number}_NoTag.jpg"
+            no_tag_snapshot_path = os.path.join(TAG_POSE_IMAGE_DIRECTORY, no_tag_snapshot_name)
+            if (
+                current_image_path is None
+                or os.path.exists(tag_snapshot_path)
+                or os.path.exists(no_tag_snapshot_path)
+            ):
+                print("--> Capture denied: source image unavailable or capture filename already exists.")
+                continue
+
+            tag_image_revision = get_image_revision(current_image_path)
+
+            try:
+                shutil.move(current_image_path, tag_snapshot_path)
+            except OSError as error:
+                print(f"--> Capture denied: source image was not moved: {error}")
+                continue
+
+            print("Remove the tag, then press [SPACEBAR] to capture the 3D model image.")
+            while True:
+                no_tag_image_path = get_latest_image(DATA_DIRECTORY)
+                no_tag_revision = get_image_revision(no_tag_image_path) if no_tag_image_path else None
+                if no_tag_revision is not None and no_tag_revision != tag_image_revision:
+                    no_tag_frame = load_capsule_frame(no_tag_image_path)
+                    if no_tag_frame is not None:
+                        vis_frame = no_tag_frame
+
+                display_frame = vis_frame.copy()
+                cv2.putText(
+                    display_frame,
+                    "Remove tag, then SPACE for model image",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+                )
+                cv2.imshow("Tag Pose Logger", display_frame)
+                if cv2.waitKey(15) & 0xFF != ord(' '):
+                    continue
+
+                if no_tag_revision is None or no_tag_revision == tag_image_revision:
+                    print("--> No-tag capture denied: waiting for a new source image.")
+                    continue
+
+                try:
+                    shutil.move(no_tag_image_path, no_tag_snapshot_path)
+                except OSError as error:
+                    print(f"--> No-tag capture denied: source image was not moved: {error}")
+                    continue
+                break
+
+            with open(TAG_POSE_LOG_FILE, 'a', newline='', encoding='utf-8') as log_file:
+                writer = csv.writer(log_file)
+                if write_header:
+                    writer.writerow([
+                        'image_file', 'tag_id',
+                        'camera_x_mm', 'camera_y_mm', 'camera_z_mm',
+                        'camera_orientation_reference_frame',
+                        'euler_rotation_convention',
+                        'camera_roll_deg', 'camera_pitch_deg', 'camera_yaw_deg',
+                        'camera_qx', 'camera_qy', 'camera_qz', 'camera_qw',
+                    ])
+                writer.writerow([
+                    tag_snapshot_path, STAGE_ARUCO_ID,
+                    *P_cam_in_tag_mm,
+                    'camera axes relative to tag frame',
+                    "extrinsic XYZ; scipy Rotation.as_euler('xyz')",
+                    *euler_cam_in_tag_deg, *quaternion_cam_in_tag_xyzw,
+                ])
+            log_exists = True
+            log_count += 1
+            next_capture_number += 1
+            last_processed_revision = no_tag_revision
+            print(
+                f"--> Logged pose {log_count}: camera in tag frame: "
+                f"X={P_cam_in_tag_mm[0]:.3f}, Y={P_cam_in_tag_mm[1]:.3f}, "
+                f"Z={P_cam_in_tag_mm[2]:.3f} mm"
+            )
+    finally:
+        cv2.destroyWindow("Tag Pose Logger")
+
+    print(f"Saved {log_count} pose(s) to '{TAG_POSE_LOG_FILE}'.")
+
+# -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    mode = input("Select Execution Mode ('1: intrinsics', '2: boresight', or '3: eccentricity'): ").strip().lower()
+    mode = input(
+        "Select Execution Mode "
+        "('1: intrinsics', '2: boresight', '3: eccentricity', '4: stage', or '5: tag logger'): "
+    ).strip().lower()
     if mode == '1' or mode == 'intrinsics':
         run_intrinsic_calibration()
     elif mode == '2' or mode == 'boresight':
         run_boresight_calibration()
     elif mode == '3' or mode == 'eccentricity':
         run_eccentricity_check()
+    elif mode == '4' or mode == 'stage':
+        run_stage_kinematic_calibration()
+    elif mode == '5' or mode in ('tag logger', 'tag_logger', 'logger'):
+        run_tag_pose_logger()
     else:
-        print("Invalid choice. Select 'intrinsics', 'boresight', or 'eccentricity'.")
+        print("Invalid choice. Select 'intrinsics', 'boresight', 'eccentricity', 'stage', or 'tag logger'.")

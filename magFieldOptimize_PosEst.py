@@ -15,7 +15,6 @@ import struct
 import threading
 import argparse
 import joblib
-from collections import deque
 from datetime import datetime
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.transform import Rotation as R
@@ -30,10 +29,6 @@ ARROW_WIDTH = 0.002
 max_Bfield = 20000  # Maximum magnetic field in µT
 MODEL_FILE = 'correction_models.pkl'
 COMPARISON_LOG = 'ml_comparison_log.csv'
-
-POSITION_TIMING_PERIODS = deque(maxlen=100)
-POSITION_TIMING_LOCK = threading.Lock()
-POSITION_TIMING_LAST_PRINT = 0.0
 
 # Constants
 mu_0 = 4 * np.pi * 1e-7
@@ -78,12 +73,6 @@ def init_comparison_log():
         ])
         df.to_csv(COMPARISON_LOG, index=False)
         print(f"✅ Created comparison log: {COMPARISON_LOG}")
-
-def format_position_timing_summary(step_durations_ms, avg_hz):
-    """Format a compact timing summary for position estimation requests."""
-    parts = [f"{name}={value:.2f}ms" for name, value in step_durations_ms.items()]
-    return "Position timing | " + " | ".join(parts) + f" | avg_hz={avg_hz:.2f}"
-
 
 def log_comparison_result(B_custom, quat_sensor, r_physics, r_ml, true_pos=None):
     """Log comparison between physics-only and ML-corrected estimates"""
@@ -580,7 +569,6 @@ def run_position_server(host=POSITION_SERVER_HOST, port=POSITION_SERVER_PORT,
 
 def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, enable_ml=True):
     """Enhanced client handler with ML comparison and both quadratic/cubic comparison"""
-    global POSITION_TIMING_LAST_PRINT
     try:
         # Try to load quadratic model for comparison
         quad_params = None
@@ -598,9 +586,6 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
             pass
         
         while not STOP_EVENT.is_set():
-
-
-
             # # --- FLUSH ACCUMULATED OLD DATA ---
             # client_socket.setblocking(False)
             # try:
@@ -615,13 +600,16 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
             #     client_socket.setblocking(True)
 
 
-            # Receive data length
-            length_bytes = b''
-            while len(length_bytes) < 4:
-                chunk = client_socket.recv(4 - len(length_bytes))
-                if not chunk:
-                    raise ConnectionError("Client disconnected")
-                length_bytes += chunk
+            # Receive data length. An idle client remains connected.
+            try:
+                length_bytes = b''
+                while len(length_bytes) < 4:
+                    chunk = client_socket.recv(4 - len(length_bytes))
+                    if not chunk:
+                        raise ConnectionError("Client disconnected")
+                    length_bytes += chunk
+            except socket.timeout:
+                continue
             length = struct.unpack('>I', length_bytes)[0]
             
             # Receive data
@@ -654,20 +642,13 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                                'error': 'Invalid quaternion norm'}
                 else:
                     quat_sensor = [x / quat_norm for x in quat_sensor]
-                    
-                    start_time = time.perf_counter()
-                    step_names = ['validation', 'cubic_estimate', 'quadratic_estimate', 'ml_correct', 'response']
-                    step_durations_ms = {name: 0.0 for name in step_names}
 
-                    step_start = time.perf_counter()
                     # Cubic estimate (current model)
                     r_cubic, r_init = estimate_position_unified(
                         B_custom, quat_sensor, dipole_params, pos_bounds,
                         xgb_models=None
                     )
-                    step_durations_ms['cubic_estimate'] = (time.perf_counter() - step_start) * 1000.0
-                    
-                    step_start = time.perf_counter()
+
                     # Quadratic estimate (if available)
                     r_quad = None
                     if quad_params is not None:
@@ -675,32 +656,6 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                             B_custom, quat_sensor, quad_params, pos_bounds,
                             xgb_models=None
                         )
-                    step_durations_ms['quadratic_estimate'] = (time.perf_counter() - step_start) * 1000.0
-                    
-                    # step_start = time.perf_counter()
-                    # # ML-corrected estimate (if enabled)
-                    # r_ml = r_cubic.copy()
-                    # if enable_ml and xgb_models[0] is not None:
-                    #     r_ml, _ = estimate_position_unified(
-                    #         B_custom, quat_sensor, dipole_params, pos_bounds,
-                    #         xgb_models
-                    #     )
-                    step_durations_ms['ml_correct'] = (time.perf_counter() - step_start) * 1000.0
-                    
-                    step_start = time.perf_counter()
-                    # Log comparison
-                    # log_comparison_result(B_custom, quat_sensor, r_cubic, r_ml)
-                    step_durations_ms['response'] = (time.perf_counter() - step_start) * 1000.0
-                    
-                    request_period = time.perf_counter() - start_time
-                    with POSITION_TIMING_LOCK:
-                        POSITION_TIMING_PERIODS.append(request_period)
-                        avg_period = sum(POSITION_TIMING_PERIODS) / len(POSITION_TIMING_PERIODS)
-                        avg_hz = 1.0 / avg_period if avg_period > 0.0 else 0.0
-                        global POSITION_TIMING_LAST_PRINT
-                        if time.perf_counter() - POSITION_TIMING_LAST_PRINT >= 0.5:
-                            print(format_position_timing_summary(step_durations_ms, avg_hz))
-                            POSITION_TIMING_LAST_PRINT = time.perf_counter()
                     
                     # Print results
                     # print(f"\n📡 Client {addr}:")
@@ -710,7 +665,7 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                     # print(f"   cubic Physics: x={r_cubic[0]:.6f}, y={r_cubic[1]:.6f}, z={r_cubic[2]:.6f} m")
                     
                     if r_quad is not None:
-                        print(f"  In.B: [{B_custom[0]:.2f}, {B_custom[1]:.2f}, {B_custom[2]:.2f}] µT] phy. only: x={r_quad[0]:.3f}, y={r_quad[1]:.3f}, z={r_quad[2]:.3f} m Cur_Time: {time.time():3f}")
+                        print(f"  In.B: [{B_custom[0]:.2f}, {B_custom[1]:.2f}, {B_custom[2]:.2f}] uT, q: [{quat_sensor[0]:.2f}, {quat_sensor[1]:.2f}, {quat_sensor[2]:.2f}, {quat_sensor[3]:.2f}] phy. only: x={r_quad[0]:.3f}, y={r_quad[1]:.3f}, z={r_quad[2]:.3f} m")
                     
                     # if enable_ml and xgb_models[0] is not None:
                     #     print(f"   ML: x={r_ml[0]:.6f}, y={r_ml[1]:.6f}, z={r_ml[2]:.6f} m")

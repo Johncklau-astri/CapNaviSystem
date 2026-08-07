@@ -1447,7 +1447,7 @@ def rotateto1000(dev):
 
     
     rotary_travel = 18.6   # degrees (positive/negative)
-    pitch_travel = 105.4
+    pitch_travel = 100.2
     vert_travel = 15
     hori_travel   = 6
 

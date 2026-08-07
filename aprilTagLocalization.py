@@ -333,6 +333,9 @@ POSITION_SERVER_HOST = 'localhost'
 POSITION_SERVER_PORT = 12346
 MOTOR_SERVER_PORT = 12345
 BT_ANGLE_EST_PORT = 12347  # Port for receiving data from bt_angleEst
+TELEMETRY_SOURCE_BT_ANGLE_EST = 'bt_angleEst'
+TELEMETRY_SOURCE_CAPSULE_ORIENTATION = 'capsule_orientation'
+telemetry_source = TELEMETRY_SOURCE_BT_ANGLE_EST
 
 # Global variables
 magX = 0.0
@@ -368,6 +371,45 @@ position_data_lock = threading.Lock()
 bt_data_lock = threading.Lock()
 position_data_queue = queue.Queue()
 stop_event = threading.Event()
+
+
+def select_telemetry_source(source=None):
+    """Select the TCP telemetry producer and its required frame conversion."""
+    global telemetry_source
+    valid_sources = {
+        'b': TELEMETRY_SOURCE_BT_ANGLE_EST,
+        TELEMETRY_SOURCE_BT_ANGLE_EST: TELEMETRY_SOURCE_BT_ANGLE_EST,
+        'c': TELEMETRY_SOURCE_CAPSULE_ORIENTATION,
+        TELEMETRY_SOURCE_CAPSULE_ORIENTATION: TELEMETRY_SOURCE_CAPSULE_ORIENTATION,
+    }
+
+    while source not in valid_sources:
+        source = input(
+            'Telemetry source: [b]t_angleEst (requires axis/sign remap) or '
+            '[c]apsule_orientation (already aligned): '
+        ).strip().lower()
+
+    telemetry_source = valid_sources[source]
+    print(f'Telemetry source selected: {telemetry_source}')
+
+
+def decode_bt_telemetry(data):
+    """Return magnetometer and quaternion values in localization coordinates."""
+    raw_mag = np.array([
+        data.get('magX', 0.0),
+        data.get('magY', 0.0),
+        data.get('magZ', 0.0),
+    ])
+    if telemetry_source == TELEMETRY_SOURCE_BT_ANGLE_EST:
+        raw_mag = np.array([-raw_mag[1], -raw_mag[0], -raw_mag[2]])
+
+    quaternion = [
+        data.get('qw', 1.0),
+        data.get('qx', 0.0),
+        data.get('qy', 0.0),
+        data.get('qz', 0.0),
+    ]
+    return raw_mag, quaternion
 
 # Position estimation thread control
 position_thread_running = True
@@ -742,7 +784,7 @@ def position_estimation_worker():
             return None  # No data available, normal condition
         except Exception as e:
             print(f"Error receiving position response: {e}")
-            return None
+            return False
     
     # Main worker loop
     pending_request = None
@@ -791,6 +833,14 @@ def position_estimation_worker():
             # Check for responses (non-blocking)
             if position_socket:
                 response = receive_position_response(position_socket)
+                if response is False:
+                    with position_socket_lock:
+                        try:
+                            position_socket.close()
+                        except OSError:
+                            pass
+                        position_socket = None
+                    continue
                 if response:
                     # print(f"Received position response: {response}")
                     
@@ -966,15 +1016,8 @@ def run_bt_only_loop(args):
             latest_bt_data = get_latest_bt_data()
             if latest_bt_data:
                 with bt_data_lock:
-                    magX = -latest_bt_data.get('magY', 0.0)
-                    magY = -latest_bt_data.get('magX', 0.0)
-                    magZ = -latest_bt_data.get('magZ', 0.0)
-                    bt_quat_global = [
-                        latest_bt_data.get('qw', 1.0),
-                        latest_bt_data.get('qx', 0.0),
-                        latest_bt_data.get('qy', 0.0),
-                        latest_bt_data.get('qz', 0.0),
-                    ]
+                    magnetometer, bt_quat_global = decode_bt_telemetry(latest_bt_data)
+                    magX, magY, magZ = magnetometer
             step_durations_ms['bt_fetch'] = (time.perf_counter() - step_start) * 1000.0
 
             step_start = time.perf_counter()
@@ -1825,13 +1868,13 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
     measurement_order = 0
     motor_data = None
     last_motor_update = 0
-    MOTOR_UPDATE_INTERVAL = 0.1
+    MOTOR_UPDATE_INTERVAL = 0.01
 
 
     
     # Position estimation update rate control
     last_position_update = 0
-    POSITION_UPDATE_INTERVAL = 0.2  # Update 20 times per second
+    POSITION_UPDATE_INTERVAL = 0.05  # Update 20 times per second
 
     # Start position estimation worker thread
     position_thread = threading.Thread(target=position_estimation_worker, daemon=True)
@@ -2055,15 +2098,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 latest_bt_data = get_latest_bt_data()
                 if latest_bt_data:
                     with bt_data_lock:
-                        magX = -latest_bt_data.get('magY', 0.0)
-                        magY = -latest_bt_data.get('magX', 0.0)
-                        magZ = -latest_bt_data.get('magZ', 0.0)
-                        q_btcap_global = [
-                            latest_bt_data.get('qw', 1.0),
-                            latest_bt_data.get('qx', 0.0),
-                            latest_bt_data.get('qy', 0.0),
-                            latest_bt_data.get('qz', 0.0)
-                        ]
+                        magnetometer, q_btcap_global = decode_bt_telemetry(latest_bt_data)
+                        magX, magY, magZ = magnetometer
 
 
                 ################################################################################################################################
@@ -2567,7 +2603,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 draw_text_with_background(text_frame, motor_pos_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255),3)
 
-                # draw_text_with_background(text_frame, fused_cam_text, (50, int(170*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255),3)
+                draw_text_with_background(text_frame, mag_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 255),3)
                 # draw_text_with_background(text_frame, fused_q_cube2_cube1_text, (50, int(210*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 2)
 
                 # draw_text_with_background(text_frame, fused_q_cube2_global_text, (50, int(250*intervalOffset)), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (0, 255, 0), 3)
@@ -2724,7 +2760,14 @@ if __name__ == "__main__":
         parser.add_argument('--repeat', action='store_true', help='Run in repeatability test mode (logs cube2 position relative to origin)')
         parser.add_argument('--vert', action='store_true', help='Run in verticality test mode (logs cube2 global orientation)')
         parser.add_argument('--bt_only', action='store_true', help='Skip AprilTag processing and use BT + motor data only')
+        parser.add_argument(
+            '--telemetry-source',
+            choices=[TELEMETRY_SOURCE_BT_ANGLE_EST, TELEMETRY_SOURCE_CAPSULE_ORIENTATION],
+            help='Use bt_angleEst data with remapping or already-aligned capsule_orientation data',
+        )
         args = parser.parse_args()
+
+        select_telemetry_source(args.telemetry_source)
 
 
 

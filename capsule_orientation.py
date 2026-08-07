@@ -626,9 +626,9 @@ class DataProcessor:
 
         # BORESIGHT_R_MC = np.eye(3)  # Replace with actual boresight rotation matrix if available
         BORESIGHT_R_MC = np.array([
-            [0.9973795336, -0.0670782385, -0.0271030610],
-            [-0.0657938828, -0.9967822524, 0.0457854384],
-            [-0.0300870567, -0.0438822435, -0.9985835557],
+            [0.9995257103, -0.0143004282, 0.0272736537],
+            [-0.0132971355, -0.9992408174, -0.0366193250],
+            [0.0277766200, 0.0362392954, -0.9989570425],
         ])
         mag_final = MAGNETOMETER_TO_NWU_R @ BORESIGHT_R_MC @ mag_ellipsoid_corrected
         
@@ -649,10 +649,11 @@ class DataProcessor:
         cal_matrix_zx = -0.001112236; cal_matrix_zy = 0.000433145; cal_matrix_zz = 0.988900540
 
         ACCEL_BORESIGHT_R = np.array([
-            [ 0.998563151, -0.053542108,  0.002208008],
-            [ 0.053581860,  0.998211883, -0.026495694],
-            [-0.000785424,  0.026575933,  0.999646489],
+            [ 0.999378039,  0.026655007, -0.023087776],
+            [-0.027565879,  0.998816295, -0.040076570],
+            [ 0.021992206,  0.040688079,  0.998929839],
         ])
+
         # ACCEL_BORESIGHT_R =np.eye(3)  # Identity matrix for demonstration; replace with actual boresight rotation if available
 
         # Step 1: Apply bias correction (remove offset)
@@ -838,7 +839,7 @@ class DataProcessor:
                 accel_calibrated = self.calibrate_accelerometer(accel_g)
 
 
-                sample_to_log = accel_g if logging_source == "magnetometer" else accel_g
+                sample_to_log = mag_calibrated if logging_source == "magnetometer" else accel_g
 
 
                 ## For "l" one shot logging

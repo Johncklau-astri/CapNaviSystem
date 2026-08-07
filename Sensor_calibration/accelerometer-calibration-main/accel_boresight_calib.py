@@ -1,125 +1,121 @@
+"""Estimate the accelerometer-to-capsule boresight from a six-position tumble log.
+
+The log must contain five comma-separated X,Y,Z samples for each pose, in this
+exact order: +X, -X, +Y, -Y, +Z, -Z. The samples must be in the same frame and
+already use the same bias/scale calibration as ``DataProcessor``.
+"""
+
+from pathlib import Path
+
 import numpy as np
 
-def calculate_pitch_roll_misalignment(file_path, stable_window_size=50, noise_threshold=0.005):
-    """
-    Parses comma-separated accelerometer logs, isolates a stable resting period,
-    calculates pitch/roll misalignment angles, and generates a 3D correction matrix.
-    Outputs the matrix parameters formatted as individual flat variables.
-    Sequence order: Roll (X-axis) then Pitch (Y-axis).
-    """
-    data = []
-    
-    # 1. Parse the comma-separated text file safely
-    with open(file_path, 'r') as f:
-        for line_num, line in enumerate(f, 1):
+
+SAMPLES_PER_POSITION = 5
+POSE_NAMES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+EXPECTED_GRAVITY_VECTORS = np.array(
+    [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+     [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]
+)
+
+def load_tumble_log(file_path):
+    """Load exactly six consecutive five-sample tumble positions."""
+    samples = []
+    with open(file_path, "r", encoding="utf-8") as input_file:
+        for line_number, line in enumerate(input_file, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                parts = line.split(',')
-                if len(parts) >= 3:
-                    data.append([float(parts[0].strip()), 
-                                 float(parts[1].strip()), 
-                                 float(parts[2].strip())])
-            except ValueError:
-                print(f"Skipping malformed text/header on line {line_num}: {line}")
+                values = [float(value.strip()) for value in line.split(",")]
+            except ValueError as error:
+                raise ValueError(f"Invalid numeric data on line {line_number}: {line}") from error
+            if len(values) != 3:
+                raise ValueError(f"Expected three values on line {line_number}: {line}")
+            samples.append(values)
 
-    if not data:
-        raise ValueError("No valid data rows found in the log file.")
+    samples = np.asarray(samples, dtype=float)
+    expected_count = len(POSE_NAMES) * SAMPLES_PER_POSITION
+    if samples.shape != (expected_count, 3):
+        raise ValueError(
+            f"Expected {expected_count} samples ({len(POSE_NAMES)} poses x "
+            f"{SAMPLES_PER_POSITION} samples), but found {len(samples)}."
+        )
+    return samples
 
-    accel_data = np.array(data)
-    total_samples = len(accel_data)
-    
-    # 2. Find a stable resting window
-    best_start_idx = 0
-    min_variance = float('inf')
-    
-    # Safeguard window size if data log is shorter than default settings
-    effective_window = min(stable_window_size, total_samples)
-    
-    for i in range(total_samples - effective_window + 1):
-        window = accel_data[i : i + effective_window]
-        window_variance = np.sum(np.var(window, axis=0))
-        
-        if window_variance < min_variance:
-            min_variance = window_variance
-            best_start_idx = i
 
-    stable_data = accel_data[best_start_idx : best_start_idx + effective_window]
-    
-    if np.mean(np.std(stable_data, axis=0)) > noise_threshold:
-        print("⚠️ Warning: Could not find a perfectly stationary window. Results might be noisy.")
+def estimate_boresight_rotation(calibrated_samples):
+    """Fit the proper rotation mapping measured gravity directions to the six axes."""
+    expected_count = len(POSE_NAMES) * SAMPLES_PER_POSITION
+    if calibrated_samples.shape != (expected_count, 3):
+        raise ValueError(f"Expected calibrated samples with shape ({expected_count}, 3).")
 
-    # 3. Compute the mean static gravity vector components
-    ax_mean, ay_mean, az_mean = np.mean(stable_data, axis=0)
-    
-    # 4. Standard Industrial Aerospace Trigonometry (ISO/Euler conventions)
-    roll_rad = np.arctan2(ay_mean, az_mean)
-    pitch_rad = np.arctan2(-ax_mean, np.sqrt(ay_mean**2 + az_mean**2))
-    
-    roll_deg = np.degrees(roll_rad)
-    pitch_deg = np.degrees(pitch_rad)
-    
-    # 5. Generate the 3D Correction Matrix
-    # We invert the angles (negative sign) to rotate back to the ideal alignment
-    alpha = -roll_rad
-    beta = -pitch_rad
-    
-    # Rotation about X-axis (Roll)
-    R_x = np.array([
-        [1, 0, 0],
-        [0, np.cos(alpha), -np.sin(alpha)],
-        [0, np.sin(alpha), np.cos(alpha)]
-    ])
-    
-    # Rotation about Y-axis (Pitch)
-    R_y = np.array([
-        [np.cos(beta), 0, np.sin(beta)],
-        [0, 1, 0],
-        [-np.sin(beta), 0, np.cos(beta)]
-    ])
-    
-    # CHANGED: Flipped to R_y * R_x. Because matrix operators act from right-to-left,
-    # this applies Roll (R_x) first, and then applies Pitch (R_y) second.
-    R_correct = np.dot(R_y, R_x)
-    
-    # 6. Output Calibration Report with individual flat elements
-    print("=" * 60)
-    print("         IMU BORESIGHT CALIBRATION & CORRECTION REPORT        ")
-    print("=" * 60)
-    print(f"Analyzed {total_samples} CSV data points.")
-    print(f"Isolated stable baseline at rows {best_start_idx} to {best_start_idx + effective_window}.")
-    print(f"Averaged Gravity Vectors -> X: {ax_mean:.4f}g, Y: {ay_mean:.4f}g, Z: {az_mean:.4f}g")
-    print("-" * 60)
-    print(f"📐 ROLL MISALIGNMENT  (X-Axis): {roll_deg:+.4f}°")
-    print(f"📐 PITCH MISALIGNMENT (Y-Axis): {pitch_deg:+.4f}°")
-    print("-" * 60)
-    print("🔄 INDIVIDUAL CORRECTION MATRIX ELEMENTS (Roll -> Pitch Order):")
-    print(f"cor_matrix_xx = {R_correct[0, 0]: .6f}")
-    print(f"cor_matrix_xy = {R_correct[0, 1]: .6f}")
-    print(f"cor_matrix_xz = {R_correct[0, 2]: .6f}")
-    print(f"cor_matrix_yx = {R_correct[1, 0]: .6f}")
-    print(f"cor_matrix_yy = {R_correct[1, 1]: .6f}")
-    print(f"cor_matrix_yz = {R_correct[1, 2]: .6f}")
-    print(f"cor_matrix_zx = {R_correct[2, 0]: .6f}")
-    print(f"cor_matrix_zy = {R_correct[2, 1]: .6f}")
-    print(f"cor_matrix_zz = {R_correct[2, 2]: .6f}")
-    print("=" * 60)
-    
-    return pitch_deg, roll_deg, R_correct
+    pose_means = calibrated_samples.reshape(len(POSE_NAMES), SAMPLES_PER_POSITION, 3).mean(axis=1)
+    pose_norms = np.linalg.norm(pose_means, axis=1)
+    if np.any(pose_norms == 0):
+        raise ValueError("A tumble position has zero gravity magnitude.")
+    measured_directions = pose_means / pose_norms[:, np.newaxis]
 
-def apply_correction(raw_data, R_correct):
-    """
-    Applies the 3x3 correction matrix to an array of raw accelerometer data.
-    Assumes raw_data shape is (N, 3).
-    """
-    return np.dot(raw_data, R_correct.T)
+    covariance = EXPECTED_GRAVITY_VECTORS.T @ measured_directions
+    left_vectors, _, right_vectors_t = np.linalg.svd(covariance)
+    boresight_rotation = left_vectors @ right_vectors_t
+    if np.linalg.det(boresight_rotation) < 0:
+        left_vectors[:, -1] *= -1
+        boresight_rotation = left_vectors @ right_vectors_t
 
-# --- Execution ---
+    corrected_directions = (boresight_rotation @ measured_directions.T).T
+    angular_errors_deg = np.degrees(np.arccos(np.clip(
+        np.sum(corrected_directions * EXPECTED_GRAVITY_VECTORS, axis=1), -1.0, 1.0
+    )))
+    return boresight_rotation, pose_means, angular_errors_deg
+
+
+def rotation_to_euler_zyx(rotation):
+    """Return roll, pitch, yaw degrees for R = Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    pitch_rad = np.arcsin(np.clip(-rotation[2, 0], -1.0, 1.0))
+    if np.isclose(abs(rotation[2, 0]), 1.0):
+        roll_rad = 0.0
+        yaw_rad = np.arctan2(-rotation[0, 1], rotation[1, 1])
+    else:
+        roll_rad = np.arctan2(rotation[2, 1], rotation[2, 2])
+        yaw_rad = np.arctan2(rotation[1, 0], rotation[0, 0])
+    return np.degrees([roll_rad, pitch_rad, yaw_rad])
+
+
+def print_report(boresight_rotation, pose_means, angular_errors_deg):
+    """Print a paste-ready matrix and fit diagnostics."""
+    print("=" * 68)
+    print("ACCELEROMETER SIX-POSITION BORESIGHT CALIBRATION")
+    print("=" * 68)
+    for pose_name, pose_mean, error_deg in zip(POSE_NAMES, pose_means, angular_errors_deg):
+        print(
+            f"{pose_name:>2} mean: [{pose_mean[0]:+.6f}, {pose_mean[1]:+.6f}, "
+            f"{pose_mean[2]:+.6f}] g   residual: {error_deg:.3f} deg"
+        )
+    print(f"Maximum residual: {np.max(angular_errors_deg):.3f} deg")
+    print("\nPaste this over ACCEL_BORESIGHT_R in capsule_orientation.py:")
+    print("ACCEL_BORESIGHT_R = np.array([")
+    for row in boresight_rotation:
+        print(f"    [{row[0]: .9f}, {row[1]: .9f}, {row[2]: .9f}],")
+    print("])")
+    roll_deg, pitch_deg, yaw_deg = rotation_to_euler_zyx(boresight_rotation)
+    print("\nBoresight offset angles (degrees, ZYX order):")
+    print(f"  Roll:  {roll_deg:+.3f}")
+    print(f"  Pitch: {pitch_deg:+.3f}")
+    print(f"  Yaw:   {yaw_deg:+.3f}")
+    print("=" * 68)
+
+
+def calibrate_tumble_log(file_path):
+    """Load a six-position log, estimate boresight, and print its report."""
+    calibrated_samples = load_tumble_log(file_path)
+    result = estimate_boresight_rotation(calibrated_samples)
+    print_report(*result)
+    return result
+
+
 if __name__ == "__main__":
-    log_file = "accelerometer_single_log.txt" 
+    log_file = Path(__file__).with_name("accelerometer_boresight_log.txt")
     try:
-        pitch, roll, R_correct = calculate_pitch_roll_misalignment(log_file)
-        
-    except FileNotFoundError:
-        print(f"Error: Could not find the file '{log_file}'. Please place it in the same directory.")
+        calibrate_tumble_log(log_file)
+    except (FileNotFoundError, ValueError) as error:
+        print(f"Calibration failed: {error}")

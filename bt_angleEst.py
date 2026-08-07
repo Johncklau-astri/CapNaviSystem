@@ -871,10 +871,12 @@ def processing_thread():
 
             # 7. Outputs and Client Transmissions
             print(
-                f"Yaw: {yaw:.1f}°\tPitch: {pitch:.1f}°\t Roll: {roll:.1f}°,\t "
-                f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
-                f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz, "
-                f"Calculation Time: {math_duration:.2f} ms"
+                # f"Yaw: {yaw:.1f}°\tPitch: {pitch:.1f}°\t Roll: {roll:.1f}°"
+                # f"AC Amplitudes (µT): [X: {mag_amplitudes[0]:.1f}, Y: {mag_amplitudes[1]:.1f}, Z: {mag_amplitudes[2]:.1f}]\t "
+                # f"BLE f: {running_freq_hz:.1f} Hz, Loop f: {loop_freq_hz:.1f} Hz, "
+                # f"Calculation Time: {math_duration:.2f} ms"
+                f"Mag: [{mag_uT[0]:.1f}, {mag_uT[1]:.1f}, {mag_uT[2]:.1f}] uT\tAccel: [{accel_g[0]:.2f}, {accel_g[1]:.2f}, {accel_g[2]:.2f}] g\tGyro: [{gyro_dps[0]:.2f}, {gyro_dps[1]:.2f}, {gyro_dps[2]:.2f}] dps |"       
+
             )
 
             send_to_tcp_clients(mod_q, final_dc)
