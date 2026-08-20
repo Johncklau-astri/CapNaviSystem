@@ -35,6 +35,10 @@ DELETE_PROCESSED_FILES = False
 DEBUG_INGESTION = False
 STREAM_RESTART_IDLE_SECONDS = 2.0
 
+# A capture record is emitted after all newly accepted packets from an
+# imgInfo file have passed through the orientation filter.
+CAPTURE_MESSAGE_TYPE = "capture"
+
 # Replace the identity matrix with the BORESIGHT_R_MC block printed by
 # Sensor_calibration/magnetometer_calibration-main/mag_boresight_calib.py.
 # It transforms ellipsoid-corrected magnetometer vectors into the mounting frame.
@@ -620,6 +624,16 @@ class DataProcessor:
         match = re.search(r'imgInfo_(\d+)_', filename)
         return int(match.group(1)) if match else -1
 
+    @staticmethod
+    def capture_info_from_telemetry_path(filepath):
+        """Return the shared capture ID and expected image path for an imgInfo file."""
+        telemetry_path = Path(filepath)
+        match = re.fullmatch(r"imgInfo_(.+)\.txt", telemetry_path.name)
+        if not match:
+            raise ValueError(f"Unsupported telemetry filename: {telemetry_path.name}")
+        capture_id = match.group(1)
+        return capture_id, telemetry_path.with_name(f"image_{capture_id}.jpg")
+
     def update_sensor_input_rate(self, timestamp):
         """Estimate the sensor packet rate from the timestamps embedded in the logged file data."""
         self.packet_timestamps.append(timestamp)
@@ -909,6 +923,7 @@ class DataProcessor:
                 return
 
             parsed_packets.sort(key=lambda item: item[0])
+            capture_id, image_path = self.capture_info_from_telemetry_path(filepath)
             for timestamp, accel_g, gyro_dps, mag_uT in parsed_packets:
                 self.last_packet_timestamp = timestamp
                 self.update_sensor_input_rate(timestamp)
@@ -939,6 +954,15 @@ class DataProcessor:
 
                 data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU, 0))
                 self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU))
+
+            # FIFO ordering means this marker is handled only after every new
+            # packet from this image interval has updated the filter state.
+            data_queue.put({
+                "type": CAPTURE_MESSAGE_TYPE,
+                "capture_id": capture_id,
+                "image_path": str(image_path),
+                "timestamp": parsed_packets[-1][0],
+            })
             
             self.update_file_extraction_rate()
             self.last_file_num = file_num
@@ -993,7 +1017,18 @@ def processing_thread(processor):
     with ThreadPoolExecutor(max_workers=2) as executor:
         while not shutdown_event.is_set():
             try:
-                current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get(timeout=1.0)
+                queue_item = data_queue.get(timeout=1.0)
+                if isinstance(queue_item, dict) and queue_item.get("type") == CAPTURE_MESSAGE_TYPE:
+                    send_capture_to_tcp_clients(
+                        queue_item,
+                        mod_q,
+                        lowpass_mag,
+                        ac_lowpass_mag,
+                    )
+                    data_queue.task_done()
+                    continue
+
+                current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = queue_item
                 # print(f"Sign Corrected Raw a[0]: {accel_g[0]:.3f} g, a[1]: {accel_g[1]:.3f} g, a[2]: {accel_g[2]:.3f} g, m[0]: {mag_uT[0]:.3f} uT, m[1]: {mag_uT[1]:.3f} uT, m[2]: {mag_uT[2]:.3f} uT, gyro[0]: {gyro_dps[0]:.3f} dps, gyro[1]: {gyro_dps[1]:.3f} dps, gyro[2]: {gyro_dps[2]:.3f} dps")
 
                 # Track calculation update frequency
@@ -1152,6 +1187,43 @@ def send_to_tcp_clients(q, mag_uT, ac_mag_uT):
         except (socket.error, BrokenPipeError):
             clients_to_remove.append(client_socket)
     
+    for client_socket in clients_to_remove:
+        tcp_clients.remove(client_socket)
+        client_socket.close()
+
+
+def send_capture_to_tcp_clients(capture, q, mag_uT, ac_mag_uT):
+    """Publish one image-associated pose input to capture-aware TCP clients."""
+    global tcp_clients
+    if not tcp_clients or not tcp_server_running or mag_uT is None or ac_mag_uT is None:
+        print(f"[CAPTURE] unable to publish {capture['capture_id']}: telemetry is not ready")
+        return
+
+    data = {
+        "type": CAPTURE_MESSAGE_TYPE,
+        "capture_id": capture["capture_id"],
+        "image_path": capture["image_path"],
+        "timestamp": float(capture["timestamp"]),
+        "qw": float(q[0]),
+        "qx": float(q[1]),
+        "qy": float(q[2]),
+        "qz": float(q[3]),
+        "magX": float(mag_uT[0]),
+        "magY": float(mag_uT[1]),
+        "magZ": float(mag_uT[2]),
+        "lockInX": float(ac_mag_uT[0]),
+        "lockInY": float(ac_mag_uT[1]),
+        "lockInZ": float(ac_mag_uT[2]),
+    }
+    data_bytes = json.dumps(data).encode("utf-8")
+    clients_to_remove = []
+    for client_socket in tcp_clients:
+        try:
+            client_socket.sendall(struct.pack(">I", len(data_bytes)))
+            client_socket.sendall(data_bytes)
+        except (socket.error, BrokenPipeError):
+            clients_to_remove.append(client_socket)
+
     for client_socket in clients_to_remove:
         tcp_clients.remove(client_socket)
         client_socket.close()

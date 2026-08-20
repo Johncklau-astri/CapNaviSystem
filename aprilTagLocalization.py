@@ -10,6 +10,7 @@ except ImportError:
 import os
 import time
 import csv
+import shutil
 from pathlib import Path
 import socket
 import json
@@ -261,6 +262,14 @@ TAG_IDS = [0, 1, 2, 3, 4, 5 ,7,8,9]
 # LOG_FILE = "magnetic_field_log.csv"
 LOG_FILE = "Mag_Field_log.csv"  # For repeatability testing, only log essential data
 LOG_REPEAT_TEST_FILE = "repeatability_test_log.csv"  # For repeatability testing, only log essential data
+CAPTURE_MESSAGE_TYPE = "capture"
+# Set this to a local folder shared through SMB, or to a mapped SMB path.
+CAPTURE_EXPORT_DIRECTORY = r"R:\Release_Internal_V1A\export"
+CAPTURE_EXPORT_MAX_PENDING = 2
+capture_export_executor = ThreadPoolExecutor(max_workers=1)
+capture_export_result_queue = queue.Queue()
+capture_export_pending = 0
+capture_export_pending_lock = threading.Lock()
 
 
 def write_to_shared_file(t_xyz, q_wxyz):
@@ -359,6 +368,9 @@ serial_port = None
 bt_data_queue = queue.Queue(maxsize=100)  # Buffer up to 100 samples
 position_request_queue = queue.Queue(maxsize=10)  # Position estimation requests
 position_response_queue = queue.Queue(maxsize=10)  # Position estimation responses
+capture_data_queue = queue.Queue()
+capture_position_request_queue = queue.Queue()
+capture_position_response_queue = queue.Queue()
 
 R_worldCube_camera = None
 top_R_worldCube_camera = None
@@ -651,6 +663,10 @@ def run_bt_data_receiver(host='localhost', port=BT_ANGLE_EST_PORT, stop_event=No
                 # Parse JSON data
                 data_str = data_bytes.decode('utf-8')
                 data = json.loads(data_str)
+
+                if data.get('type') == CAPTURE_MESSAGE_TYPE:
+                    capture_data_queue.put(data)
+                    continue
                 
                 # Put data in queue (non-blocking, drop oldest if full)
                 try:
@@ -718,7 +734,8 @@ def position_estimation_worker():
             # print(f"Failed to connect to position server: {e}")
             return None
     
-    def send_position_request(socket_obj, magX, magY, magZ, quat_w, quat_x, quat_y, quat_z):
+    def send_position_request(socket_obj, magX, magY, magZ, quat_w, quat_x, quat_y, quat_z,
+                              capture_id=None):
         """Send request to position server"""
         try:
             data = {
@@ -730,6 +747,8 @@ def position_estimation_worker():
                 'qy': quat_y,
                 'qz': quat_z
             }
+            if capture_id is not None:
+                data['capture_id'] = capture_id
             
             data_str = json.dumps(data)
             data_bytes = data_str.encode('utf-8')
@@ -788,15 +807,17 @@ def position_estimation_worker():
     
     # Main worker loop
     pending_request = None
-    response_buffer = b''
-    expected_response_length = 0
+    sent_requests = deque()
     
     while position_thread_running and not stop_event.is_set():
         try:
             # Get new request from queue (non-blocking)
             try:
                 if pending_request is None:
-                    pending_request = position_request_queue.get_nowait()
+                    try:
+                        pending_request = capture_position_request_queue.get_nowait()
+                    except queue.Empty:
+                        pending_request = position_request_queue.get_nowait()
                     # print("Got new position estimation request from queue")
             except queue.Empty:
                 pass  # No new requests
@@ -811,12 +832,20 @@ def position_estimation_worker():
             
             # Process pending request
             if pending_request is not None:
-                magX, magY, magZ, quat_w, quat_x, quat_y, quat_z = pending_request
-                
-                # Send request
-                success = send_position_request(position_socket, magX, magY, magZ, 
-                                              quat_w, quat_x, quat_y, quat_z)
+                if isinstance(pending_request, dict):
+                    request = pending_request
+                    success = send_position_request(
+                        position_socket,
+                        request['magX'], request['magY'], request['magZ'],
+                        request['qw'], request['qx'], request['qy'], request['qz'],
+                        request['capture_id'],
+                    )
+                else:
+                    magX, magY, magZ, quat_w, quat_x, quat_y, quat_z = pending_request
+                    success = send_position_request(position_socket, magX, magY, magZ,
+                                                    quat_w, quat_x, quat_y, quat_z)
                 if success:
+                    sent_requests.append(pending_request)
                     # print(f"Sent position request - Mag: ({magX:.2f}, {magY:.2f}, {magZ:.2f})")
                     pending_request = None  # Request sent, wait for response
                 else:
@@ -843,6 +872,10 @@ def position_estimation_worker():
                     continue
                 if response:
                     # print(f"Received position response: {response}")
+                    request = sent_requests.popleft() if sent_requests else None
+                    if isinstance(request, dict):
+                        capture_position_response_queue.put((request, response))
+                        continue
                     
                     if 'error' in response:
                         print(f"Server error: {response['error']}")
@@ -891,6 +924,198 @@ def request_position_estimation(magX, magY, magZ, quat_w, quat_x, quat_y, quat_z
     except queue.Full:
         # print("Position request queue full, dropping request")
         return False
+
+
+def request_capture_position_estimation(capture, motor_data):
+    """Queue one image-associated magnetic solve using a motor-pose snapshot."""
+    relative_quaternion = compute_bt_only_quaternion(
+        motor_data,
+        [capture['qw'], capture['qx'], capture['qy'], capture['qz']],
+    )
+    if relative_quaternion is None:
+        return False
+
+    request = {
+        'capture_id': capture['capture_id'],
+        'image_path': capture['image_path'],
+        'timestamp': capture['timestamp'],
+        'orientation_world': [capture['qw'], capture['qx'], capture['qy'], capture['qz']],
+        'motor_data': motor_data.copy(),
+        'magX': capture['magX'],
+        'magY': capture['magY'],
+        'magZ': capture['magZ'],
+        'qw': float(relative_quaternion[0]),
+        'qx': float(relative_quaternion[1]),
+        'qy': float(relative_quaternion[2]),
+        'qz': float(relative_quaternion[3]),
+    }
+    capture_position_request_queue.put(request)
+    return True
+
+
+def queue_pending_capture_requests(motor_data):
+    """Attach the current motor pose to all completed telemetry captures."""
+    if motor_data is None:
+        return
+    while True:
+        try:
+            capture = capture_data_queue.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            if not request_capture_position_estimation(capture, motor_data):
+                print(f"[CAPTURE] skipped {capture['capture_id']}: motor pose is unavailable")
+        finally:
+            capture_data_queue.task_done()
+
+
+def export_capture_bundle(request, response):
+    """Write an image and minimal world-pose manifest; create .ready last."""
+    if 'error' in response:
+        print(f"[CAPTURE] solver failed for {request['capture_id']}: {response['error']}")
+        return None
+
+    image_path = Path(request['image_path'])
+    if not image_path.is_file():
+        print(f"[CAPTURE] image not found for {request['capture_id']}: {image_path}")
+        return None
+
+    motor_data = request['motor_data']
+    relative_position = np.array([response['estX'], response['estY'], response['estZ']], dtype=float)
+    motor_position = np.array([motor_data['x'], motor_data['y'], motor_data['z']], dtype=float)
+    motor_rotation = quaternion_to_rotation_matrix([
+        motor_data['qw'], motor_data['qx'], motor_data['qy'], motor_data['qz'],
+    ])
+    position_world = motor_position + motor_rotation @ relative_position
+
+    capture_number = request['capture_id'].split('_', 1)[0]
+    output_dir = Path(CAPTURE_EXPORT_DIRECTORY) / capture_number
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_image = output_dir / image_path.name
+    shutil.copy2(image_path, output_image)
+
+    payload = {
+        'capture_id': request['capture_id'],
+        'image_file': output_image.name,
+        'timestamp': float(request['timestamp']),
+        'position_world': [float(value) for value in position_world],
+        'orientation_world': [float(value) for value in request['orientation_world']],
+    }
+    temporary_manifest = output_dir / 'pos.json.tmp'
+    with open(temporary_manifest, 'w', encoding='utf-8') as output_file:
+        json.dump(payload, output_file, indent=2)
+    os.replace(temporary_manifest, output_dir / 'pos.json')
+    (output_dir / 'capture.ready').touch()
+    print(f"[CAPTURE] exported {request['capture_id']} to {output_dir}")
+    return {
+        'image_path': output_image,
+        'position_world': position_world,
+        'orientation_world': request['orientation_world'],
+    }
+
+
+def display_exported_capture(exported_capture):
+    """Display an exported image with its world pose overlaid."""
+    image = cv2.imread(str(exported_capture['image_path']))
+    if image is None:
+        print(f"[CAPTURE] could not read exported image: {exported_capture['image_path']}")
+        return True
+
+    position = exported_capture['position_world']
+    quaternion = exported_capture['orientation_world']
+    overlay_lines = [
+        f"position: x={position[0]:.4f}, y={position[1]:.4f}, z={position[2]:.4f}",
+        f"q: w={quaternion[0]:.4f}, x={quaternion[1]:.4f}, y={quaternion[2]:.4f}, z={quaternion[3]:.4f}",
+    ]
+    for line_number, line in enumerate(overlay_lines):
+        cv2.putText(
+            image,
+            line,
+            (20, 40 + line_number * 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.imshow("BT-only latest exported capture", image)
+    return (cv2.waitKey(1) & 0xFF) != ord('q')
+
+
+def finish_capture_export(future):
+    """Make a completed background export available to the display loop."""
+    global capture_export_pending
+    try:
+        exported_capture = future.result()
+    except Exception as exc:
+        print(f"[CAPTURE] background export failed: {exc}")
+    else:
+        if exported_capture is not None:
+            capture_export_result_queue.put(exported_capture)
+    finally:
+        with capture_export_pending_lock:
+            capture_export_pending -= 1
+
+
+def export_completed_capture_bundles(should_export=True):
+    """Queue completed results for export and return the latest finished export."""
+    global capture_export_pending
+    latest_export = None
+    while True:
+        if should_export:
+            with capture_export_pending_lock:
+                if capture_export_pending >= CAPTURE_EXPORT_MAX_PENDING:
+                    break
+        try:
+            request, response = capture_position_response_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            if should_export:
+                with capture_export_pending_lock:
+                    capture_export_pending += 1
+                future = capture_export_executor.submit(export_capture_bundle, request, response)
+                future.add_done_callback(finish_capture_export)
+        finally:
+            capture_position_response_queue.task_done()
+
+    while True:
+        try:
+            latest_export = capture_export_result_queue.get_nowait()
+        except queue.Empty:
+            return latest_export
+
+
+def shutdown_capture_export_executor(should_export=True):
+    """Wait for queued file writes before the process exits."""
+    global capture_export_pending
+    if should_export:
+        while True:
+            try:
+                request, response = capture_position_response_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                with capture_export_pending_lock:
+                    capture_export_pending += 1
+                future = capture_export_executor.submit(export_capture_bundle, request, response)
+                future.add_done_callback(finish_capture_export)
+            finally:
+                capture_position_response_queue.task_done()
+    else:
+        while True:
+            try:
+                capture_position_response_queue.get_nowait()
+                capture_position_response_queue.task_done()
+            except queue.Empty:
+                break
+    capture_export_executor.shutdown(wait=True)
+    while True:
+        try:
+            capture_export_result_queue.get_nowait()
+        except queue.Empty:
+            return
 
 def get_latest_position_estimate():
     """Get the latest position estimate (non-blocking)"""
@@ -977,6 +1202,11 @@ def run_bt_only_loop(args):
     global position_latency_plotter
 
     print("BT-only mode enabled; camera and AprilTag processing are skipped.")
+    export_data = input("Export capture data to the export directory? [y/N]: ").strip().lower() in {'y', 'yes'}
+    if export_data:
+        print(f"Capture export enabled: {CAPTURE_EXPORT_DIRECTORY}")
+    else:
+        print("Capture export disabled.")
 
     # global position_latency_plotter
     # position_latency_plotter = PositionLatencyPlotter()
@@ -1028,6 +1258,8 @@ def run_bt_only_loop(args):
                 last_motor_update = time.time()
             step_durations_ms['motor_update'] = (time.perf_counter() - step_start) * 1000.0
 
+            queue_pending_capture_requests(motor_data)
+
             step_start = time.perf_counter()
             current_time = time.time()
             if (current_time - last_position_update > POSITION_UPDATE_INTERVAL and
@@ -1045,11 +1277,18 @@ def run_bt_only_loop(args):
                 estX, estY, estZ = latest_estimate
             step_durations_ms['position_update'] = (time.perf_counter() - step_start) * 1000.0
 
+            latest_export = export_completed_capture_bundles(export_data)
+            if export_data and getattr(args, 'display_export', False) and latest_export is not None:
+                if not display_exported_capture(latest_export):
+                    stop_event.set()
+                    break
+
             step_start = time.perf_counter()
             if position_latency_plotter is not None:
                 position_latency_plotter.push(motor_data, [estX, estY, estZ])
             step_durations_ms['plot_update'] = (time.perf_counter() - step_start) * 1000.0
 
+            time.sleep(0.01)
             loop_period = time.perf_counter() - loop_start
             loop_periods.append(loop_period)
             avg_loop_period = sum(loop_periods) / len(loop_periods)
@@ -1057,8 +1296,6 @@ def run_bt_only_loop(args):
             if time.perf_counter() - last_stats_print >= 0.5 or not loop_periods:
                 print(format_bt_only_timing_summary(step_durations_ms, avg_hz))
                 last_stats_print = time.perf_counter()
-
-            time.sleep(0.01)
     finally:
         position_thread_running = False
         if position_latency_plotter is not None:
@@ -1070,6 +1307,9 @@ def run_bt_only_loop(args):
             bt_receiver_thread.join(timeout=1.0)
         if 'position_thread' in locals():
             position_thread.join(timeout=1.0)
+        shutdown_capture_export_executor(export_data)
+        if getattr(args, 'display_export', False):
+            cv2.destroyAllWindows()
 
 # def load_calibration():
 #     if os.path.exists(CALIBRATION_FILE):
@@ -2483,6 +2723,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                             motor_data = latest_position_data.copy()
                     last_motor_update = time.time()
 
+                queue_pending_capture_requests(motor_data)
+
                 R_btcap_cube2Encode = None
                 q_btcap_cube2Encode = None
                 R_cube2Encode_global = None
@@ -2505,6 +2747,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 if current_time - last_position_update > POSITION_UPDATE_INTERVAL and q_btcap_cube2Encode is not None and magX != 0.0 and magY != 0.0 and magZ != 0.0:
                     update_position_estimation(q_btcap_cube2Encode, magX, magY, magZ)  # This is now non-blocking
                     last_position_update = current_time
+
+                export_completed_capture_bundles()
 
 
 
@@ -2752,6 +2996,7 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
             bt_receiver_thread.join(timeout=1.0)
         if 'position_thread' in locals():
             position_thread.join(timeout=1.0)
+        shutdown_capture_export_executor()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
@@ -2760,6 +3005,7 @@ if __name__ == "__main__":
         parser.add_argument('--repeat', action='store_true', help='Run in repeatability test mode (logs cube2 position relative to origin)')
         parser.add_argument('--vert', action='store_true', help='Run in verticality test mode (logs cube2 global orientation)')
         parser.add_argument('--bt_only', action='store_true', help='Skip AprilTag processing and use BT + motor data only')
+        parser.add_argument('--display-export', action='store_true', help='Display the latest BT-only exported image with pose overlay')
         parser.add_argument(
             '--telemetry-source',
             choices=[TELEMETRY_SOURCE_BT_ANGLE_EST, TELEMETRY_SOURCE_CAPSULE_ORIENTATION],

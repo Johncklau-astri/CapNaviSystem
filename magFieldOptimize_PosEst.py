@@ -26,7 +26,7 @@ CSV_FILE = 'new_1cm.csv'
 STOP_EVENT = threading.Event()
 ARROW_SCALE = 5
 ARROW_WIDTH = 0.002
-max_Bfield = 20000  # Maximum magnetic field in µT
+max_Bfield = 25000  # Maximum magnetic field in µT
 MODEL_FILE = 'correction_models.pkl'
 COMPARISON_LOG = 'ml_comparison_log.csv'
 
@@ -622,6 +622,7 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
             
             # Parse JSON data
             data = json.loads(data_bytes.decode('utf-8'))
+            capture_id = data.get('capture_id')
             B_custom = [data['magX'], data['magY'], data['magZ']]
             quat_sensor = [data['qw'], data['qx'], data['qy'], data['qz']]
 
@@ -677,6 +678,9 @@ def handle_client(client_socket, addr, dipole_params, pos_bounds, xgb_models, en
                         'estY': float(r_cubic[1]),
                         'estZ': float(r_cubic[2]),
                     }
+
+            if capture_id is not None:
+                response['capture_id'] = capture_id
             
             # Send response
             response_str = json.dumps(response)
