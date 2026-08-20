@@ -153,6 +153,8 @@ def main():
     with arguments.csv.open(newline="", encoding="utf-8") as pose_file:
         for row_index, row in enumerate(csv.DictReader(pose_file), start=1):
             image_path = Path(row["image_file"])
+            if not image_path.is_absolute():
+                image_path = arguments.csv.parent / image_path
             real_image = source_image_for_comparison(image_path)
             image_shape = real_image.shape if real_image is not None else fallback_shape
             tag_id = int(row["tag_id"])

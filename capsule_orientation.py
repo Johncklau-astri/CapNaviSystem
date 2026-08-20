@@ -307,6 +307,12 @@ class LockInAmplifier:
         self.polarity = None  # Resolves the remaining +/- ambiguity of an AC field.
         self.last_relative_vector = None
         self.last_output_vector = None
+        self.last_sign_resolution_time = None
+        self.min_sign_amplitude_uT = 15.0
+        self.max_unexplained_turn_deg = 120.0
+        self.base_turn_allowance_deg = 10.0
+        self.gyro_turn_allowance = 1.5
+        self.max_sign_resolution_dt = 0.25
 
     def high_pass_filter(self, mag_uT):
             """Apply high-pass filter to remove DC offset from input signals."""
@@ -341,6 +347,7 @@ class LockInAmplifier:
         alignment = float(np.dot(estimate, reference))
         self.polarity = 1.0 if alignment >= 0 else -1.0
         self.last_output_vector = estimate * self.polarity
+        self.last_sign_resolution_time = None
         print(
             "AC polarity calibrated to {:+.0f} (reference alignment: {:+.3f})".format(
                 self.polarity, alignment
@@ -348,7 +355,51 @@ class LockInAmplifier:
         )
         return True
 
-    def update(self, mag_uT, current_time):
+    def resolve_polarity(self, signed_amplitudes, current_time, predicted_field=None, gyro_dps=None):
+        """Resolve the equivalent global lock-in polarity branches."""
+        signed_amplitudes = np.asarray(signed_amplitudes, dtype=float)
+        magnitude = np.linalg.norm(signed_amplitudes)
+        previous = self.last_output_vector
+        previous_norm = 0.0 if previous is None else np.linalg.norm(previous)
+
+        if magnitude > 0:
+            candidates = (signed_amplitudes, -signed_amplitudes)
+            sign_reference = predicted_field
+            if sign_reference is None or np.linalg.norm(sign_reference) == 0:
+                sign_reference = previous
+
+            if sign_reference is not None and np.linalg.norm(sign_reference) > 0:
+                signed_amplitudes = max(
+                    candidates,
+                    key=lambda candidate: float(np.dot(candidate, sign_reference)),
+                )
+
+            if (
+                previous_norm > 0
+                and magnitude >= self.min_sign_amplitude_uT
+                and self.last_sign_resolution_time is not None
+            ):
+                cosine = float(np.dot(signed_amplitudes, previous) / (magnitude * previous_norm))
+                turn_deg = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+                elapsed = min(
+                    max(current_time - self.last_sign_resolution_time, 0.0),
+                    self.max_sign_resolution_dt,
+                )
+                gyro_magnitude_dps = 0.0 if gyro_dps is None else np.linalg.norm(gyro_dps)
+                allowed_turn_deg = self.base_turn_allowance_deg + (
+                    self.gyro_turn_allowance * gyro_magnitude_dps * elapsed
+                )
+                if turn_deg > self.max_unexplained_turn_deg and turn_deg > allowed_turn_deg:
+                    signed_amplitudes = max(
+                        candidates,
+                        key=lambda candidate: float(np.dot(candidate, previous)),
+                    )
+
+        self.last_output_vector = signed_amplitudes.copy()
+        self.last_sign_resolution_time = current_time
+        return signed_amplitudes
+
+    def update(self, mag_uT, current_time, predicted_field=None, gyro_dps=None):
     # """Paper-based lock-in amplifier that uses phase differences only."""
         global gyro_predicted_field
 
@@ -404,13 +455,15 @@ class LockInAmplifier:
         if self.polarity is not None:
             _signed_amplitudes *= self.polarity
 
-        sign_reference = gyro_predicted_field
-        if sign_reference is None or np.linalg.norm(sign_reference) == 0:
-            sign_reference = self.last_output_vector
-        if sign_reference is not None and np.dot(_signed_amplitudes, sign_reference) < 0:
-            _signed_amplitudes = -_signed_amplitudes
-
-        self.last_output_vector = _signed_amplitudes.copy()
+        # The phase method produces two equivalent global sign branches. Choose
+        # the branch closest to the expected body-frame +X field, then prevent
+        # a discontinuous branch swap unless gyro motion can explain it.
+        _signed_amplitudes = self.resolve_polarity(
+            _signed_amplitudes,
+            current_time,
+            predicted_field=predicted_field,
+            gyro_dps=gyro_dps,
+        )
         
         return _signed_amplitudes, [np.degrees(p) for p in raw_phases], _filtered_mag, current_time
 
@@ -418,6 +471,8 @@ class LockInAmplifier:
         """Reset DC offset estimates (useful when conditions change dramatically)."""
         self.hpf_dc_offsets = [0.0, 0.0, 0.0]
         self.hpf_mag_uT = [0.0, 0.0, 0.0]
+        self.last_output_vector = None
+        self.last_sign_resolution_time = None
         print("DC offsets reset")
 
 
@@ -591,31 +646,16 @@ class DataProcessor:
         return self.file_extraction_rate_hz
     
     def calibrate_magnetometer(self, mag_raw):
-        """
-        Calibrate raw magnetometer data using hard iron bias, soft iron matrix,
-        and a dynamically generated boresight rotation matrix from Euler angles.
-        
-        The boresight matrix uses the ZYX (Yaw-Pitch-Roll) intrinsic sequence:
-        R = R_x(roll) @ R_y(pitch) @ R_z(yaw)
-        
-        Args: 
-            mag_raw: Raw magnetometer readings [x, y, z] in microTesla
-            pitch_deg: Physical tilt around Y-axis in degrees
-            roll_deg: Physical tilt around X-axis in degrees
-            yaw_deg: Physical tilt around Z-axis in degrees
-            
-        Returns:
-            Calibrated and structurally aligned readings [x, y, z] in microTesla
-        """
+
         # Convert to numpy array for vectorized operations
         mag_raw = np.array(mag_raw)
         
         # 1. HARD IRON BIAS (Offset correction)
-        hard_iron_bias = np.array([44.176451, 13093.491676, 2096.206430])
+        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
         soft_iron_matrix = np.array([
-            [1.002919, -0.012571, 0.014055],
-            [-0.012571, 0.972390, 0.009790],
-            [0.014055, 0.009790, 0.993532]
+            [0.994153, -0.031541, 0.007716],
+            [-0.031541, 0.970074, 0.030319],
+            [0.007716, 0.030319, 1.010868]
         ])
         # --- Execute Calibration Pipeline ---
         
@@ -623,16 +663,52 @@ class DataProcessor:
         mag_ellipsoid_corrected = (mag_raw - hard_iron_bias ) @ soft_iron_matrix.T
         
         # Step B: Apply Boresight Alignment (Corrected Sensor Frame -> Physical Board Frame)
-
-        # BORESIGHT_R_MC = np.eye(3)  # Replace with actual boresight rotation matrix if available
-        BORESIGHT_R_MC = np.array([
-            [0.9995257103, -0.0143004282, 0.0272736537],
-            [-0.0132971355, -0.9992408174, -0.0366193250],
-            [0.0277766200, 0.0362392954, -0.9989570425],
-        ])
+        BORESIGHT_R_MC = np.eye(3)  # Identity matrix for demonstration; replace with actual boresight rotation if available
+        # BORESIGHT_R_MC = np.array([
+        #     [-0.9980132617, -0.0307965777, -0.0549645357],
+        #     [-0.0331427909, 0.9985551949, 0.0422974965],
+        #     [0.0535825045, 0.0440351405, -0.9975920116],
+        # ])
         mag_final = MAGNETOMETER_TO_NWU_R @ BORESIGHT_R_MC @ mag_ellipsoid_corrected
         
         
+        return mag_final.tolist()
+
+    def calibrate_magnetometer_ellipsoidOnly(self, mag_raw):
+        """
+        Calibrate raw magnetometer data using hard iron bias and soft iron matrix only.
+        
+        Args: 
+            mag_raw: Raw magnetometer readings [x, y, z] in microTesla
+
+        Returns:
+            Calibrated readings [x, y, z] in microTesla
+        """
+        mag_raw = np.array(mag_raw)
+        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
+        soft_iron_matrix = np.array([
+            [0.994153, -0.031541, 0.007716],
+            [-0.031541, 0.970074, 0.030319],
+            [0.007716, 0.030319, 1.010868]
+        ])
+        mag_ellipsoid_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
+        return mag_ellipsoid_corrected.tolist()
+    
+    def calibrate_magnetometer_noNWU(self, mag_raw):
+        mag_raw = np.array(mag_raw)
+        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
+        soft_iron_matrix = np.array([
+            [0.994153, -0.031541, 0.007716],
+            [-0.031541, 0.970074, 0.030319],
+            [0.007716, 0.030319, 1.010868]
+        ])
+        mag_ellipsoid_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
+        BORESIGHT_R_MC = np.array([
+            [0.9971499862, 0.0586529494, 0.0474524663],
+            [-0.0571768781, 0.9978546578, -0.0318886591],
+            [-0.0492210284, 0.0290845921, 0.9983643508],
+        ])
+        mag_final = BORESIGHT_R_MC @ mag_ellipsoid_corrected
         return mag_final.tolist()
     
     def calibrate_accelerometer(self, accel_raw):
@@ -649,9 +725,9 @@ class DataProcessor:
         cal_matrix_zx = -0.001112236; cal_matrix_zy = 0.000433145; cal_matrix_zz = 0.988900540
 
         ACCEL_BORESIGHT_R = np.array([
-            [ 0.999378039,  0.026655007, -0.023087776],
-            [-0.027565879,  0.998816295, -0.040076570],
-            [ 0.021992206,  0.040688079,  0.998929839],
+            [ 0.997543889,  0.057823542,  0.039530088],
+            [-0.059066636,  0.997771446,  0.031036667],
+            [-0.037647343, -0.033295347,  0.998736250],
         ])
 
         # ACCEL_BORESIGHT_R =np.eye(3)  # Identity matrix for demonstration; replace with actual boresight rotation if available
@@ -712,6 +788,8 @@ class DataProcessor:
         mag_uT[1] = temp
 
         mag_uT[2] = -mag_uT[2]
+
+        # print(f"Raw mag: {mag_uT[0]:.3f} uT, {mag_uT[1]:.3f} uT, {mag_uT[2]:.3f} uT")
 
 
 
@@ -835,11 +913,15 @@ class DataProcessor:
                 self.last_packet_timestamp = timestamp
                 self.update_sensor_input_rate(timestamp)
 
+                ## mag_calibrated makes magwick gets the z rotation opposite
                 mag_calibrated = self.calibrate_magnetometer(mag_uT)
                 accel_calibrated = self.calibrate_accelerometer(accel_g)
+                mag_calibrated_ellipsoid = self.calibrate_magnetometer_ellipsoidOnly(mag_uT)
+                ## mag_calibrated_noNWU makes correct direction in 3 axis in magwick
+                mag_calibrated_noNWU = self.calibrate_magnetometer_noNWU(mag_uT)
 
 
-                sample_to_log = mag_calibrated if logging_source == "magnetometer" else accel_g
+                sample_to_log = mag_calibrated_ellipsoid if logging_source == "magnetometer" else accel_g
 
 
                 ## For "l" one shot logging
@@ -850,11 +932,13 @@ class DataProcessor:
                 ## For "m" continuous logging
                 log_sensor_sample(sample_to_log)
 
+                # print(f"Raw mag: {mag_uT}, Calibrated mag: {mag_calibrated}")
 
 
 
-                data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated, 0))
-                self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated))
+
+                data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU, 0))
+                self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU))
             
             self.update_file_extraction_rate()
             self.last_file_num = file_num
@@ -897,7 +981,7 @@ def processing_thread(processor):
     lowpass_mag = None
     ac_lowpass_mag = None
     mod_q_lowpass = None
-    alpha = 0.08
+    alpha = 0.4
     alpha_amp = 0.4
     alpha_q = 0.4
     
@@ -929,7 +1013,12 @@ def processing_thread(processor):
                     gyro_predicted_field = None
 
                 # Update lock-in amplifier utilizing the same gyro-predicted sign resolution logic as bt_angleEst.py
-                mag_amplitudes, mag_phases, highpass_mag, _ = lockin.update(mag_uT, current_time)
+                mag_amplitudes, mag_phases, highpass_mag, _ = lockin.update(
+                    mag_uT,
+                    current_time,
+                    predicted_field=gyro_predicted_field,
+                    gyro_dps=gyro_dps,
+                )
 
                 if calibration_requested:
                     # 'C' is pressed at the known NWU identity pose: north/+X.
@@ -984,10 +1073,15 @@ def processing_thread(processor):
                 mag_magnitude = np.sqrt(mag_array[0]**2 + mag_array[1]**2 + mag_array[2]**2)
                 ac_magnitude = np.sqrt(mag_amplitudes[0]**2 + mag_amplitudes[1]**2 + mag_amplitudes[2]**2)
                 ## Yaw Z, Pitch Y, Roll X
+                # tmp_lp_mag_x = lowpass_mag[0]
+                # tmp_lp_mag_y = -lowpass_mag[1]
+                # tmp_lp_magz = -lowpass_mag[2]
+
+                # tmp_lp = np.array([tmp_lp_mag_x, tmp_lp_mag_y, tmp_lp_magz])
                 print(
-                    f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\tq: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t  LockIn: {mag_amplitudes[0]:.3f} uT, {mag_amplitudes[1]:.3f} uT, {mag_amplitudes[2]:.3f} uT\tAccel: {accel_g[0]:.3f} g, {accel_g[1]:.3f} g, {accel_g[2]:.3f} g\tGyro: {gyro_dps[0]:.3f} dps, {gyro_dps[1]:.3f} dps, {gyro_dps[2]:.3f} dps\t"
+                    f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\tq: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t  LockIn: {mag_amplitudes[0]:.3f} uT, {mag_amplitudes[1]:.3f} uT, {mag_amplitudes[2]:.3f} uT\tRaw Mag: {mag_array[0]:.3f} uT, {mag_array[1]:.3f} uT, {mag_array[2]:.3f} uT"
                     # f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
-                    # f" Raw  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT"
+                    # f"Calib Mag  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT, lowpass_mag: {lowpass_mag[0]:.3f} uT, {tmp_lp_mag_y:.3f} uT, {tmp_lp_magz:.3f} uT"
                     # f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\tYaw: {yaw:.3f}°\t Pitch: {pitch:.3f}°\tRoll: {roll:.3f}°"
                     # f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
                     # f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
@@ -1012,6 +1106,8 @@ def processing_thread(processor):
                 plot_hp_x.append(highpass_mag[0])
                 plot_hp_y.append(highpass_mag[1])
                 plot_hp_z.append(highpass_mag[2])
+
+
                 
                 # Send to TCP clients
                 send_to_tcp_clients(mod_q, lowpass_mag, ac_lowpass_mag)
@@ -1103,7 +1199,6 @@ def keyboard_listener():
     print("Press 's' to switch logging source (magnetometer or IMU accelerometer)")
     print("Press 'l' to log one sample from the selected source")
     print("Press 'm' to start/stop continuous logging for the selected source")
-    print("Press 'q' to quit")
     
     while not shutdown_event.is_set():
         try:
@@ -1134,10 +1229,10 @@ def keyboard_listener():
                     start_logging()
                 time.sleep(0.5)
                 
-            if keyboard.is_pressed('q'):
-                print("Quitting...")
-                shutdown_event.set()
-                break
+            # if keyboard.is_pressed('q'):
+            #     print("Quitting...")
+            #     shutdown_event.set()
+            #     break
                 
             time.sleep(0.1)
         except:

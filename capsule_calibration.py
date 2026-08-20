@@ -14,11 +14,11 @@ from scipy.spatial.transform import Rotation as R
 # --- SYSTEM CONFIGURATION ---
 DATA_DIRECTORY = r"R:\Release_Internal_V1A\output"
 INTRINSIC_FILE = "capsule_intrinsics.npz"
-STAGE_KINEMATICS_FILE = "stage_kinematics.npz"
+STAGE_KINEMATICS_FILE = "stage_kinematics.npz" 
 STAGE_ARUCO_ID = 0
 # Use the black marker side length, not the full paper patch with white margins.
-STAGE_ARUCO_MARKER_SIZE_MM = 17.0
-STAGE_MEASUREMENT_SAMPLES = 10
+STAGE_ARUCO_MARKER_SIZE_MM = 40.0
+STAGE_MEASUREMENT_SAMPLES = 20
 TAG_POSE_OUTPUT_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainingData")
 TAG_POSE_LOG_FILE = os.path.join(TAG_POSE_OUTPUT_DIRECTORY, "camera_pose_relative_to_tag.csv")
 TAG_POSE_IMAGE_DIRECTORY = TAG_POSE_OUTPUT_DIRECTORY
@@ -29,6 +29,44 @@ TCP_PORT = 12347
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 CHARUCO_BOARD = cv2.aruco.CharucoBoard((7, 9), 0.026, 0.01976, ARUCO_DICT)
 detector = cv2.aruco.CharucoDetector(CHARUCO_BOARD)
+
+# Mode 5 uses this compact target rather than the larger intrinsic-calibration board.
+# Five 10 mm squares make the printed board exactly 50 mm x 50 mm.
+MODE5_CHARUCO_SQUARES_X = 5
+MODE5_CHARUCO_SQUARES_Y = 5
+MODE5_CHARUCO_SQUARE_LENGTH_M = 0.010
+MODE5_CHARUCO_MARKER_LENGTH_M = 0.0075
+MODE5_CHARUCO_BOARD = cv2.aruco.CharucoBoard(
+    (MODE5_CHARUCO_SQUARES_X, MODE5_CHARUCO_SQUARES_Y),
+    MODE5_CHARUCO_SQUARE_LENGTH_M,
+    MODE5_CHARUCO_MARKER_LENGTH_M,
+    ARUCO_DICT,
+)
+# OpenCV defines ChArUco board coordinates from an outer corner. Mode 5 shifts
+# that frame so the physical center of this 50 mm x 50 mm board is [0, 0, 0].
+MODE5_BOARD_CENTER_IN_OPENCV_FRAME_M = np.array(
+    [
+        MODE5_CHARUCO_SQUARES_X * MODE5_CHARUCO_SQUARE_LENGTH_M / 2.0,
+        MODE5_CHARUCO_SQUARES_Y * MODE5_CHARUCO_SQUARE_LENGTH_M / 2.0,
+        0.0,
+    ],
+    dtype=np.float64,
+).reshape(3, 1)
+# Mode 5's physical tag frame uses the centered origin with Y and Z reversed
+# from OpenCV's ChArUco board frame, equivalent to a 180 degree local X rotation.
+MODE5_TAG_FRAME_FROM_OPENCV_FRAME = np.diag([1.0, -1.0, -1.0])
+MODE5_CHARUCO_OUTPUT_FILE = "mode5_charuco_50mm.png"
+MODE5_CHARUCO_PRINT_DPI = 600
+MODE7_VERIFICATION_OUTPUT_DIRECTORY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tag_pose_synthetic_output"
+)
+MODE7_BOARD_RENDER_SIZE_PX = 2000
+MODE7_OVERLAY_ALPHA = 0.55
+MODE5_MIN_CORNERS = 12
+MODE5_MAX_REPROJECTION_RMSE_PX = 1.0
+MODE5_MIN_INLIER_SAMPLES = 10
+MODE5_POSITION_OUTLIER_FLOOR_MM = 0.05
+MODE5_ROTATION_OUTLIER_FLOOR_DEG = 0.05
 
 # --- GLOBAL VARIABLES ---
 imu_lock = threading.Lock()
@@ -145,6 +183,211 @@ def load_capsule_frame(path):
     if frame is None:
         return None
     return cv2.rotate(frame, cv2.ROTATE_180)
+
+
+def generate_mode5_charuco_board():
+    """Generate the 50 mm square ChArUco target at a fixed print resolution."""
+    edge_px = round(
+        MODE5_CHARUCO_SQUARES_X
+        * MODE5_CHARUCO_SQUARE_LENGTH_M
+        / 0.0254
+        * MODE5_CHARUCO_PRINT_DPI
+    )
+    board_image = MODE5_CHARUCO_BOARD.generateImage((edge_px, edge_px), marginSize=0)
+    if not cv2.imwrite(MODE5_CHARUCO_OUTPUT_FILE, board_image):
+        print(f"Could not save board image to '{MODE5_CHARUCO_OUTPUT_FILE}'.")
+        return
+    print(
+        f"Saved 50.00 mm x 50.00 mm ChArUco board to '{MODE5_CHARUCO_OUTPUT_FILE}' "
+        f"({edge_px} px at {MODE5_CHARUCO_PRINT_DPI} DPI)."
+    )
+    print(
+        "In the print dialog, set image resolution to 600 DPI or set the outer edge to 50.00 mm; "
+        "disable fit-to-page and verify the outer edge with calipers."
+    )
+
+
+def _create_mode5_charuco_detector():
+    detector_parameters = cv2.aruco.DetectorParameters()
+    detector_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector_parameters.cornerRefinementWinSize = 5
+    detector_parameters.cornerRefinementMaxIterations = 50
+    detector_parameters.cornerRefinementMinAccuracy = 0.01
+    return cv2.aruco.CharucoDetector(
+        MODE5_CHARUCO_BOARD,
+        cv2.aruco.CharucoParameters(),
+        detector_parameters,
+    )
+
+
+def _solve_mode5_charuco_pose(charuco_corners, charuco_ids, camera_matrix, dist_coeffs):
+    if charuco_corners is None or len(charuco_corners) < MODE5_MIN_CORNERS:
+        corner_count = 0 if charuco_corners is None else len(charuco_corners)
+        return None, f"need {MODE5_MIN_CORNERS} ChArUco corners; found {corner_count}"
+
+    obj_pts, img_pts = MODE5_CHARUCO_BOARD.matchImagePoints(charuco_corners, charuco_ids)
+    if len(obj_pts) < MODE5_MIN_CORNERS:
+        return None, f"only {len(obj_pts)} matched ChArUco corners"
+
+    success, rvec, tvec = cv2.solvePnP(
+        obj_pts, img_pts, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not success:
+        return None, "PnP solve failed"
+
+    rvec, tvec = cv2.solvePnPRefineLM(
+        obj_pts, img_pts, camera_matrix, dist_coeffs, rvec, tvec
+    )
+    projected_points, _ = cv2.projectPoints(obj_pts, rvec, tvec, camera_matrix, dist_coeffs)
+    residuals = img_pts.reshape(-1, 2) - projected_points.reshape(-1, 2)
+    reprojection_rmse_px = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
+    if reprojection_rmse_px > MODE5_MAX_REPROJECTION_RMSE_PX:
+        return None, (
+            f"RMSE {reprojection_rmse_px:.2f} px exceeds "
+            f"{MODE5_MAX_REPROJECTION_RMSE_PX:.2f} px"
+        )
+
+    R_board_to_cam, _ = cv2.Rodrigues(rvec)
+    tvec_center_origin = tvec + R_board_to_cam @ MODE5_BOARD_CENTER_IN_OPENCV_FRAME_M
+    R_tag_to_cam = R_board_to_cam @ MODE5_TAG_FRAME_FROM_OPENCV_FRAME
+    rvec_tag, _ = cv2.Rodrigues(R_tag_to_cam)
+    return (rvec_tag, tvec_center_origin, reprojection_rmse_px, len(obj_pts)), None
+
+
+def _robust_average_mode5_poses(positions_mm, rotations):
+    positions_mm = np.asarray(positions_mm, dtype=np.float64)
+    rotations = np.asarray(rotations, dtype=np.float64)
+    position_median = np.median(positions_mm, axis=0)
+    initial_rotation = _average_rotation_matrices(rotations)
+
+    position_errors_mm = np.linalg.norm(positions_mm - position_median, axis=1)
+    rotation_errors_deg = np.degrees(
+        R.from_matrix(np.transpose(initial_rotation) @ rotations).magnitude()
+    )
+    position_mad_mm = float(np.median(np.abs(position_errors_mm - np.median(position_errors_mm))))
+    rotation_mad_deg = float(np.median(np.abs(rotation_errors_deg - np.median(rotation_errors_deg))))
+    position_limit_mm = max(
+        MODE5_POSITION_OUTLIER_FLOOR_MM,
+        float(np.median(position_errors_mm)) + 3.0 * 1.4826 * position_mad_mm,
+    )
+    rotation_limit_deg = max(
+        MODE5_ROTATION_OUTLIER_FLOOR_DEG,
+        float(np.median(rotation_errors_deg)) + 3.0 * 1.4826 * rotation_mad_deg,
+    )
+    inliers = (position_errors_mm <= position_limit_mm) & (rotation_errors_deg <= rotation_limit_deg)
+
+    if int(np.count_nonzero(inliers)) < MODE5_MIN_INLIER_SAMPLES:
+        return None
+
+    return (
+        np.mean(positions_mm[inliers], axis=0),
+        _average_rotation_matrices(rotations[inliers]),
+        inliers,
+        position_errors_mm,
+        rotation_errors_deg,
+        position_limit_mm,
+        rotation_limit_deg,
+    )
+
+
+def _mode7_tag_to_camera_pose(row):
+    """Invert a Mode 5 camera-in-tag pose into an OpenCV tag-to-camera pose."""
+    camera_position_mm = np.array(
+        [
+            float(row['camera_x_mm']),
+            float(row['camera_y_mm']),
+            float(row['camera_z_mm']),
+        ],
+        dtype=np.float64,
+    ).reshape(3, 1)
+    camera_euler_deg = np.array(
+        [
+            float(row['camera_roll_deg']),
+            float(row['camera_pitch_deg']),
+            float(row['camera_yaw_deg']),
+        ],
+        dtype=np.float64,
+    )
+    R_cam_to_tag = R.from_euler('xyz', camera_euler_deg, degrees=True).as_matrix()
+    R_tag_to_cam = R_cam_to_tag.T
+    t_tag_to_cam_m = -R_tag_to_cam @ camera_position_mm / 1000.0
+    rvec_tag_to_cam, _ = cv2.Rodrigues(R_tag_to_cam)
+    return R_tag_to_cam, rvec_tag_to_cam, t_tag_to_cam_m
+
+
+def _render_mode7_charuco_board(image_shape, R_tag_to_cam, t_tag_to_cam_m, camera_matrix, dist_coeffs):
+    """Project the full Mode 5 board using the logged pose and camera model."""
+    board_image = MODE5_CHARUCO_BOARD.generateImage(
+        (MODE7_BOARD_RENDER_SIZE_PX, MODE7_BOARD_RENDER_SIZE_PX), marginSize=0
+    )
+    board_image = cv2.cvtColor(board_image, cv2.COLOR_GRAY2BGR)
+    R_board_to_cam = R_tag_to_cam @ MODE5_TAG_FRAME_FROM_OPENCV_FRAME
+    t_board_to_cam_m = t_tag_to_cam_m - R_board_to_cam @ MODE5_BOARD_CENTER_IN_OPENCV_FRAME_M
+    rvec_board_to_cam, _ = cv2.Rodrigues(R_board_to_cam)
+    board_width_m = MODE5_CHARUCO_SQUARES_X * MODE5_CHARUCO_SQUARE_LENGTH_M
+    board_height_m = MODE5_CHARUCO_SQUARES_Y * MODE5_CHARUCO_SQUARE_LENGTH_M
+    board_corners_m = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [board_width_m, 0.0, 0.0],
+            [board_width_m, board_height_m, 0.0],
+            [0.0, board_height_m, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    undistorted_corners, _ = cv2.projectPoints(
+        board_corners_m, rvec_board_to_cam, t_board_to_cam_m, camera_matrix, None
+    )
+    undistorted_corners = undistorted_corners.reshape(4, 2).astype(np.float32)
+    source_size = MODE7_BOARD_RENDER_SIZE_PX - 1
+    source_corners = np.array(
+        [[0, 0], [source_size, 0], [source_size, source_size], [0, source_size]], dtype=np.float32
+    )
+    height, width = image_shape[:2]
+    homography = cv2.getPerspectiveTransform(source_corners, undistorted_corners)
+    inverse_homography = np.linalg.inv(homography)
+    pixel_grid = np.stack(
+        np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)), axis=-1
+    ).reshape(-1, 1, 2)
+    undistorted_pixels = cv2.undistortPoints(
+        pixel_grid, camera_matrix, dist_coeffs, P=camera_matrix
+    )
+    board_pixels = cv2.perspectiveTransform(undistorted_pixels, inverse_homography).reshape(height, width, 2)
+    map_x = board_pixels[:, :, 0].astype(np.float32)
+    map_y = board_pixels[:, :, 1].astype(np.float32)
+    synthetic = np.full((height, width, 3), 255, dtype=np.uint8)
+    warped_board = cv2.remap(
+        board_image, map_x, map_y, interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255),
+    )
+    mask = np.where(
+        (map_x >= 0) & (map_x <= source_size) & (map_y >= 0) & (map_y <= source_size), 255, 0
+    ).astype(np.uint8)
+    synthetic[mask > 0] = warped_board[mask > 0]
+    return synthetic, mask
+
+
+def _mode7_comparison_image(real_image, synthetic, board_mask):
+    overlay = real_image.copy()
+    synthetic_gray = cv2.cvtColor(synthetic, cv2.COLOR_BGR2GRAY)
+    synthetic_inverted = cv2.bitwise_not(synthetic_gray)
+    synthetic_tinted = cv2.cvtColor(synthetic_inverted, cv2.COLOR_GRAY2BGR)
+    synthetic_tinted[:, :, 2] = 0
+    blended = cv2.addWeighted(real_image, 0.80, synthetic_tinted, 0.20, 0.0)
+    overlay[board_mask > 0] = blended[board_mask > 0]
+    board_outline, _ = cv2.findContours(board_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, board_outline, -1, (0, 255, 255), 2, cv2.LINE_AA)
+    label_height = 34
+    panels = []
+    for image, label in (
+        (real_image, 'Captured tag image (rotated)'),
+        (synthetic_tinted, 'Inverted cyan synthetic ChArUco from logged pose'),
+        (overlay, '40% inverted cyan synthetic overlay'),
+    ):
+        panel = cv2.copyMakeBorder(image, label_height, 0, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
+        cv2.putText(panel, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+        panels.append(panel)
+    return cv2.hconcat(panels), overlay
 
 # -----------------------------------------------------------------------------
 # PHASE 1: INTRINSIC CALIBRATION
@@ -991,16 +1234,8 @@ def run_tag_pose_logger():
     data = np.load(INTRINSIC_FILE)
     camera_matrix = data['camera_matrix']
     dist_coeffs = data['dist_coeffs']
-    marker_size_m = STAGE_ARUCO_MARKER_SIZE_MM / 1000.0
-    obj_pts = np.array([
-        [-marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
-        [ marker_size_m / 2.0, marker_size_m / 2.0, 0.0],
-        [ marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
-        [-marker_size_m / 2.0,-marker_size_m / 2.0, 0.0],
-    ], dtype=np.float32)
-    axis_length_m = marker_size_m * 0.75
-    solvepnp_flag = getattr(cv2, 'SOLVEPNP_IPPE_SQUARE', cv2.SOLVEPNP_ITERATIVE)
-    stage_detector = cv2.aruco.ArucoDetector(ARUCO_DICT)
+    axis_length_m = MODE5_CHARUCO_SQUARE_LENGTH_M * 2.0
+    mode5_detector = _create_mode5_charuco_detector()
     log_exists = os.path.exists(TAG_POSE_LOG_FILE)
     log_count = 0
     os.makedirs(TAG_POSE_IMAGE_DIRECTORY, exist_ok=True)
@@ -1018,8 +1253,14 @@ def run_tag_pose_logger():
     current_image_path = None
     vis_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-    print(f"Detecting marker ID {STAGE_ARUCO_ID}; marker side length: {STAGE_ARUCO_MARKER_SIZE_MM:.2f} mm.")
-    print("The displayed axes are the tag coordinate system. Press [SPACEBAR] to log; [Q] to finish.")
+    print(
+        "Detecting the 50 mm x 50 mm ChArUco board "
+        f"({MODE5_MIN_CORNERS}+ corners; max RMSE {MODE5_MAX_REPROJECTION_RMSE_PX:.2f} px)."
+    )
+    print(
+        "Displayed XYZ axes and logged positions use the physical board center as [0, 0, 0]. "
+        "Press [SPACEBAR] to log; [Q] to finish."
+    )
     cv2.namedWindow("Tag Pose Logger", cv2.WINDOW_NORMAL)
 
     try:
@@ -1032,58 +1273,73 @@ def run_tag_pose_logger():
                 if frame is not None:
                     current_image_path = img_path
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    marker_corners, marker_ids, _ = stage_detector.detectMarkers(gray)
+                    charuco_corners, charuco_ids, marker_corners, marker_ids = mode5_detector.detectBoard(gray)
                     vis_frame = frame.copy()
                     current_pose = None
                     live_camera_position_mm = None
                     live_camera_orientation_deg = None
 
-                    if marker_ids is not None and STAGE_ARUCO_ID in marker_ids.flatten():
-                        target_idx = int(np.where(marker_ids.flatten() == STAGE_ARUCO_ID)[0][0])
-                        img_pts = marker_corners[target_idx].reshape(4, 2).astype(np.float32)
-                        success, rvec, tvec = cv2.solvePnP(
-                            obj_pts, img_pts, camera_matrix, dist_coeffs, flags=solvepnp_flag
-                        )
+                    if marker_ids is not None:
                         cv2.aruco.drawDetectedMarkers(vis_frame, marker_corners, marker_ids)
-                        if success:
-                            current_pose = (rvec, tvec)
-                            R_tag_to_cam, _ = cv2.Rodrigues(rvec)
-                            R_cam_to_tag = R_tag_to_cam.T
-                            live_camera_position_mm = (-R_cam_to_tag @ tvec).flatten() * 1000.0
-                            live_camera_orientation_deg = R.from_matrix(R_cam_to_tag).as_euler(
-                                'xyz', degrees=True
-                            )
-                            cv2.drawFrameAxes(
-                                vis_frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length_m, 2
-                            )
-                            cv2.putText(vis_frame, "Tag tracked: SPACE to log", (10, 30),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    if charuco_corners is not None:
+                        cv2.aruco.drawDetectedCornersCharuco(vis_frame, charuco_corners, charuco_ids)
+                    solved_pose, pose_rejection_reason = _solve_mode5_charuco_pose(
+                        charuco_corners, charuco_ids, camera_matrix, dist_coeffs
+                    )
+                    marker_count = 0 if marker_ids is None else len(marker_ids)
+                    charuco_corner_count = 0 if charuco_corners is None else len(charuco_corners)
+                    cv2.putText(
+                        vis_frame,
+                        f"Markers: {marker_count}/12 | ChArUco corners: "
+                        f"{charuco_corner_count}/{MODE5_MIN_CORNERS} min",
+                        (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 255, 0),
+                        2,
+                    )
+                    if solved_pose is not None:
+                        rvec, tvec, reprojection_rmse_px, corner_count = solved_pose
+                        current_pose = (rvec, tvec, reprojection_rmse_px, corner_count)
+                        R_tag_to_cam, _ = cv2.Rodrigues(rvec)
+                        R_cam_to_tag = R_tag_to_cam.T
+                        live_camera_position_mm = (-R_cam_to_tag @ tvec).flatten() * 1000.0
+                        live_camera_orientation_deg = R.from_matrix(R_cam_to_tag).as_euler(
+                            'xyz', degrees=True
+                        )
+                        cv2.drawFrameAxes(
+                            vis_frame, camera_matrix, dist_coeffs, rvec, tvec, axis_length_m, 2
+                        )
+                        cv2.putText(vis_frame, "ChArUco tracked: SPACE to log", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     else:
-                        cv2.putText(vis_frame, f"Marker ID {STAGE_ARUCO_ID} not detected", (10, 30),
+                        cv2.putText(vis_frame, "ChArUco pose rejected", (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.putText(vis_frame, pose_rejection_reason, (10, 80),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                     last_processed_revision = image_revision
 
             display_frame = vis_frame.copy()
             if live_camera_position_mm is not None:
                 cv2.putText(
                     display_frame,
-                    "Camera in tag (mm): "
+                    "Camera in board-center (mm): "
                     f"X={live_camera_position_mm[0]:.2f} "
                     f"Y={live_camera_position_mm[1]:.2f} "
                     f"Z={live_camera_position_mm[2]:.2f}",
-                    (10, 60),
+                    (10, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2,
                 )
                 cv2.putText(
                     display_frame,
-                    "Camera in tag (deg): "
+                    "Camera in board-center (deg): "
                     f"Roll={live_camera_orientation_deg[0]:.2f} "
                     f"Pitch={live_camera_orientation_deg[1]:.2f} "
                     f"Yaw={live_camera_orientation_deg[2]:.2f}",
-                    (10, 85),
+                    (10, 135),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2,
                 )
-            cv2.putText(display_frame, f"Logged poses: {log_count}", (10, 115),
+            cv2.putText(display_frame, f"Logged poses: {log_count}", (10, 160),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             cv2.imshow("Tag Pose Logger", display_frame)
             key = cv2.waitKey(15) & 0xFF
@@ -1103,7 +1359,7 @@ def run_tag_pose_logger():
             while sample_count < STAGE_MEASUREMENT_SAMPLES:
                 if sample_count == 0:
                     sample_path = current_image_path
-                    rvec, tvec = current_pose
+                    rvec, tvec, reprojection_rmse_px, corner_count = current_pose
                 else:
                     next_path = get_latest_image(DATA_DIRECTORY)
                     next_revision = get_image_revision(next_path) if next_path else None
@@ -1118,22 +1374,27 @@ def run_tag_pose_logger():
                         continue
 
                     sample_gray = cv2.cvtColor(sample_frame, cv2.COLOR_BGR2GRAY)
-                    sample_corners, sample_ids, _ = stage_detector.detectMarkers(sample_gray)
-                    if sample_ids is None or STAGE_ARUCO_ID not in sample_ids.flatten():
-                        continue
-
-                    target_idx = int(np.where(sample_ids.flatten() == STAGE_ARUCO_ID)[0][0])
-                    sample_img_pts = sample_corners[target_idx].reshape(4, 2).astype(np.float32)
-                    success, rvec, tvec = cv2.solvePnP(
-                        obj_pts, sample_img_pts, camera_matrix, dist_coeffs, flags=solvepnp_flag
+                    sample_charuco_corners, sample_charuco_ids, sample_marker_corners, sample_marker_ids = (
+                        mode5_detector.detectBoard(sample_gray)
                     )
-                    if not success:
+                    solved_pose, _ = _solve_mode5_charuco_pose(
+                        sample_charuco_corners, sample_charuco_ids, camera_matrix, dist_coeffs
+                    )
+                    if solved_pose is None:
                         continue
+                    rvec, tvec, reprojection_rmse_px, corner_count = solved_pose
 
                     sample_path = next_path
                     current_image_path = next_path
                     vis_frame = sample_frame.copy()
-                    cv2.aruco.drawDetectedMarkers(vis_frame, sample_corners, sample_ids)
+                    if sample_marker_ids is not None:
+                        cv2.aruco.drawDetectedMarkers(
+                            vis_frame, sample_marker_corners, sample_marker_ids
+                        )
+                    if sample_charuco_corners is not None:
+                        cv2.aruco.drawDetectedCornersCharuco(
+                            vis_frame, sample_charuco_corners, sample_charuco_ids
+                        )
 
                 R_tag_to_cam, _ = cv2.Rodrigues(rvec)
                 R_cam_to_tag = R_tag_to_cam.T
@@ -1150,10 +1411,32 @@ def run_tag_pose_logger():
                 cv2.imshow("Tag Pose Logger", vis_frame)
                 cv2.waitKey(1)
                 current_image_path = sample_path
-                print(f"   Sample {sample_count}/{STAGE_MEASUREMENT_SAMPLES} captured")
+                print(
+                    f"   Sample {sample_count}/{STAGE_MEASUREMENT_SAMPLES} captured "
+                    f"({corner_count} corners, RMSE={reprojection_rmse_px:.3f} px)"
+                )
 
-            P_cam_in_tag_mm = np.mean(np.asarray(sample_positions_mm), axis=0)
-            R_cam_to_tag = _average_rotation_matrices(sample_rotations)
+            robust_pose = _robust_average_mode5_poses(sample_positions_mm, sample_rotations)
+            if robust_pose is None:
+                print(
+                    f"--> Capture denied: fewer than {MODE5_MIN_INLIER_SAMPLES} samples survived "
+                    "outlier rejection. Hold the camera and board steady, then retry."
+                )
+                continue
+            (
+                P_cam_in_tag_mm,
+                R_cam_to_tag,
+                inliers,
+                position_errors_mm,
+                rotation_errors_deg,
+                position_limit_mm,
+                rotation_limit_deg,
+            ) = robust_pose
+            print(
+                f"   Outlier rejection kept {np.count_nonzero(inliers)}/{len(inliers)} samples "
+                f"(position limit {position_limit_mm:.3f} mm; "
+                f"rotation limit {rotation_limit_deg:.3f} deg)."
+            )
             euler_cam_in_tag_deg = R.from_matrix(R_cam_to_tag).as_euler('xyz', degrees=True)
             quaternion_cam_in_tag_xyzw = R.from_matrix(R_cam_to_tag).as_quat()
             write_header = not log_exists
@@ -1220,9 +1503,9 @@ def run_tag_pose_logger():
                         'camera_qx', 'camera_qy', 'camera_qz', 'camera_qw',
                     ])
                 writer.writerow([
-                    tag_snapshot_path, STAGE_ARUCO_ID,
+                    os.path.basename(tag_snapshot_path), 'charuco_50mm_5x5',
                     *P_cam_in_tag_mm,
-                    'camera axes relative to tag frame',
+                    'camera axes relative to 50 mm ChArUco board center',
                     "extrinsic XYZ; scipy Rotation.as_euler('xyz')",
                     *euler_cam_in_tag_deg, *quaternion_cam_in_tag_xyzw,
                 ])
@@ -1240,13 +1523,75 @@ def run_tag_pose_logger():
 
     print(f"Saved {log_count} pose(s) to '{TAG_POSE_LOG_FILE}'.")
 
+
+def run_mode7_pose_verification():
+    """Render each Mode 5 pose and overlay the synthetic board on its source image."""
+    print("\n--- MODE 7: TAG POSE SYNTHETIC OVERLAY ---")
+    if not os.path.exists(INTRINSIC_FILE):
+        print(f"Error: Missing calibration dependency '{INTRINSIC_FILE}'. Run intrinsic pass first.")
+        return
+    if not os.path.exists(TAG_POSE_LOG_FILE):
+        print(f"Error: No Mode 5 pose log found at '{TAG_POSE_LOG_FILE}'.")
+        return
+
+    calibration = np.load(INTRINSIC_FILE)
+    camera_matrix = calibration['camera_matrix']
+    dist_coeffs = calibration['dist_coeffs']
+    os.makedirs(MODE7_VERIFICATION_OUTPUT_DIRECTORY, exist_ok=True)
+    rendered_count = 0
+    stopped_early = False
+    print("Press [ENTER] to view the next comparison, or [Q] to stop.")
+
+    with open(TAG_POSE_LOG_FILE, newline='', encoding='utf-8') as pose_file:
+        for row_index, row in enumerate(csv.DictReader(pose_file), start=1):
+            source_path = os.path.join(TAG_POSE_IMAGE_DIRECTORY, row['image_file'])
+            source_image = cv2.imread(source_path)
+            if source_image is None:
+                print(f"Skipping row {row_index}: could not read '{source_path}'.")
+                continue
+            real_image = cv2.rotate(source_image, cv2.ROTATE_180)
+            R_tag_to_cam, _, t_tag_to_cam_m = _mode7_tag_to_camera_pose(row)
+            synthetic, board_mask = _render_mode7_charuco_board(
+                real_image.shape, R_tag_to_cam, t_tag_to_cam_m, camera_matrix, dist_coeffs
+            )
+            comparison, overlay = _mode7_comparison_image(real_image, synthetic, board_mask)
+            stem = os.path.splitext(os.path.basename(row['image_file']))[0]
+            synthetic_path = os.path.join(
+                MODE7_VERIFICATION_OUTPUT_DIRECTORY, f'{row_index:02d}_{stem}_synthetic.png'
+            )
+            overlay_path = os.path.join(
+                MODE7_VERIFICATION_OUTPUT_DIRECTORY, f'{row_index:02d}_{stem}_overlay.png'
+            )
+            comparison_path = os.path.join(
+                MODE7_VERIFICATION_OUTPUT_DIRECTORY, f'{row_index:02d}_{stem}_comparison.png'
+            )
+            cv2.imwrite(synthetic_path, synthetic)
+            cv2.imwrite(overlay_path, overlay)
+            cv2.imwrite(comparison_path, comparison)
+            cv2.imshow('Mode 7 Pose Verification', overlay)
+            rendered_count += 1
+            print(f"Showing overlay for '{row['image_file']}' ({rendered_count}); press ENTER for the next image.")
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord('q'), ord('Q')):
+                stopped_early = True
+                break
+
+    cv2.destroyWindow('Mode 7 Pose Verification')
+    if stopped_early:
+        print("Mode 7 stopped before all comparisons were shown.")
+    print(
+        f"Saved {rendered_count} synthetic, overlay, and comparison image set(s) to "
+        f"'{MODE7_VERIFICATION_OUTPUT_DIRECTORY}'."
+    )
+
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     mode = input(
         "Select Execution Mode "
-        "('1: intrinsics', '2: boresight', '3: eccentricity', '4: stage', or '5: tag logger'): "
+        "('1: intrinsics', '2: boresight', '3: eccentricity', '4: stage', "
+        "'5: tag logger', '6: generate mode 5 board', or '7: pose overlay'): "
     ).strip().lower()
     if mode == '1' or mode == 'intrinsics':
         run_intrinsic_calibration()
@@ -1258,5 +1603,12 @@ if __name__ == "__main__":
         run_stage_kinematic_calibration()
     elif mode == '5' or mode in ('tag logger', 'tag_logger', 'logger'):
         run_tag_pose_logger()
+    elif mode == '6' or mode in ('generate board', 'generate_board', 'board'):
+        generate_mode5_charuco_board()
+    elif mode == '7' or mode in ('pose overlay', 'pose_overlay', 'overlay', 'verify'):
+        run_mode7_pose_verification()
     else:
-        print("Invalid choice. Select 'intrinsics', 'boresight', 'eccentricity', 'stage', or 'tag logger'.")
+        print(
+            "Invalid choice. Select 'intrinsics', 'boresight', 'eccentricity', 'stage', "
+            "'tag logger', 'generate board', or 'pose overlay'."
+        )

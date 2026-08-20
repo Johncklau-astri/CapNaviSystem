@@ -238,8 +238,8 @@ position_latency_plotter = None
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 1
-camera_id = 0
-top_camera_id = 1
+camera_id = 1
+top_camera_id = 0
 
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08

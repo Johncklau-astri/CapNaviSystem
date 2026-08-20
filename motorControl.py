@@ -1446,8 +1446,8 @@ def euler_to_quaternion(roll, pitch, yaw, degrees=True):
 def rotateto1000(dev):
 
     
-    rotary_travel = 18.6   # degrees (positive/negative)
-    pitch_travel = 100.2
+    rotary_travel = 22.4   # degrees (positive/negative)
+    pitch_travel = 101.4
     vert_travel = 15
     hori_travel   = 6
 
