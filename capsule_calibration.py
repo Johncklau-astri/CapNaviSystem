@@ -62,7 +62,9 @@ MODE7_VERIFICATION_OUTPUT_DIRECTORY = os.path.join(
 )
 MODE7_BOARD_RENDER_SIZE_PX = 2000
 MODE7_OVERLAY_ALPHA = 0.55
-MODE5_MIN_CORNERS = 12
+MODE5_MIN_CORNERS = 8
+MODE5_FULL_CORNERS = 12
+MODE5_FALLBACK_MIN_BOARD_COVERAGE = 0.0
 MODE5_MAX_REPROJECTION_RMSE_PX = 1.0
 MODE5_MIN_INLIER_SAMPLES = 10
 MODE5_POSITION_OUTLIER_FLOOR_MM = 0.05
@@ -220,6 +222,18 @@ def _create_mode5_charuco_detector():
     )
 
 
+def _mode5_has_sufficient_board_coverage(obj_pts):
+    board_points = np.asarray(obj_pts, dtype=np.float64).reshape(-1, 3)
+    if len(board_points) == 0:
+        return False
+
+    board_width = MODE5_CHARUCO_SQUARES_X * MODE5_CHARUCO_SQUARE_LENGTH_M
+    board_height = MODE5_CHARUCO_SQUARES_Y * MODE5_CHARUCO_SQUARE_LENGTH_M
+    x_coverage = (np.max(board_points[:, 0]) - np.min(board_points[:, 0])) / board_width
+    y_coverage = (np.max(board_points[:, 1]) - np.min(board_points[:, 1])) / board_height
+    return min(x_coverage, y_coverage) >= MODE5_FALLBACK_MIN_BOARD_COVERAGE
+
+
 def _solve_mode5_charuco_pose(charuco_corners, charuco_ids, camera_matrix, dist_coeffs):
     if charuco_corners is None or len(charuco_corners) < MODE5_MIN_CORNERS:
         corner_count = 0 if charuco_corners is None else len(charuco_corners)
@@ -228,6 +242,11 @@ def _solve_mode5_charuco_pose(charuco_corners, charuco_ids, camera_matrix, dist_
     obj_pts, img_pts = MODE5_CHARUCO_BOARD.matchImagePoints(charuco_corners, charuco_ids)
     if len(obj_pts) < MODE5_MIN_CORNERS:
         return None, f"only {len(obj_pts)} matched ChArUco corners"
+    if len(obj_pts) < MODE5_FULL_CORNERS and not _mode5_has_sufficient_board_coverage(obj_pts):
+        return None, (
+            f"8-11 corners cover less than {MODE5_FALLBACK_MIN_BOARD_COVERAGE:.0%} "
+            "of the board"
+        )
 
     success, rvec, tvec = cv2.solvePnP(
         obj_pts, img_pts, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE

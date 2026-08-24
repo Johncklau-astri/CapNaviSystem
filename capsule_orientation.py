@@ -21,6 +21,8 @@ import struct
 import re
 from pathlib import Path
 import signal as system_signal  # Rename to avoid conflict
+import argparse
+import serial
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -34,10 +36,13 @@ LOG_FILENAME = "calibration_log.txt"
 DELETE_PROCESSED_FILES = False
 DEBUG_INGESTION = False
 STREAM_RESTART_IDLE_SECONDS = 2.0
-
-# A capture record is emitted after all newly accepted packets from an
-# imgInfo file have passed through the orientation filter.
-CAPTURE_MESSAGE_TYPE = "capture"
+CALIBRATION_SERIAL_PORT = 'COM11'
+CALIBRATION_SERIAL_BAUDRATE = 800000
+CALIBRATION_SERIAL_TIMEOUT = 0.1
+CALIBRATION_OUTPUT_FILE = 'capsule_clock_calibration.json'
+CALIBRATION_FILE_WAIT_TIMEOUT = 10.0
+CALIBRATION_SIDECAR_GRACE_TIMEOUT = 0.5
+CAPSULE_CLOCK_OFFSET_SECONDS = 0.0
 
 # Replace the identity matrix with the BORESIGHT_R_MC block printed by
 # Sensor_calibration/magnetometer_calibration-main/mag_boresight_calib.py.
@@ -624,16 +629,6 @@ class DataProcessor:
         match = re.search(r'imgInfo_(\d+)_', filename)
         return int(match.group(1)) if match else -1
 
-    @staticmethod
-    def capture_info_from_telemetry_path(filepath):
-        """Return the shared capture ID and expected image path for an imgInfo file."""
-        telemetry_path = Path(filepath)
-        match = re.fullmatch(r"imgInfo_(.+)\.txt", telemetry_path.name)
-        if not match:
-            raise ValueError(f"Unsupported telemetry filename: {telemetry_path.name}")
-        capture_id = match.group(1)
-        return capture_id, telemetry_path.with_name(f"image_{capture_id}.jpg")
-
     def update_sensor_input_rate(self, timestamp):
         """Estimate the sensor packet rate from the timestamps embedded in the logged file data."""
         self.packet_timestamps.append(timestamp)
@@ -923,7 +918,6 @@ class DataProcessor:
                 return
 
             parsed_packets.sort(key=lambda item: item[0])
-            capture_id, image_path = self.capture_info_from_telemetry_path(filepath)
             for timestamp, accel_g, gyro_dps, mag_uT in parsed_packets:
                 self.last_packet_timestamp = timestamp
                 self.update_sensor_input_rate(timestamp)
@@ -954,15 +948,6 @@ class DataProcessor:
 
                 data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU, 0))
                 self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU))
-
-            # FIFO ordering means this marker is handled only after every new
-            # packet from this image interval has updated the filter state.
-            data_queue.put({
-                "type": CAPTURE_MESSAGE_TYPE,
-                "capture_id": capture_id,
-                "image_path": str(image_path),
-                "timestamp": parsed_packets[-1][0],
-            })
             
             self.update_file_extraction_rate()
             self.last_file_num = file_num
@@ -1017,18 +1002,7 @@ def processing_thread(processor):
     with ThreadPoolExecutor(max_workers=2) as executor:
         while not shutdown_event.is_set():
             try:
-                queue_item = data_queue.get(timeout=1.0)
-                if isinstance(queue_item, dict) and queue_item.get("type") == CAPTURE_MESSAGE_TYPE:
-                    send_capture_to_tcp_clients(
-                        queue_item,
-                        mod_q,
-                        lowpass_mag,
-                        ac_lowpass_mag,
-                    )
-                    data_queue.task_done()
-                    continue
-
-                current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = queue_item
+                current_time, accel_g, gyro_dps, mag_uT, running_freq_hz = data_queue.get(timeout=1.0)
                 # print(f"Sign Corrected Raw a[0]: {accel_g[0]:.3f} g, a[1]: {accel_g[1]:.3f} g, a[2]: {accel_g[2]:.3f} g, m[0]: {mag_uT[0]:.3f} uT, m[1]: {mag_uT[1]:.3f} uT, m[2]: {mag_uT[2]:.3f} uT, gyro[0]: {gyro_dps[0]:.3f} dps, gyro[1]: {gyro_dps[1]:.3f} dps, gyro[2]: {gyro_dps[2]:.3f} dps")
 
                 # Track calculation update frequency
@@ -1145,7 +1119,12 @@ def processing_thread(processor):
 
                 
                 # Send to TCP clients
-                send_to_tcp_clients(mod_q, lowpass_mag, ac_lowpass_mag)
+                send_to_tcp_clients(
+                    mod_q,
+                    lowpass_mag,
+                    ac_lowpass_mag,
+                    timestamp_capsule=current_time,
+                )
                 data_queue.task_done()
                 
             except queue.Empty:
@@ -1155,12 +1134,14 @@ def processing_thread(processor):
                     print(f"Processing error: {e}")               
                 time.sleep(0.1)
 
-def send_to_tcp_clients(q, mag_uT, ac_mag_uT):
+def send_to_tcp_clients(q, mag_uT, ac_mag_uT, timestamp_capsule=None):
     """Send quaternion and magnetometer data to connected TCP clients."""
     global tcp_clients
     if not tcp_clients or not tcp_server_running:
         return
     
+    if timestamp_capsule is None:
+        timestamp_capsule = time.time()
     data = {
         'qw': float(q[0]),
         'qx': float(q[1]),
@@ -1172,7 +1153,9 @@ def send_to_tcp_clients(q, mag_uT, ac_mag_uT):
         'lockInX': float(ac_mag_uT[0]),
         'lockInY': float(ac_mag_uT[1]),
         'lockInZ': float(ac_mag_uT[2]),
-        'timestamp': time.time()
+        'timestamp_capsule': float(timestamp_capsule),
+        'timestamp_computer': float(timestamp_capsule - CAPSULE_CLOCK_OFFSET_SECONDS),
+        'timestamp_sent': time.time(),
     }
     
     data_str = json.dumps(data)
@@ -1187,43 +1170,6 @@ def send_to_tcp_clients(q, mag_uT, ac_mag_uT):
         except (socket.error, BrokenPipeError):
             clients_to_remove.append(client_socket)
     
-    for client_socket in clients_to_remove:
-        tcp_clients.remove(client_socket)
-        client_socket.close()
-
-
-def send_capture_to_tcp_clients(capture, q, mag_uT, ac_mag_uT):
-    """Publish one image-associated pose input to capture-aware TCP clients."""
-    global tcp_clients
-    if not tcp_clients or not tcp_server_running or mag_uT is None or ac_mag_uT is None:
-        print(f"[CAPTURE] unable to publish {capture['capture_id']}: telemetry is not ready")
-        return
-
-    data = {
-        "type": CAPTURE_MESSAGE_TYPE,
-        "capture_id": capture["capture_id"],
-        "image_path": capture["image_path"],
-        "timestamp": float(capture["timestamp"]),
-        "qw": float(q[0]),
-        "qx": float(q[1]),
-        "qy": float(q[2]),
-        "qz": float(q[3]),
-        "magX": float(mag_uT[0]),
-        "magY": float(mag_uT[1]),
-        "magZ": float(mag_uT[2]),
-        "lockInX": float(ac_mag_uT[0]),
-        "lockInY": float(ac_mag_uT[1]),
-        "lockInZ": float(ac_mag_uT[2]),
-    }
-    data_bytes = json.dumps(data).encode("utf-8")
-    clients_to_remove = []
-    for client_socket in tcp_clients:
-        try:
-            client_socket.sendall(struct.pack(">I", len(data_bytes)))
-            client_socket.sendall(data_bytes)
-        except (socket.error, BrokenPipeError):
-            clients_to_remove.append(client_socket)
-
     for client_socket in clients_to_remove:
         tcp_clients.remove(client_socket)
         client_socket.close()
@@ -1394,6 +1340,231 @@ def reconcile_directory(event_handler, directory, interval=0.5):
     while not shutdown_event.wait(interval):
         event_handler.scan_directory(directory)
 
+
+def _read_telemetry_samples(filepath, processor):
+    """Read packet timestamps from one telemetry file using the normal parser."""
+    with open(filepath, 'r') as input_file:
+        hex_string = ''.join(input_file.read().split())
+    data = bytes.fromhex(hex_string)
+    data = data[6:131] + data[131 + 8:244]
+
+    samples = []
+    for offset in range(0, len(data) - 22, 23):
+        result = processor.parse_data_packet(data[offset:offset + 23], 0)
+        if result is not None:
+            samples.append(result[0])
+    return samples
+
+
+def _telemetry_file_snapshot(processor):
+    """Return existing telemetry names and the greatest packet timestamp."""
+    files = [
+        path for path in Path(DATA_DIRECTORY).glob('imgInfo_*.txt')
+        if path.is_file()
+    ]
+    file_names = {path.name for path in files}
+    latest_timestamp = -1.0
+    for path in files:
+        try:
+            samples = _read_telemetry_samples(path, processor)
+        except (OSError, ValueError):
+            continue
+        if samples:
+            latest_timestamp = max(latest_timestamp, max(samples))
+    return file_names, latest_timestamp
+
+
+def _find_newest_sensor_timestamp(processor, previous_names, previous_timestamp, timeout,
+                                  expected_new_files=2):
+    """Find the final fresh packet in the newest file created during a trial."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new_files = [
+            path for path in Path(DATA_DIRECTORY).glob('imgInfo_*.txt')
+            if path.is_file() and path.name not in previous_names
+        ]
+        new_files.sort(key=lambda path: processor.extract_file_number(path.name))
+        if len(new_files) >= expected_new_files:
+            newest_file = new_files[-1]
+            try:
+                samples = [
+                    timestamp for timestamp in _read_telemetry_samples(newest_file, processor)
+                    if timestamp > previous_timestamp
+                ]
+            except (OSError, ValueError):
+                samples = []
+            if samples:
+                return newest_file, samples[-1]
+        time.sleep(0.02)
+    return None, None
+
+
+def _read_serial_line(connection):
+    """Read one UART line while preserving extra lines received in one read."""
+    if not hasattr(connection, '_calibration_line_buffer'):
+        connection._calibration_line_buffer = b''
+
+    while True:
+        line_endings = [
+            index for index in (
+                connection._calibration_line_buffer.find(b'\r'),
+                connection._calibration_line_buffer.find(b'\n'),
+            ) if index >= 0
+        ]
+        if line_endings:
+            line_end = min(line_endings)
+            raw_line = connection._calibration_line_buffer[:line_end]
+            remainder = connection._calibration_line_buffer[line_end + 1:]
+            if remainder.startswith(b'\n') and connection._calibration_line_buffer[line_end:line_end + 2] == b'\r\n':
+                remainder = remainder[1:]
+            connection._calibration_line_buffer = remainder
+            return time.time(), raw_line.decode('utf-8', errors='replace').strip()
+
+        chunk = connection.read(4096)
+        if not chunk:
+            return None, None
+        connection._calibration_line_buffer += chunk
+
+
+def _wait_for_serial_text(connection, text, timeout):
+    """Wait for text in serial output and return its computer receive time."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        received_time, line = _read_serial_line(connection)
+        if line is not None and text in line:
+            return received_time
+    raise TimeoutError(f"Timed out waiting for serial output: {text}")
+
+
+def run_time_calibration(trials=20, output_file=CALIBRATION_OUTPUT_FILE,
+                         serial_port=CALIBRATION_SERIAL_PORT,
+                         baudrate=CALIBRATION_SERIAL_BAUDRATE,
+                         timeout=CALIBRATION_FILE_WAIT_TIMEOUT,
+                         warmup_trials=1, max_missing_sidecar_retries=8):
+    """Estimate capsule-to-computer clock offset using the second image.
+
+    A capture without its telemetry sidecar is discarded and retried.
+    """
+    processor = DataProcessor()
+    connection = serial.Serial(
+        serial_port,
+        baudrate=baudrate,
+        timeout=CALIBRATION_SERIAL_TIMEOUT,
+        write_timeout=CALIBRATION_SERIAL_TIMEOUT,
+    )
+    offsets = []
+    trial_records = []
+    discarded_capture_count = 0
+
+    try:
+        connection.reset_input_buffer()
+        connection.write(b'at+photo=p,1,2\r')
+        _wait_for_serial_text(connection, 'Total image number', timeout)
+
+        total_sequences = warmup_trials + trials
+        for sequence_number in range(1, total_sequences + 1):
+            missing_sidecar_retries = 0
+            while True:
+                previous_names, previous_timestamp = _telemetry_file_snapshot(processor)
+                command_time = time.time()
+                connection.write(b'at+photo+\r')
+
+                image_start_count = 0
+                second_image_start_time = None
+                while second_image_start_time is None:
+                    received_time, line = _read_serial_line(connection)
+                    if line is None:
+                        continue
+                    if '+++Image-Start' in line:
+                        image_start_count += 1
+                        if image_start_count == 2:
+                            second_image_start_time = received_time
+
+                second_image_end_time = _wait_for_serial_text(connection, 'ImgCt2', timeout)
+                telemetry_file, capsule_timestamp = _find_newest_sensor_timestamp(
+                    processor, previous_names, previous_timestamp,
+                    min(timeout, CALIBRATION_SIDECAR_GRACE_TIMEOUT),
+                    expected_new_files=2,
+                )
+                if telemetry_file is not None:
+                    break
+
+                missing_sidecar_retries += 1
+                discarded_capture_count += 1
+                if missing_sidecar_retries > max_missing_sidecar_retries:
+                    raise TimeoutError(
+                        f"No fresh telemetry packet found after {missing_sidecar_retries} "
+                        f"recaptures for calibration trial {sequence_number}"
+                    )
+                print(
+                    f"Calibration capture missing telemetry sidecar; recapturing "
+                    f"trial {sequence_number} ({missing_sidecar_retries}/"
+                    f"{max_missing_sidecar_retries})"
+                )
+
+            offset = capsule_timestamp - second_image_start_time
+            record = {
+                'trial': sequence_number,
+                'discarded_capture_retries': missing_sidecar_retries,
+                'command_sent_computer_time': command_time,
+                'second_image_start_computer_time': second_image_start_time,
+                'second_image_end_computer_time': second_image_end_time,
+                'telemetry_file': str(telemetry_file),
+                'previous_sensor_timestamp': previous_timestamp,
+                'capsule_timestamp': capsule_timestamp,
+                'offset_seconds': offset,
+                'warmup': sequence_number <= warmup_trials,
+            }
+            trial_records.append(record)
+            if sequence_number <= warmup_trials:
+                print(
+                    f"Calibration warm-up {sequence_number}/{warmup_trials}: "
+                    f"offset={offset:.6f}s, file={telemetry_file.name} (excluded)"
+                )
+            else:
+                offsets.append(offset)
+                print(
+                    f"Calibration trial {sequence_number - warmup_trials}/{trials}: "
+                    f"offset={offset:.6f}s, file={telemetry_file.name}"
+                )
+
+        result = {
+            'clock_model': 'constant_offset',
+            'offset_seconds': float(np.median(offsets)),
+            'offset_std_seconds': float(np.std(offsets)),
+            'trial_count': len(offsets),
+            'warmup_trials': warmup_trials,
+            'serial_port': serial_port,
+            'baudrate': baudrate,
+            'ignored_first_image': True,
+            'discarded_capture_count': discarded_capture_count,
+            'trials': trial_records,
+        }
+        with open(output_file, 'w', encoding='utf-8') as calibration_file:
+            json.dump(result, calibration_file, indent=2)
+        print(f"Saved capsule clock calibration to {output_file}")
+        print(
+            f"Median offset: {result['offset_seconds']:.6f}s "
+            f"(std={result['offset_std_seconds']:.6f}s)"
+        )
+        return result
+    finally:
+        connection.close()
+
+
+def load_capsule_clock_offset(calibration_file=CALIBRATION_OUTPUT_FILE):
+    """Load the calibrated capsule-minus-computer clock offset."""
+    try:
+        with open(calibration_file, 'r', encoding='utf-8') as input_file:
+            calibration = json.load(input_file)
+        offset = float(calibration['offset_seconds'])
+        print(f"Loaded capsule clock offset: {offset:.6f}s from {calibration_file}")
+        return offset
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Capsule clock calibration unavailable ({calibration_file}): {exc}")
+        print("Using capsule timestamps without clock conversion.")
+        return 0.0
+
 def cleanup():
     """Clean up resources before shutdown."""
     global tcp_server_running, observers
@@ -1427,19 +1598,37 @@ def signal_handler(sig, frame):
 
 def parse_args():
     """Parse command-line arguments."""
-    show_plot = '--plot' in sys.argv
-    return show_plot
+    parser = argparse.ArgumentParser(description='Capsule orientation processor')
+    parser.add_argument('--plot', action='store_true', help='Show live telemetry plots')
+    parser.add_argument('--calibration-trials', type=int, default=20)
+    parser.add_argument('--calibration-warmup-trials', type=int, default=1)
+    parser.add_argument('--calibration-output', default=CALIBRATION_OUTPUT_FILE)
+    return parser.parse_args()
 
 
 def main():
     """Main function to run the application."""
-    global observers
+    global observers, CAPSULE_CLOCK_OFFSET_SECONDS
     
-    show_plot = parse_args()
+    args = parse_args()
+    show_plot = args.plot
 
     system_signal.signal(system_signal.SIGINT, signal_handler)
     system_signal.signal(system_signal.SIGTERM, signal_handler)
     atexit.register(cleanup)
+
+    print("Capsule clock calibration is required before normal telemetry mode.")
+    calibration_result = run_time_calibration(
+        trials=args.calibration_trials,
+        warmup_trials=args.calibration_warmup_trials,
+        output_file=args.calibration_output,
+    )
+    CAPSULE_CLOCK_OFFSET_SECONDS = float(calibration_result['offset_seconds'])
+    print(
+        f"Time calibration complete for this power session; "
+        f"starting normal telemetry extraction with offset "
+        f"{CAPSULE_CLOCK_OFFSET_SECONDS:.6f}s."
+    )
     
     processor = DataProcessor()
 

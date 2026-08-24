@@ -99,6 +99,12 @@ def calculate_magnet_pose_and_sendMagAbsPos(Motor):
     # SciPy outputs quaternions in [x, y, z, w] format
     quat = rotation.as_quat() 
     quat[1] = -1 * quat[1]  # Invert the y component to match your convention
+
+    encoder_timestamps = [
+        motor.last_update_time for motor in Motor
+        if motor.last_update_time is not None
+    ]
+    pose_timestamp = max(encoder_timestamps) if encoder_timestamps else time.time()
     
     # print(f"Magnet Pos- X: {X:.3f}, Y: {Y:.3f}, Z: {Z:.3f} q: [{quat[3]:.4f}, {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}]")
 
@@ -111,6 +117,7 @@ def calculate_magnet_pose_and_sendMagAbsPos(Motor):
         "qx": float(f"{quat[0]:.4f}"),
         "qy": float(f"{quat[1]:.4f}"),
         "qz": float(f"{quat[2]:.4f}"),
+        "timestamp": float(pose_timestamp),
         "record_data":False
     }
     # print(f"Sending Magnet Pos- X: {X:.3f}, Y: {Y:.3f}, Z: {Z:.3f} q: [{quat[3]:.4f}, {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}]")

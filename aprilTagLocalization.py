@@ -25,6 +25,7 @@ import argparse
 from collections import deque
 import matplotlib.pyplot as plt
 import math
+import re
 
 
 
@@ -265,6 +266,8 @@ LOG_REPEAT_TEST_FILE = "repeatability_test_log.csv"  # For repeatability testing
 CAPTURE_MESSAGE_TYPE = "capture"
 # Set this to a local folder shared through SMB, or to a mapped SMB path.
 CAPTURE_EXPORT_DIRECTORY = r"R:\Release_Internal_V1A\export"
+CAPTURE_SOURCE_DIRECTORY = r"R:\Release_Internal_V1A\output"
+CAPSULE_CLOCK_CALIBRATION_FILE = "capsule_clock_calibration.json"
 CAPTURE_EXPORT_MAX_PENDING = 2
 capture_export_executor = ThreadPoolExecutor(max_workers=1)
 capture_export_result_queue = queue.Queue()
@@ -382,6 +385,8 @@ latest_bt_data = None
 position_data_lock = threading.Lock()
 bt_data_lock = threading.Lock()
 position_data_queue = queue.Queue()
+MOTOR_POSE_BUFFER_SECONDS = 3.0
+motor_pose_history = deque()
 stop_event = threading.Event()
 
 
@@ -598,6 +603,11 @@ def run_tcp_server(host='localhost', port=MOTOR_SERVER_PORT, stop_event=None):
                         auto_record_flag = True
                     with position_data_lock:
                         latest_position_data = data
+                        pose_timestamp = float(data.get('timestamp', time.time()))
+                        motor_pose_history.append((pose_timestamp, data.copy()))
+                        cutoff = pose_timestamp - MOTOR_POSE_BUFFER_SECONDS
+                        while motor_pose_history and motor_pose_history[0][0] < cutoff:
+                            motor_pose_history.popleft()
                         position_data_queue.put(data)
                 client_socket.close()
             except socket.timeout:
@@ -926,8 +936,64 @@ def request_position_estimation(magX, magY, magZ, quat_w, quat_x, quat_y, quat_z
         return False
 
 
-def request_capture_position_estimation(capture, motor_data):
+def _interpolate_quaternion(q0, q1, fraction):
+    """Interpolate unit quaternions while taking the shortest path."""
+    first = np.asarray(q0, dtype=float)
+    second = np.asarray(q1, dtype=float)
+    first /= np.linalg.norm(first)
+    second /= np.linalg.norm(second)
+    dot = float(np.dot(first, second))
+    if dot < 0.0:
+        second = -second
+        dot = -dot
+    if dot > 0.9995:
+        result = first + fraction * (second - first)
+        return result / np.linalg.norm(result)
+    angle = np.arccos(np.clip(dot, -1.0, 1.0))
+    sine = np.sin(angle)
+    return (np.sin((1.0 - fraction) * angle) * first +
+            np.sin(fraction * angle) * second) / sine
+
+
+def get_motor_pose_at_time(target_timestamp):
+    """Return an interpolated motor pose from the recent three-second history."""
+    with position_data_lock:
+        samples = list(motor_pose_history)
+    if not samples:
+        return None, None
+    if target_timestamp <= samples[0][0]:
+        return samples[0][1].copy(), abs(samples[0][0] - target_timestamp)
+    if target_timestamp >= samples[-1][0]:
+        return samples[-1][1].copy(), abs(samples[-1][0] - target_timestamp)
+
+    for (time0, pose0), (time1, pose1) in zip(samples, samples[1:]):
+        if time0 <= target_timestamp <= time1:
+            fraction = (target_timestamp - time0) / (time1 - time0)
+            pose = pose0.copy()
+            for axis in ('x', 'y', 'z'):
+                pose[axis] = pose0[axis] + fraction * (pose1[axis] - pose0[axis])
+            quaternion = _interpolate_quaternion(
+                [pose0['qw'], pose0['qx'], pose0['qy'], pose0['qz']],
+                [pose1['qw'], pose1['qx'], pose1['qy'], pose1['qz']],
+                fraction,
+            )
+            pose.update(dict(zip(('qw', 'qx', 'qy', 'qz'), quaternion)))
+            pose['timestamp'] = target_timestamp
+            return pose, 0.0
+    return None, None
+
+
+def request_capture_position_estimation(capture, motor_data=None):
     """Queue one image-associated magnetic solve using a motor-pose snapshot."""
+    capture_timestamp = capture.get('timestamp_computer', capture.get('timestamp'))
+    if capture_timestamp is not None:
+        matched_motor_data, motor_time_error = get_motor_pose_at_time(float(capture_timestamp))
+        if matched_motor_data is not None:
+            motor_data = matched_motor_data
+    else:
+        motor_time_error = None
+    if motor_data is None:
+        return False
     relative_quaternion = compute_bt_only_quaternion(
         motor_data,
         [capture['qw'], capture['qx'], capture['qy'], capture['qz']],
@@ -939,6 +1005,8 @@ def request_capture_position_estimation(capture, motor_data):
         'capture_id': capture['capture_id'],
         'image_path': capture['image_path'],
         'timestamp': capture['timestamp'],
+        'timestamp_computer': capture.get('timestamp_computer', capture.get('timestamp')),
+        'motor_time_error': motor_time_error,
         'orientation_world': [capture['qw'], capture['qx'], capture['qy'], capture['qz']],
         'motor_data': motor_data.copy(),
         'magX': capture['magX'],
@@ -953,10 +1021,8 @@ def request_capture_position_estimation(capture, motor_data):
     return True
 
 
-def queue_pending_capture_requests(motor_data):
-    """Attach the current motor pose to all completed telemetry captures."""
-    if motor_data is None:
-        return
+def queue_pending_capture_requests(motor_data=None):
+    """Attach a timestamp-matched motor pose to completed telemetry captures."""
     while True:
         try:
             capture = capture_data_queue.get_nowait()
@@ -967,6 +1033,82 @@ def queue_pending_capture_requests(motor_data):
                 print(f"[CAPTURE] skipped {capture['capture_id']}: motor pose is unavailable")
         finally:
             capture_data_queue.task_done()
+
+
+def get_image_sensor_timestamp(capture_id):
+    """Return the final sensor packet time and calibrated computer time for an image."""
+    source_directory = Path(CAPTURE_SOURCE_DIRECTORY)
+    sensor_file = source_directory / f"imgInfo_{capture_id}.txt"
+    if not sensor_file.is_file():
+        return None, None
+
+    try:
+        with open(sensor_file, 'r', encoding='utf-8') as input_file:
+            data = bytes.fromhex(''.join(input_file.read().split()))
+        packet_timestamps = []
+        for data_region in (data[6:131], data[139:244]):
+            packet_timestamps.extend(
+                struct.unpack('>I', data_region[offset:offset + 4])[0] / 1000.0
+                for offset in range(0, len(data_region) - 22, 23)
+            )
+        if not packet_timestamps:
+            return None, None
+
+        with open(CAPSULE_CLOCK_CALIBRATION_FILE, 'r', encoding='utf-8') as input_file:
+            calibration = json.load(input_file)
+        clock_offset = float(calibration['offset_seconds'])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        print(f"[CAPTURE] could not read timestamp metadata for {capture_id}: {exc}")
+        return None, None
+
+    sensor_timestamp = max(packet_timestamps)
+    return sensor_timestamp, sensor_timestamp - clock_offset
+
+
+def queue_latest_image_capture(bt_data, motor_data, last_image_path=None):
+    """Queue the newest output image once it has live pose data available."""
+    if bt_data is None or motor_data is None:
+        return last_image_path
+
+    source_directory = Path(CAPTURE_SOURCE_DIRECTORY)
+    if not source_directory.is_dir():
+        return last_image_path
+
+    image_paths = [
+        path for path in source_directory.glob('image_*.jpg')
+        if path.is_file()
+    ]
+    if not image_paths:
+        return last_image_path
+
+    image_path = max(image_paths, key=lambda path: path.stat().st_mtime_ns)
+    if image_path == last_image_path:
+        return last_image_path
+
+    capture_id = image_path.stem.removeprefix('image_')
+    sensor_timestamp, computer_timestamp = get_image_sensor_timestamp(capture_id)
+    if sensor_timestamp is None or computer_timestamp is None:
+        print(f"[CAPTURE] waiting for sensor timestamp metadata for {image_path.name}")
+        return last_image_path
+
+    capture = {
+        'type': CAPTURE_MESSAGE_TYPE,
+        'capture_id': capture_id,
+        'image_path': str(image_path),
+        'timestamp': sensor_timestamp,
+        'timestamp_computer': computer_timestamp,
+        'qw': bt_data.get('qw', 1.0),
+        'qx': bt_data.get('qx', 0.0),
+        'qy': bt_data.get('qy', 0.0),
+        'qz': bt_data.get('qz', 0.0),
+        'magX': bt_data.get('magX', 0.0),
+        'magY': bt_data.get('magY', 0.0),
+        'magZ': bt_data.get('magZ', 0.0),
+    }
+    if request_capture_position_estimation(capture, motor_data):
+        print(f"[CAPTURE] queued {image_path}")
+        return image_path
+    return last_image_path
 
 
 def export_capture_bundle(request, response):
@@ -998,6 +1140,12 @@ def export_capture_bundle(request, response):
         'capture_id': request['capture_id'],
         'image_file': output_image.name,
         'timestamp': float(request['timestamp']),
+        'timestamp_computer': request.get('timestamp_computer'),
+        'motor_time_error': request.get('motor_time_error'),
+        'motor_orientation': [
+            float(motor_data['qw']), float(motor_data['qx']),
+            float(motor_data['qy']), float(motor_data['qz']),
+        ],
         'position_world': [float(value) for value in position_world],
         'orientation_world': [float(value) for value in request['orientation_world']],
     }
@@ -1011,6 +1159,10 @@ def export_capture_bundle(request, response):
         'image_path': output_image,
         'position_world': position_world,
         'orientation_world': request['orientation_world'],
+        'motor_orientation': [
+            float(motor_data['qw']), float(motor_data['qx']),
+            float(motor_data['qy']), float(motor_data['qz']),
+        ],
     }
 
 
@@ -1023,10 +1175,16 @@ def display_exported_capture(exported_capture):
 
     position = exported_capture['position_world']
     quaternion = exported_capture['orientation_world']
+    motor_quaternion = exported_capture.get('motor_orientation')
     overlay_lines = [
         f"position: x={position[0]:.4f}, y={position[1]:.4f}, z={position[2]:.4f}",
         f"q: w={quaternion[0]:.4f}, x={quaternion[1]:.4f}, y={quaternion[2]:.4f}, z={quaternion[3]:.4f}",
     ]
+    if motor_quaternion is not None:
+        overlay_lines.append(
+            f"motor q: w={motor_quaternion[0]:.4f}, x={motor_quaternion[1]:.4f}, "
+            f"y={motor_quaternion[2]:.4f}, z={motor_quaternion[3]:.4f}"
+        )
     for line_number, line in enumerate(overlay_lines):
         cv2.putText(
             image,
@@ -1041,6 +1199,42 @@ def display_exported_capture(exported_capture):
 
     cv2.imshow("BT-only latest exported capture", image)
     return (cv2.waitKey(1) & 0xFF) != ord('q')
+
+
+def load_latest_exported_capture():
+    """Load the newest complete capture bundle from the export directory."""
+    export_directory = Path(CAPTURE_EXPORT_DIRECTORY)
+    if not export_directory.is_dir():
+        return None
+
+    latest_capture = None
+    latest_timestamp = None
+    for bundle_directory in export_directory.iterdir():
+        if not bundle_directory.is_dir():
+            continue
+        ready_file = bundle_directory / 'capture.ready'
+        manifest_file = bundle_directory / 'pos.json'
+        if not ready_file.is_file() or not manifest_file.is_file():
+            continue
+        try:
+            with open(manifest_file, 'r', encoding='utf-8') as input_file:
+                payload = json.load(input_file)
+            image_path = bundle_directory / payload['image_file']
+            if not image_path.is_file():
+                continue
+            manifest_timestamp = manifest_file.stat().st_mtime
+            if latest_timestamp is None or manifest_timestamp > latest_timestamp:
+                latest_timestamp = manifest_timestamp
+                latest_capture = {
+                    'image_path': image_path,
+                    'position_world': payload['position_world'],
+                    'orientation_world': payload['orientation_world'],
+                    'motor_orientation': payload.get('motor_orientation'),
+                }
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[CAPTURE] could not load export bundle {bundle_directory}: {exc}")
+
+    return latest_capture
 
 
 def finish_capture_export(future):
@@ -1202,16 +1396,25 @@ def run_bt_only_loop(args):
     global position_latency_plotter
 
     print("BT-only mode enabled; camera and AprilTag processing are skipped.")
-    export_data = input("Export capture data to the export directory? [y/N]: ").strip().lower() in {'y', 'yes'}
+    display_export = getattr(args, 'display_export', False)
+    export_data = display_export or (
+        input("Export capture data to the export directory? [y/N]: ").strip().lower()
+        in {'y', 'yes'}
+    )
     if export_data:
         print(f"Capture export enabled: {CAPTURE_EXPORT_DIRECTORY}")
     else:
         print("Capture export disabled.")
 
+    latest_export = load_latest_exported_capture() if display_export else None
+    if latest_export is not None:
+        print(f"Displaying latest exported capture: {latest_export['image_path']}")
+
     # global position_latency_plotter
     # position_latency_plotter = PositionLatencyPlotter()
 
     motor_data = None
+    last_capture_image_path = None
     last_motor_update = 0.0
     MOTOR_UPDATE_INTERVAL = 0.1
     last_position_update = 0.0
@@ -1258,6 +1461,10 @@ def run_bt_only_loop(args):
                 last_motor_update = time.time()
             step_durations_ms['motor_update'] = (time.perf_counter() - step_start) * 1000.0
 
+            if export_data:
+                last_capture_image_path = queue_latest_image_capture(
+                    latest_bt_data, motor_data, last_capture_image_path
+                )
             queue_pending_capture_requests(motor_data)
 
             step_start = time.perf_counter()
@@ -1277,8 +1484,10 @@ def run_bt_only_loop(args):
                 estX, estY, estZ = latest_estimate
             step_durations_ms['position_update'] = (time.perf_counter() - step_start) * 1000.0
 
-            latest_export = export_completed_capture_bundles(export_data)
-            if export_data and getattr(args, 'display_export', False) and latest_export is not None:
+            new_export = export_completed_capture_bundles(export_data)
+            if new_export is not None:
+                latest_export = new_export
+            if display_export and latest_export is not None:
                 if not display_exported_capture(latest_export):
                     stop_event.set()
                     break
@@ -1308,7 +1517,7 @@ def run_bt_only_loop(args):
         if 'position_thread' in locals():
             position_thread.join(timeout=1.0)
         shutdown_capture_export_executor(export_data)
-        if getattr(args, 'display_export', False):
+        if display_export:
             cv2.destroyAllWindows()
 
 # def load_calibration():
