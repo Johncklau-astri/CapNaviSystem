@@ -177,6 +177,7 @@ def test_main_starts_normal_extraction_after_time_calibration(monkeypatch):
             calibration_trials=2,
             calibration_warmup_trials=1,
             calibration_output='clock.json',
+            skip_time_calibration=False,
         ),
     )
     monkeypatch.setattr(
@@ -198,5 +199,70 @@ def test_main_starts_normal_extraction_after_time_calibration(monkeypatch):
     module.main()
 
     assert started[0][0] == 'calibrated'
+    assert ('primed', module.DATA_DIRECTORY) in started
+    assert ('observer',) in started
+
+
+def test_main_can_skip_time_calibration(monkeypatch):
+    module = load_module()
+    started = []
+
+    class FakeHandler:
+        def __init__(self, processor):
+            self.processor = processor
+
+        def prime_directory(self, directory):
+            started.append(('primed', directory))
+
+    class FakeThread:
+        def __init__(self, target, args=(), daemon=False):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            started.append(('thread', self.target))
+
+    class FakeObserver:
+        def schedule(self, handler, directory, recursive):
+            started.append(('scheduled', directory, recursive))
+
+        def start(self):
+            started.append(('observer',))
+
+        def stop(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+    monkeypatch.setattr(
+        module,
+        'parse_args',
+        lambda: types.SimpleNamespace(
+            plot=False,
+            calibration_trials=2,
+            calibration_warmup_trials=1,
+            calibration_output='clock.json',
+            skip_time_calibration=True,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        'run_time_calibration',
+        lambda **kwargs: started.append(('calibrated', kwargs)),
+    )
+    monkeypatch.setattr(module, 'DataFileHandler', FakeHandler)
+    monkeypatch.setattr(module.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(module, 'Observer', FakeObserver)
+    monkeypatch.setattr(module.system_signal, 'signal', lambda *args: None)
+    monkeypatch.setattr(module.atexit, 'register', lambda callback: None)
+    monkeypatch.setattr(module, 'cleanup', lambda: started.append(('cleaned',)))
+    monkeypatch.setattr(module.time, 'sleep', lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    module.main()
+
+    assert not any(event[0] == 'calibrated' for event in started)
+    assert module.CAPSULE_CLOCK_OFFSET_SECONDS == 0.0
     assert ('primed', module.DATA_DIRECTORY) in started
     assert ('observer',) in started

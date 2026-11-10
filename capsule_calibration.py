@@ -30,20 +30,21 @@ ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 CHARUCO_BOARD = cv2.aruco.CharucoBoard((7, 9), 0.026, 0.01976, ARUCO_DICT)
 detector = cv2.aruco.CharucoDetector(CHARUCO_BOARD)
 
-# Mode 5 uses this compact target rather than the larger intrinsic-calibration board.
-# Five 10 mm squares make the printed board exactly 50 mm x 50 mm.
+# Mode 5 uses this target rather than the larger intrinsic-calibration board.
+# Five by twelve 10 mm squares make the printed board exactly 50 mm x 120 mm.
+MODE5_ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 MODE5_CHARUCO_SQUARES_X = 5
-MODE5_CHARUCO_SQUARES_Y = 5
+MODE5_CHARUCO_SQUARES_Y = 12
 MODE5_CHARUCO_SQUARE_LENGTH_M = 0.010
 MODE5_CHARUCO_MARKER_LENGTH_M = 0.0075
 MODE5_CHARUCO_BOARD = cv2.aruco.CharucoBoard(
     (MODE5_CHARUCO_SQUARES_X, MODE5_CHARUCO_SQUARES_Y),
     MODE5_CHARUCO_SQUARE_LENGTH_M,
     MODE5_CHARUCO_MARKER_LENGTH_M,
-    ARUCO_DICT,
+    MODE5_ARUCO_DICT,
 )
 # OpenCV defines ChArUco board coordinates from an outer corner. Mode 5 shifts
-# that frame so the physical center of this 50 mm x 50 mm board is [0, 0, 0].
+# that frame so the physical center of this 50 mm x 120 mm board is [0, 0, 0].
 MODE5_BOARD_CENTER_IN_OPENCV_FRAME_M = np.array(
     [
         MODE5_CHARUCO_SQUARES_X * MODE5_CHARUCO_SQUARE_LENGTH_M / 2.0,
@@ -55,20 +56,24 @@ MODE5_BOARD_CENTER_IN_OPENCV_FRAME_M = np.array(
 # Mode 5's physical tag frame uses the centered origin with Y and Z reversed
 # from OpenCV's ChArUco board frame, equivalent to a 180 degree local X rotation.
 MODE5_TAG_FRAME_FROM_OPENCV_FRAME = np.diag([1.0, -1.0, -1.0])
-MODE5_CHARUCO_OUTPUT_FILE = "mode5_charuco_50mm.png"
+MODE5_CHARUCO_OUTPUT_FILE = "mode5_charuco_50x120mm.png"
 MODE5_CHARUCO_PRINT_DPI = 600
 MODE7_VERIFICATION_OUTPUT_DIRECTORY = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tag_pose_synthetic_output"
 )
-MODE7_BOARD_RENDER_SIZE_PX = 2000
+MODE7_BOARD_RENDER_WIDTH_PX = 1000
+MODE7_BOARD_RENDER_HEIGHT_PX = 2400
 MODE7_OVERLAY_ALPHA = 0.55
-MODE5_MIN_CORNERS = 8
+MODE5_MIN_CORNERS = 3
 MODE5_FULL_CORNERS = 12
 MODE5_FALLBACK_MIN_BOARD_COVERAGE = 0.0
-MODE5_MAX_REPROJECTION_RMSE_PX = 1.0
+MODE5_MAX_REPROJECTION_RMSE_PX = 10.0
 MODE5_MIN_INLIER_SAMPLES = 10
 MODE5_POSITION_OUTLIER_FLOOR_MM = 0.05
 MODE5_ROTATION_OUTLIER_FLOOR_DEG = 0.05
+BORESIGHT_MIN_CORNERS = 8
+BORESIGHT_MAX_REPROJECTION_RMSE_PX = 1.5
+BORESIGHT_MIN_RELATIVE_ROTATION_DEG = 3.0
 
 # --- GLOBAL VARIABLES ---
 imu_lock = threading.Lock()
@@ -117,6 +122,10 @@ def get_live_quaternion():
         latest_quaternion = None
         return val
 
+def peek_live_quaternion():
+    with imu_lock:
+        return None if latest_quaternion is None else latest_quaternion.copy()
+
 # -----------------------------------------------------------------------------
 # HAND-EYE SOLVER
 # -----------------------------------------------------------------------------
@@ -127,9 +136,13 @@ def solve_hand_eye_rotation_log(imu_poses, cam_poses):
         raise ValueError("Need at least 3 poses to solve hand-eye rotation.")
 
     H = np.zeros((3, 3), dtype=np.float64)
-    for i in range(len(imu_poses) - 1):
-        R_a = imu_poses[i].T @ imu_poses[i + 1]
-        R_b = cam_poses[i].T @ cam_poses[i + 1]
+    for i in range(len(imu_poses)):
+        for j in range(i + 1, len(imu_poses)):
+            R_a = imu_poses[i].T @ imu_poses[j]
+            R_b = cam_poses[i].T @ cam_poses[j]
+
+            if np.degrees(R.from_matrix(R_a).magnitude()) < BORESIGHT_MIN_RELATIVE_ROTATION_DEG:
+                continue
 
         a_vec = R.from_matrix(R_a).as_rotvec()
         b_vec = R.from_matrix(R_b).as_rotvec()
@@ -145,16 +158,20 @@ def solve_hand_eye_rotation_log(imu_poses, cam_poses):
 def verify_hand_eye_constraint(imu_poses, cam_poses, R_x_est):
     print("\n--- VERIFYING HAND-EYE CONSTRAINT ---")
     errors = []
-    for i in range(len(imu_poses) - 1):
-        A_i = imu_poses[i].T @ imu_poses[i + 1]
-        B_i = cam_poses[i].T @ cam_poses[i + 1]
+    for i in range(len(imu_poses)):
+        for j in range(i + 1, len(imu_poses)):
+            A_i = imu_poses[i].T @ imu_poses[j]
+            B_i = cam_poses[i].T @ cam_poses[j]
+
+            if np.degrees(R.from_matrix(A_i).magnitude()) < BORESIGHT_MIN_RELATIVE_ROTATION_DEG:
+                continue
         
-        left = A_i @ R_x_est
-        right = R_x_est @ B_i
-        
-        error = np.linalg.norm(left - right, 'fro')
-        errors.append(error)
-        print(f"Constraint error for pose pair {i+1}: {error:.8f}")
+            left = A_i @ R_x_est
+            right = R_x_est @ B_i
+            
+            error = np.linalg.norm(left - right, 'fro')
+            errors.append(error)
+            print(f"Constraint error for pose pair {i+1}->{j+1}: {error:.8f}")
     
     print(f"Mean constraint error: {np.mean(errors):.8f}")
     print(f"Max constraint error: {np.max(errors):.8f}")
@@ -188,20 +205,28 @@ def load_capsule_frame(path):
 
 
 def generate_mode5_charuco_board():
-    """Generate the 50 mm square ChArUco target at a fixed print resolution."""
-    edge_px = round(
+    """Generate the 50 mm x 120 mm ChArUco target at a fixed print resolution."""
+    board_width_px = round(
         MODE5_CHARUCO_SQUARES_X
         * MODE5_CHARUCO_SQUARE_LENGTH_M
         / 0.0254
         * MODE5_CHARUCO_PRINT_DPI
     )
-    board_image = MODE5_CHARUCO_BOARD.generateImage((edge_px, edge_px), marginSize=0)
+    board_height_px = round(
+        MODE5_CHARUCO_SQUARES_Y
+        * MODE5_CHARUCO_SQUARE_LENGTH_M
+        / 0.0254
+        * MODE5_CHARUCO_PRINT_DPI
+    )
+    board_image = MODE5_CHARUCO_BOARD.generateImage(
+        (board_width_px, board_height_px), marginSize=0
+    )
     if not cv2.imwrite(MODE5_CHARUCO_OUTPUT_FILE, board_image):
         print(f"Could not save board image to '{MODE5_CHARUCO_OUTPUT_FILE}'.")
         return
     print(
-        f"Saved 50.00 mm x 50.00 mm ChArUco board to '{MODE5_CHARUCO_OUTPUT_FILE}' "
-        f"({edge_px} px at {MODE5_CHARUCO_PRINT_DPI} DPI)."
+        f"Saved 50.00 mm x 120.00 mm ChArUco board to '{MODE5_CHARUCO_OUTPUT_FILE}' "
+        f"({board_width_px} x {board_height_px} px at {MODE5_CHARUCO_PRINT_DPI} DPI)."
     )
     print(
         "In the print dialog, set image resolution to 600 DPI or set the outer edge to 50.00 mm; "
@@ -242,21 +267,59 @@ def _solve_mode5_charuco_pose(charuco_corners, charuco_ids, camera_matrix, dist_
     obj_pts, img_pts = MODE5_CHARUCO_BOARD.matchImagePoints(charuco_corners, charuco_ids)
     if len(obj_pts) < MODE5_MIN_CORNERS:
         return None, f"only {len(obj_pts)} matched ChArUco corners"
+    if len(obj_pts) == 3:
+        board_triangle = obj_pts.reshape(-1, 3)[:, :2]
+        edge_a = board_triangle[1] - board_triangle[0]
+        edge_b = board_triangle[2] - board_triangle[0]
+        triangle_area = abs(edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0])
+        if triangle_area <= 1e-9:
+            return None, "three ChArUco corners are collinear"
     if len(obj_pts) < MODE5_FULL_CORNERS and not _mode5_has_sufficient_board_coverage(obj_pts):
         return None, (
             f"8-11 corners cover less than {MODE5_FALLBACK_MIN_BOARD_COVERAGE:.0%} "
             "of the board"
         )
 
-    success, rvec, tvec = cv2.solvePnP(
-        obj_pts, img_pts, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-    )
+    # ITERATIVE's DLT initialization requires at least six points for this
+    # planar board. For partial detections, use SQPNP's generic API and choose
+    # the valid positive-depth candidate with the lowest reprojection error.
+    if len(obj_pts) < 6:
+        try:
+            pnp_result = cv2.solvePnPGeneric(
+                obj_pts, img_pts, camera_matrix, dist_coeffs,
+                flags=cv2.SOLVEPNP_SQPNP,
+            )
+        except cv2.error:
+            return None, "three-corner PnP solve failed"
+        success, candidate_rvecs, candidate_tvecs = pnp_result[:3]
+        if not success or len(candidate_rvecs) == 0:
+            return None, "partial-board PnP solve failed"
+        candidates = []
+        for candidate_rvec, candidate_tvec in zip(candidate_rvecs, candidate_tvecs):
+            candidate_tvec = np.asarray(candidate_tvec, dtype=np.float64).reshape(3, 1)
+            rotation, _ = cv2.Rodrigues(candidate_rvec)
+            if float(candidate_tvec[2, 0]) <= 0.0 or float(rotation[2, 2]) <= 0.0:
+                continue
+            projected, _ = cv2.projectPoints(
+                obj_pts, candidate_rvec, candidate_tvec, camera_matrix, dist_coeffs
+            )
+            residuals = img_pts.reshape(-1, 2) - projected.reshape(-1, 2)
+            error = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
+            candidates.append((error, candidate_rvec, candidate_tvec))
+        if not candidates:
+            return None, "partial-board PnP produced no valid pose"
+        _, rvec, tvec = min(candidates, key=lambda candidate: candidate[0])
+    else:
+        success, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+        )
     if not success:
         return None, "PnP solve failed"
 
-    rvec, tvec = cv2.solvePnPRefineLM(
-        obj_pts, img_pts, camera_matrix, dist_coeffs, rvec, tvec
-    )
+    if len(obj_pts) >= 6:
+        rvec, tvec = cv2.solvePnPRefineLM(
+            obj_pts, img_pts, camera_matrix, dist_coeffs, rvec, tvec
+        )
     projected_points, _ = cv2.projectPoints(obj_pts, rvec, tvec, camera_matrix, dist_coeffs)
     residuals = img_pts.reshape(-1, 2) - projected_points.reshape(-1, 2)
     reprojection_rmse_px = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
@@ -335,9 +398,9 @@ def _mode7_tag_to_camera_pose(row):
 
 
 def _render_mode7_charuco_board(image_shape, R_tag_to_cam, t_tag_to_cam_m, camera_matrix, dist_coeffs):
-    """Project the full Mode 5 board using the logged pose and camera model."""
+    """Project the full 50 mm x 120 mm Mode 5 board using the logged pose."""
     board_image = MODE5_CHARUCO_BOARD.generateImage(
-        (MODE7_BOARD_RENDER_SIZE_PX, MODE7_BOARD_RENDER_SIZE_PX), marginSize=0
+        (MODE7_BOARD_RENDER_WIDTH_PX, MODE7_BOARD_RENDER_HEIGHT_PX), marginSize=0
     )
     board_image = cv2.cvtColor(board_image, cv2.COLOR_GRAY2BGR)
     R_board_to_cam = R_tag_to_cam @ MODE5_TAG_FRAME_FROM_OPENCV_FRAME
@@ -358,9 +421,14 @@ def _render_mode7_charuco_board(image_shape, R_tag_to_cam, t_tag_to_cam_m, camer
         board_corners_m, rvec_board_to_cam, t_board_to_cam_m, camera_matrix, None
     )
     undistorted_corners = undistorted_corners.reshape(4, 2).astype(np.float32)
-    source_size = MODE7_BOARD_RENDER_SIZE_PX - 1
     source_corners = np.array(
-        [[0, 0], [source_size, 0], [source_size, source_size], [0, source_size]], dtype=np.float32
+        [
+            [0, 0],
+            [MODE7_BOARD_RENDER_WIDTH_PX - 1, 0],
+            [MODE7_BOARD_RENDER_WIDTH_PX - 1, MODE7_BOARD_RENDER_HEIGHT_PX - 1],
+            [0, MODE7_BOARD_RENDER_HEIGHT_PX - 1],
+        ],
+        dtype=np.float32,
     )
     height, width = image_shape[:2]
     homography = cv2.getPerspectiveTransform(source_corners, undistorted_corners)
@@ -380,7 +448,12 @@ def _render_mode7_charuco_board(image_shape, R_tag_to_cam, t_tag_to_cam_m, camer
         borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255),
     )
     mask = np.where(
-        (map_x >= 0) & (map_x <= source_size) & (map_y >= 0) & (map_y <= source_size), 255, 0
+        (map_x >= 0)
+        & (map_x <= MODE7_BOARD_RENDER_WIDTH_PX - 1)
+        & (map_y >= 0)
+        & (map_y <= MODE7_BOARD_RENDER_HEIGHT_PX - 1),
+        255,
+        0,
     ).astype(np.uint8)
     synthetic[mask > 0] = warped_board[mask > 0]
     return synthetic, mask
@@ -435,6 +508,7 @@ def run_intrinsic_calibration():
         if image_revision is not None and image_revision != last_processed_revision:
             frame = load_capsule_frame(img_path)
             if frame is not None:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
                 last_valid_frame = frame.copy()
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 imsize = gray.shape[::-1]
@@ -602,6 +676,7 @@ def run_boresight_calibration():
                 
     current_corners, current_ids = None, None
     is_detected = False
+    current_reprojection_rmse = None
     
     try:
         while True:
@@ -612,11 +687,13 @@ def run_boresight_calibration():
                 time.sleep(0.05)
                 frame = load_capsule_frame(img_path)
                 if frame is not None:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     current_corners, current_ids, _, _ = detector.detectBoard(gray)
                     
                     vis_frame = frame.copy()
-                    is_detected = current_corners is not None and len(current_corners) >= 4
+                    is_detected = current_corners is not None and len(current_corners) >= BORESIGHT_MIN_CORNERS
+                    current_reprojection_rmse = None
                     
                     if is_detected:
                         cv2.aruco.drawDetectedCornersCharuco(vis_frame, current_corners, current_ids, (0, 255, 0))
@@ -632,6 +709,18 @@ def run_boresight_calibration():
             display_copy = vis_frame.copy()
             cv2.putText(display_copy, f"Logged Poses: {len(imu_poses)}", (10, 60), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+            q_display = peek_live_quaternion()
+            if q_display is not None:
+                q_text = "q [qw qx qy qz]: " + " ".join(f"{value:.4f}" for value in q_display)
+            else:
+                q_text = "q [qw qx qy qz]: waiting..."
+            cv2.putText(display_copy, q_text, (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            if current_reprojection_rmse is not None:
+                cv2.putText(display_copy, f"PnP RMSE: {current_reprojection_rmse:.2f} px", (10, 145),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             
             if last_processed_img:
                 cv2.putText(display_copy, f"File: {os.path.basename(last_processed_img)}", (10, 90), 
@@ -647,7 +736,9 @@ def run_boresight_calibration():
                 if not is_detected or q_live is None:
                     reasons = []
                     if not is_detected:
-                        reasons.append("Board Tracking Lost (Needs >= 4 corners)")
+                        reasons.append(
+                            f"Board Tracking Lost (Needs >= {BORESIGHT_MIN_CORNERS} corners)"
+                        )
                     if q_live is None:
                         reasons.append("IMU Socket returned None (Timeout/No data)")
                     print(f"--> Sync Frame Dropped. Reason(s): {', '.join(reasons)}")
@@ -655,13 +746,30 @@ def run_boresight_calibration():
 
                 obj_pts, img_pts = CHARUCO_BOARD.matchImagePoints(current_corners, current_ids)
                 
-                if len(obj_pts) >= 4:
+                if len(obj_pts) >= BORESIGHT_MIN_CORNERS:
                     retval, rvec, tvec = cv2.solvePnP(
                         obj_pts, img_pts, camera_matrix, dist_coeffs, 
                         flags=cv2.SOLVEPNP_ITERATIVE
                     )
                     
                     if retval:
+                        rvec, tvec = cv2.solvePnPRefineLM(
+                            obj_pts, img_pts, camera_matrix, dist_coeffs, rvec, tvec
+                        )
+                        projected_points, _ = cv2.projectPoints(
+                            obj_pts, rvec, tvec, camera_matrix, dist_coeffs
+                        )
+                        residuals = img_pts.reshape(-1, 2) - projected_points.reshape(-1, 2)
+                        current_reprojection_rmse = float(
+                            np.sqrt(np.mean(np.sum(residuals ** 2, axis=1)))
+                        )
+                        if current_reprojection_rmse > BORESIGHT_MAX_REPROJECTION_RMSE_PX:
+                            print(
+                                f"--> Pose rejected: PnP RMSE {current_reprojection_rmse:.2f} px "
+                                f"exceeds {BORESIGHT_MAX_REPROJECTION_RMSE_PX:.2f} px."
+                            )
+                            continue
+
                         R_board_to_cam, _ = cv2.Rodrigues(rvec)
                         R_cam_to_board = R_board_to_cam.T
                         
@@ -676,7 +784,10 @@ def run_boresight_calibration():
                     else:
                         print("--> PnP Geometry Engine failed to converge.")
                 else:
-                    print("--> Insufficient paired feature points matched.")
+                    print(
+                        f"--> Insufficient paired feature points matched "
+                        f"(need {BORESIGHT_MIN_CORNERS})."
+                    )
                     
             elif key == 13 or key == 10:
                 break
@@ -1273,7 +1384,7 @@ def run_tag_pose_logger():
     vis_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
     print(
-        "Detecting the 50 mm x 50 mm ChArUco board "
+        "Detecting the 50 mm x 120 mm ChArUco board "
         f"({MODE5_MIN_CORNERS}+ corners; max RMSE {MODE5_MAX_REPROJECTION_RMSE_PX:.2f} px)."
     )
     print(

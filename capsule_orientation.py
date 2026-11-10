@@ -91,6 +91,9 @@ one_shot_logging_trigger = threading.Event()
 logging_lock = threading.Lock()
 q_prev = None  # Global reference tracking for gyro-predicted field direction
 
+MAG_DISTURBANCE_RATIO_MIN = 0.01
+MAG_DISTURBANCE_RATIO_MAX = 0.03
+
 
 def get_log_filename():
     """Return the calibration file associated with the selected sensor."""
@@ -153,6 +156,23 @@ def quaternion_to_rotation_matrix(q):
     ])
 
 
+def compute_magnetometer_weight(raw_mag_uT, ac_mag_uT):
+    """Estimate how much trust to place in the lock-in magnetic direction."""
+    raw_magnitude = float(np.linalg.norm(np.asarray(raw_mag_uT, dtype=float)))
+    ac_magnitude = float(np.linalg.norm(np.asarray(ac_mag_uT, dtype=float)))
+    if raw_magnitude <= 1e-9 or ac_magnitude <= 1e-9:
+        return 0.0
+
+    ratio = ac_magnitude / raw_magnitude
+    if ratio <= MAG_DISTURBANCE_RATIO_MIN:
+        return 0.0
+    if ratio >= MAG_DISTURBANCE_RATIO_MAX:
+        return 1.0
+    return (ratio - MAG_DISTURBANCE_RATIO_MIN) / (
+        MAG_DISTURBANCE_RATIO_MAX - MAG_DISTURBANCE_RATIO_MIN
+    )
+
+
 class MadgwickFilter:
     def __init__(self, alpha, beta):
         """
@@ -210,7 +230,7 @@ class MadgwickFilter:
         self.last_time = None
         return self.q
 
-    def update(self, gyro, accel, mag, current_time=None):
+    def update(self, gyro, accel, mag, current_time=None, mag_weight=1.0):
         """
         Update Madgwick filter with gyro, accelerometer and magnetometer data (9DOF).
         
@@ -235,42 +255,43 @@ class MadgwickFilter:
         self.last_time = current_time
 
         accel_normalized = self.normalize_vector(np.asarray(accel, dtype=float))
-        mag_normalized = self.normalize_vector(mag)
+        mag_array = None if mag is None else np.asarray(mag, dtype=float)
+        use_mag = mag_array is not None and np.linalg.norm(mag_array) > 0 and mag_weight > 0.0
+        mag_normalized = self.normalize_vector(mag_array) if use_mag else None
         
         # Extract quaternion elements
         q0, q1, q2, q3 = self.q
         
-        # Reference direction of Earth's magnetic field
-        h = self.quaternion_multiply(
-            self.quaternion_multiply(self.q, np.array([0.0, *mag_normalized])),
-            self.quaternion_conjugate(self.q)
-        )[1:]
-        
-        b = np.array([0.0, np.linalg.norm([self.magnetic_ref[0], self.magnetic_ref[1]]), 
-                        0.0, self.magnetic_ref[2]])        
-        
-        # Gradient descent algorithm corrective step
-        # Objective function and Jacobian for accelerometer and magnetometer
-        f = np.array([
+        accel_f = np.array([
             2.0 * (q0*q2 - q1*q3) - accel_normalized[0],
             -2.0 * (q0*q1 + q2*q3) - accel_normalized[1],
             -2.0 * (0.5 - q1*q1 - q2*q2) - accel_normalized[2],
-            2.0 * b[1] * (0.5 - q2*q2 - q3*q3) + 2.0 * b[3] * (q1*q3 - q0*q2) - mag_normalized[0],
-            2.0 * b[1] * (q1*q2 - q0*q3) + 2.0 * b[3] * (q0*q1 + q2*q3) - mag_normalized[1],
-            2.0 * b[1] * (q0*q2 + q1*q3) + 2.0 * b[3] * (0.5 - q1*q1 - q2*q2) - mag_normalized[2]
         ])
-        
-        J = np.array([
+        accel_J = np.array([
             [2.0*q2, -2.0*q3, 2.0*q0, -2.0*q1],
             [-2.0*q1, -2.0*q0, -2.0*q3, -2.0*q2],
             [0.0, 4.0*q1, 4.0*q2, 0.0],
-            [-2.0*b[3]*q2, 2.0*b[3]*q3, -4.0*b[1]*q2 - 2.0*b[3]*q0, -4.0*b[1]*q3 + 2.0*b[3]*q1],
-            [-2.0*b[1]*q3 + 2.0*b[3]*q1, 2.0*b[1]*q2 + 2.0*b[3]*q0, 2.0*b[1]*q1 + 2.0*b[3]*q3, -2.0*b[1]*q0 + 2.0*b[3]*q2],
-            [2.0*b[1]*q2, 2.0*b[1]*q3 - 4.0*b[3]*q1, 2.0*b[1]*q0 - 4.0*b[3]*q2, 2.0*b[1]*q1]
         ])
-        
-        # Compute gradient
-        gradient = J.T @ f
+
+        gradient = accel_J.T @ accel_f
+        if use_mag:
+            h = self.quaternion_multiply(
+                self.quaternion_multiply(self.q, np.array([0.0, *mag_normalized])),
+                self.quaternion_conjugate(self.q)
+            )[1:]
+            b = np.array([0.0, np.linalg.norm(h[:2]), 0.0, h[2]])
+            mag_f = np.array([
+                2.0 * b[1] * (0.5 - q2*q2 - q3*q3) + 2.0 * b[3] * (q1*q3 - q0*q2) - mag_normalized[0],
+                2.0 * b[1] * (q1*q2 - q0*q3) + 2.0 * b[3] * (q0*q1 + q2*q3) - mag_normalized[1],
+                2.0 * b[1] * (q0*q2 + q1*q3) + 2.0 * b[3] * (0.5 - q1*q1 - q2*q2) - mag_normalized[2]
+            ])
+            mag_J = np.array([
+                [-2.0*b[3]*q2, 2.0*b[3]*q3, -4.0*b[1]*q2 - 2.0*b[3]*q0, -4.0*b[1]*q3 + 2.0*b[3]*q1],
+                [-2.0*b[1]*q3 + 2.0*b[3]*q1, 2.0*b[1]*q2 + 2.0*b[3]*q0, 2.0*b[1]*q1 + 2.0*b[3]*q3, -2.0*b[1]*q0 + 2.0*b[3]*q2],
+                [2.0*b[1]*q2, 2.0*b[1]*q3 - 4.0*b[3]*q1, 2.0*b[1]*q0 - 4.0*b[3]*q2, 2.0*b[1]*q1]
+            ])
+            gradient = gradient + float(mag_weight) * (mag_J.T @ mag_f)
+
         if np.linalg.norm(gradient) > 0:
             gradient = gradient / np.linalg.norm(gradient)
         
@@ -522,8 +543,6 @@ class DataFileHandler(FileSystemEventHandler):
     
     def on_modified(self, event):
         if not event.is_directory and event.src_path.endswith('.txt'):
-            if event.src_path in self.startup_files:
-                return
             if DEBUG_INGESTION:
                 print(f"[INGEST] watcher modified: {os.path.basename(event.src_path)}")
             self.handle_file_with_retry(event.src_path)
@@ -554,8 +573,6 @@ class DataFileHandler(FileSystemEventHandler):
             for filename in os.listdir(directory):
                 if filename.startswith('imgInfo_') and filename.endswith('.txt'):
                     filepath = os.path.join(directory, filename)
-                    if filepath in self.startup_files:
-                        continue
                     revision = self.file_revision(filepath)
                     if self.known_revisions.get(filepath) != revision:
                         file_num = self.processor.extract_file_number(filename)
@@ -583,6 +600,7 @@ class DataFileHandler(FileSystemEventHandler):
                 if DEBUG_INGESTION:
                     print(f"[INGEST] reading: {os.path.basename(filepath)}")
                 self.processor.process_file(filepath)
+                self.known_revisions[filepath] = self.file_revision(filepath)
                 return
             except PermissionError:
                 if DEBUG_INGESTION:
@@ -660,11 +678,11 @@ class DataProcessor:
         mag_raw = np.array(mag_raw)
         
         # 1. HARD IRON BIAS (Offset correction)
-        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
+        hard_iron_bias = np.array([1100.025574, 13921.673267, 2861.224321])
         soft_iron_matrix = np.array([
-            [0.994153, -0.031541, 0.007716],
-            [-0.031541, 0.970074, 0.030319],
-            [0.007716, 0.030319, 1.010868]
+            [1.003489, 0.001235, 0.010487],
+            [0.001235, 0.981175, 0.018241],
+            [0.010487, 0.018241, 0.966444]
         ])
         # --- Execute Calibration Pipeline ---
         
@@ -694,50 +712,61 @@ class DataProcessor:
             Calibrated readings [x, y, z] in microTesla
         """
         mag_raw = np.array(mag_raw)
-        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
+        hard_iron_bias = np.array([1100.025574, 13921.673267, 2861.224321])
         soft_iron_matrix = np.array([
-            [0.994153, -0.031541, 0.007716],
-            [-0.031541, 0.970074, 0.030319],
-            [0.007716, 0.030319, 1.010868]
+            [1.003489, 0.001235, 0.010487],
+            [0.001235, 0.981175, 0.018241],
+            [0.010487, 0.018241, 0.966444]
         ])
         mag_ellipsoid_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
         return mag_ellipsoid_corrected.tolist()
     
-    def calibrate_magnetometer_noNWU(self, mag_raw):
+    def calibrate_magnetometer_NWU(self, mag_raw):
         mag_raw = np.array(mag_raw)
-        hard_iron_bias = np.array([-756.563845, 12437.951503, 3347.129236])
+        hard_iron_bias = np.array([1100.025574, 13921.673267, 2861.224321])
         soft_iron_matrix = np.array([
-            [0.994153, -0.031541, 0.007716],
-            [-0.031541, 0.970074, 0.030319],
-            [0.007716, 0.030319, 1.010868]
+            [1.003489, 0.001235, 0.010487],
+            [0.001235, 0.981175, 0.018241],
+            [0.010487, 0.018241, 0.966444]
         ])
         mag_ellipsoid_corrected = (mag_raw - hard_iron_bias) @ soft_iron_matrix.T
+
+        # BORESIGHT_R_MC = np.array([
+        #     [0.9347739378, -0.1333265924, 0.3292745130],
+        #     [0.1146922726, 0.9905296224, 0.0754768163],
+        #     [-0.3362192258, -0.0327885186, 0.9412128055],
+        # ])
+
         BORESIGHT_R_MC = np.array([
-            [0.9971499862, 0.0586529494, 0.0474524663],
-            [-0.0571768781, 0.9978546578, -0.0318886591],
-            [-0.0492210284, 0.0290845921, 0.9983643508],
+            [0.9203227096, 0.0233920774, -0.3904598838],
+            [-0.0276143643, -0.9918343230, -0.1245075202],
+            [-0.3901840040, 0.1253693999, -0.9121616943],
         ])
-        mag_final = BORESIGHT_R_MC @ mag_ellipsoid_corrected
+        ## the nwu matrix flips signs of y and z values
+        ## the flipping made yaw to the opposite direction , and using original rotation is enough 3,nov2026
+        mag_final = MAGNETOMETER_TO_NWU_R @ BORESIGHT_R_MC @ mag_ellipsoid_corrected
+        # mag_final =  BORESIGHT_R_MC @ mag_ellipsoid_corrected
+
+
         return mag_final.tolist()
     
     def calibrate_accelerometer(self, accel_raw):
         """Apply ellipsoid calibration followed by the fixed boresight rotation."""
         # Bias parameters (offset correction)
 
+        bias_x = -0.000987171
+        bias_y = 0.008617489
+        bias_z = -0.015150045
 
-        bias_x = 0.011359918
-        bias_y = 0.033049530
-        bias_z = -0.000184663
-
-        cal_matrix_xx = 1.005115495; cal_matrix_xy = -0.001300353; cal_matrix_xz = -0.001112236
-        cal_matrix_yx = -0.001300353; cal_matrix_yy = 0.998397127; cal_matrix_yz = 0.000433145
-        cal_matrix_zx = -0.001112236; cal_matrix_zy = 0.000433145; cal_matrix_zz = 0.988900540
-
+        cal_matrix_xx = 0.978955736; cal_matrix_xy = -0.016683116; cal_matrix_xz = -0.012363124
+        cal_matrix_yx = -0.016683116; cal_matrix_yy = 1.012684068; cal_matrix_yz = 0.012009726
+        cal_matrix_zx = -0.012363124; cal_matrix_zy = 0.012009726; cal_matrix_zz = 0.990183901
         ACCEL_BORESIGHT_R = np.array([
-            [ 0.997543889,  0.057823542,  0.039530088],
-            [-0.059066636,  0.997771446,  0.031036667],
-            [-0.037647343, -0.033295347,  0.998736250],
+            [ 0.918319961, -0.007293519, -0.395771720],
+            [ 0.064792239,  0.989115057,  0.132111200],
+            [ 0.390500211, -0.146963288,  0.908796664],
         ])
+
 
         # ACCEL_BORESIGHT_R =np.eye(3)  # Identity matrix for demonstration; replace with actual boresight rotation if available
 
@@ -799,6 +828,7 @@ class DataProcessor:
         mag_uT[2] = -mag_uT[2]
 
         # print(f"Raw mag: {mag_uT[0]:.3f} uT, {mag_uT[1]:.3f} uT, {mag_uT[2]:.3f} uT")
+        # print(f"Raw accel: {accel_g[0]:.3f} g, {accel_g[1]:.3f} g, {accel_g[2]:.3f} g")
 
 
 
@@ -923,11 +953,14 @@ class DataProcessor:
                 self.update_sensor_input_rate(timestamp)
 
                 ## mag_calibrated makes magwick gets the z rotation opposite
-                mag_calibrated = self.calibrate_magnetometer(mag_uT)
+                # mag_calibrated = self.calibrate_magnetometer(mag_uT)
                 accel_calibrated = self.calibrate_accelerometer(accel_g)
+                #use ellipsoid only for boresight calib
                 mag_calibrated_ellipsoid = self.calibrate_magnetometer_ellipsoidOnly(mag_uT)
+                # print(f"Mag calibrated (ellipsoid only): {mag_calibrated_ellipsoid}")
                 ## mag_calibrated_noNWU makes correct direction in 3 axis in magwick
-                mag_calibrated_noNWU = self.calibrate_magnetometer_noNWU(mag_uT)
+                mag_calibrated_NWU = self.calibrate_magnetometer_NWU(mag_uT)
+                # print(f"Mag calibrated (NWU): {mag_calibrated_NWU}, Mag calibrated (ellipsoid only): {mag_calibrated_ellipsoid}")
 
 
                 sample_to_log = mag_calibrated_ellipsoid if logging_source == "magnetometer" else accel_g
@@ -945,9 +978,9 @@ class DataProcessor:
 
 
 
+                data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated_NWU, 0))
 
-                data_queue.put((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU, 0))
-                self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated_noNWU))
+                self.data_buffer.append((timestamp, accel_calibrated, gyro_dps, mag_calibrated_NWU))
             
             self.update_file_extraction_rate()
             self.last_file_num = file_num
@@ -990,7 +1023,6 @@ def processing_thread(processor):
     lowpass_mag = None
     ac_lowpass_mag = None
     mod_q_lowpass = None
-    alpha = 0.4
     alpha_amp = 0.4
     alpha_q = 0.4
     
@@ -998,6 +1030,8 @@ def processing_thread(processor):
     packet_count = 0
     start_time = time.time()
     update_rate = 0.0
+    dc_window = deque()
+    dc_window_duration = 1.0 / lockin.target_freq
     
     with ThreadPoolExecutor(max_workers=2) as executor:
         while not shutdown_event.is_set():
@@ -1030,8 +1064,8 @@ def processing_thread(processor):
                 )
 
                 if calibration_requested:
-                    # 'C' is pressed at the known NWU identity pose: north/+X.
-                    if lockin.calibrate_polarity(np.array([1.0, 0.0, 0.0])):
+                    # 'C' is pressed with the robot at the negative-yaw reference pose.
+                    if lockin.calibrate_polarity(np.array([1.0, 1.0, 0.0])):
                         mag_amplitudes = lockin.last_relative_vector * lockin.polarity
                         q = filter.init()
                         q_prev = q.copy()
@@ -1039,11 +1073,14 @@ def processing_thread(processor):
                     calibration_requested = False
                 
                 # Update Madgwick filter with calculated signed amplitudes
+                mag_weight = compute_magnetometer_weight(mag_uT, mag_amplitudes)
+
                 q_filter, error, omega_corrected = filter.update(
                     np.radians(gyro_dps),
                     np.array(accel_g),
                     np.array(mag_amplitudes),
-                    current_time=current_time
+                    current_time=current_time,
+                    mag_weight=mag_weight,
                 )
                 q = q_filter
                 if mod_q_lowpass is not None and np.dot(q, mod_q_lowpass) < 0:
@@ -1052,10 +1089,14 @@ def processing_thread(processor):
                 
                 # Apply low-pass filters
                 mag_array = np.array(mag_uT)
-                if lowpass_mag is None:
-                    lowpass_mag = mag_array
-                else:
-                    lowpass_mag = alpha * mag_array + (1 - alpha) * lowpass_mag
+                dc_window.append((current_time, mag_array.copy()))
+                window_start = current_time - dc_window_duration
+                while len(dc_window) > 1 and dc_window[0][0] < window_start:
+                    dc_window.popleft()
+                lowpass_mag = np.mean(
+                    np.stack([sample for _, sample in dc_window]),
+                    axis=0,
+                )
                 
                 # # Rotate quaternion
 
@@ -1088,17 +1129,21 @@ def processing_thread(processor):
 
                 # tmp_lp = np.array([tmp_lp_mag_x, tmp_lp_mag_y, tmp_lp_magz])
                 print(
-                    f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\tq: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t  LockIn: {mag_amplitudes[0]:.3f} uT, {mag_amplitudes[1]:.3f} uT, {mag_amplitudes[2]:.3f} uT\tRaw Mag: {mag_array[0]:.3f} uT, {mag_array[1]:.3f} uT, {mag_array[2]:.3f} uT"
-                    # f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
-                    # f"Calib Mag  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT, lowpass_mag: {lowpass_mag[0]:.3f} uT, {tmp_lp_mag_y:.3f} uT, {tmp_lp_magz:.3f} uT"
-                    # f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\tYaw: {yaw:.3f}°\t Pitch: {pitch:.3f}°\tRoll: {roll:.3f}°"
-                    # f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
-                    # f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
-                    # f"files #: {processor.files_completed}\t"
-                    # f"Processing: {update_rate:.2f} Hz\t"
-                    # f"D.P. Timestamp: {current_time:.3f}s"
-                    # f"q: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\tMag: {mag_uT[0]:.3f} uT, {mag_uT[1]:.3f} uT, {mag_uT[2]:.3f} uT\tAccel: {accel_g[0]:.3f} g, {accel_g[1]:.3f} g, {accel_g[2]:.3f} g\tGyro: {gyro_dps[0]:.3f} dps, {gyro_dps[1]:.3f} dps, {gyro_dps[2]:.3f} dps\t"
-                    # f"q: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t"
+                    f"Yaw: {yaw:.3f}°\tPitch: {pitch:.3f}°\tRoll: {roll:.3f}°\tq: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t  LockIn: {mag_amplitudes[0]:.3f} uT, {mag_amplitudes[1]:.3f} uT, {mag_amplitudes[2]:.3f} uT\tlow pass mag: {lowpass_mag[0]:.3f} uT, {lowpass_mag[1]:.3f} uT, {lowpass_mag[2]:.3f} uT"
+                # #     # f"Raw mag: {mag_array[0]:.3f} uT, {mag_array[1]:.3f} uT, {mag_array[2]:.3f} uT lowpass_mag: {lowpass_mag[0]:.3f} uT, {lowpass_mag[1]:.3f} uT, {lowpass_mag[2]:.3f} uT"
+                # #     # f"Mag: {mag_magnitude:.1f} µT\tAC: {ac_magnitude:.1f} µT\t"
+                # #     # f"Calib Mag  mX: {mag_uT[0]:.3f} uT, mY: {mag_uT[1]:.3f} uT, mZ: {mag_uT[2]:.3f} uT, lowpass_mag: {lowpass_mag[0]:.3f} uT, {tmp_lp_mag_y:.3f} uT, {tmp_lp_magz:.3f} uT"
+                # #     # f"qw: {mod_q[0]:.3f}\tqx: {mod_q[1]:.3f}\tqy: {mod_q[2]:.3f}\tqz: {mod_q[3]:.3f}\tYaw: {yaw:.3f}°\t Pitch: {pitch:.3f}°\tRoll: {roll:.3f}°"
+                # #     # f"Sensor: {processor.input_rate_hz:.2f} Hz\t"
+                # #     # f"File: {processor.file_extraction_rate_hz:.2f} files/s\t"
+                # #     # f"files #: {processor.files_completed}\t"
+                # #     # f"Processing: {update_rate:.2f} Hz\t"
+                # #     # f"D.P. Timestamp: {current_time:.3f}s"
+                # #     # f"q: {mod_q[0]:.3f}, {mod_q[1]:.3f}, {mod_q[2]:.3f}, {mod_q[3]:.3f}\t"
+                # #     # f"Magx: {mag_uT[0]:.3f} uT, Magy: {mag_uT[1]:.3f} uT, Magz: {mag_uT[2]:.3f} uT"
+                # #     # f"Gyrox: {gyro_dps[0]:.3f} dps\tGyroy: {gyro_dps[1]:.3f} dps\tGyroz: {gyro_dps[2]:.3f} dps"
+                # f"accel: {accel_g[0]:.3f} g, {accel_g[1]:.3f} g, {accel_g[2]:.3f} g\t lp_mag: {lowpass_mag[0]:.3f} uT, {lowpass_mag[1]:.3f} uT, {lowpass_mag[2]:.3f} uT"
+
                     )
                 
                 # Update plots
@@ -1117,11 +1162,18 @@ def processing_thread(processor):
                 plot_hp_z.append(highpass_mag[2])
 
 
-                
+                # Apply the output-frame sign convention without changing the
+                # filter state used by the next sample.
+                mag_to_send = lowpass_mag.copy()
+                # temp = mag_to_send[0]
+                # mag_to_send[0] = mag_to_send[2]
+                # mag_to_send[2] = temp
+                # mag_to_send[1] = -mag_to_send[1]
+
                 # Send to TCP clients
                 send_to_tcp_clients(
                     mod_q,
-                    lowpass_mag,
+                    mag_to_send,
                     ac_lowpass_mag,
                     timestamp_capsule=current_time,
                 )
@@ -1428,10 +1480,14 @@ def _read_serial_line(connection):
 
 def _wait_for_serial_text(connection, text, timeout):
     """Wait for text in serial output and return its computer receive time."""
+    print(f"[calibration] waiting for serial text {text!r} (timeout={timeout:.1f}s)", flush=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         received_time, line = _read_serial_line(connection)
+        if line is not None:
+            print(f"[calibration] serial received: {line!r}", flush=True)
         if line is not None and text in line:
+            print(f"[calibration] found serial text {text!r}", flush=True)
             return received_time
     raise TimeoutError(f"Timed out waiting for serial output: {text}")
 
@@ -1446,11 +1502,19 @@ def run_time_calibration(trials=20, output_file=CALIBRATION_OUTPUT_FILE,
     A capture without its telemetry sidecar is discarded and retried.
     """
     processor = DataProcessor()
+    print(
+        f"[calibration] opening serial port {serial_port} at {baudrate} baud...",
+        flush=True,
+    )
     connection = serial.Serial(
         serial_port,
         baudrate=baudrate,
         timeout=CALIBRATION_SERIAL_TIMEOUT,
         write_timeout=CALIBRATION_SERIAL_TIMEOUT,
+    )
+    print(
+        f"[calibration] opened serial port {serial_port} at {baudrate} baud",
+        flush=True,
     )
     offsets = []
     trial_records = []
@@ -1458,6 +1522,7 @@ def run_time_calibration(trials=20, output_file=CALIBRATION_OUTPUT_FILE,
 
     try:
         connection.reset_input_buffer()
+        print("[calibration] sending: at+photo=p,1,2\\r", flush=True)
         connection.write(b'at+photo=p,1,2\r')
         _wait_for_serial_text(connection, 'Total image number', timeout)
 
@@ -1467,14 +1532,30 @@ def run_time_calibration(trials=20, output_file=CALIBRATION_OUTPUT_FILE,
             while True:
                 previous_names, previous_timestamp = _telemetry_file_snapshot(processor)
                 command_time = time.time()
+                print(
+                    f"[calibration] trial {sequence_number}: sending: at+photo+\\r",
+                    flush=True,
+                )
                 connection.write(b'at+photo+\r')
 
                 image_start_count = 0
                 second_image_start_time = None
+                image_start_deadline = time.monotonic() + timeout
+                print(
+                    f"[calibration] trial {sequence_number}: waiting for "
+                    f"the second +++Image-Start marker (timeout={timeout:.1f}s)",
+                    flush=True,
+                )
                 while second_image_start_time is None:
+                    if time.monotonic() >= image_start_deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for the second image-start marker "
+                            f"during calibration trial {sequence_number}"
+                        )
                     received_time, line = _read_serial_line(connection)
                     if line is None:
                         continue
+                    print(f"[calibration] serial received: {line!r}", flush=True)
                     if '+++Image-Start' in line:
                         image_start_count += 1
                         if image_start_count == 2:
@@ -1603,32 +1684,46 @@ def parse_args():
     parser.add_argument('--calibration-trials', type=int, default=20)
     parser.add_argument('--calibration-warmup-trials', type=int, default=1)
     parser.add_argument('--calibration-output', default=CALIBRATION_OUTPUT_FILE)
+    parser.add_argument(
+        '--skip-time-calibration',
+        action='store_true',
+        help='Start telemetry extraction without calibrating the capsule clock',
+    )
+    parser.add_argument(
+        '--debug-ingestion',
+        action='store_true',
+        help='Print telemetry file discovery, parsing, and queue diagnostics',
+    )
     return parser.parse_args()
 
 
 def main():
     """Main function to run the application."""
-    global observers, CAPSULE_CLOCK_OFFSET_SECONDS
+    global observers, CAPSULE_CLOCK_OFFSET_SECONDS, DEBUG_INGESTION
     
     args = parse_args()
+    DEBUG_INGESTION = args.debug_ingestion
     show_plot = args.plot
 
     system_signal.signal(system_signal.SIGINT, signal_handler)
     system_signal.signal(system_signal.SIGTERM, signal_handler)
     atexit.register(cleanup)
 
-    print("Capsule clock calibration is required before normal telemetry mode.")
-    calibration_result = run_time_calibration(
-        trials=args.calibration_trials,
-        warmup_trials=args.calibration_warmup_trials,
-        output_file=args.calibration_output,
-    )
-    CAPSULE_CLOCK_OFFSET_SECONDS = float(calibration_result['offset_seconds'])
-    print(
-        f"Time calibration complete for this power session; "
-        f"starting normal telemetry extraction with offset "
-        f"{CAPSULE_CLOCK_OFFSET_SECONDS:.6f}s."
-    )
+    if args.skip_time_calibration:
+        print("Skipping capsule clock calibration; using a 0.000000s clock offset.")
+    else:
+        print("Capsule clock calibration is required before normal telemetry mode.")
+        calibration_result = run_time_calibration(
+            trials=args.calibration_trials,
+            warmup_trials=args.calibration_warmup_trials,
+            output_file=args.calibration_output,
+        )
+        CAPSULE_CLOCK_OFFSET_SECONDS = float(calibration_result['offset_seconds'])
+        print(
+            f"Time calibration complete for this power session; "
+            f"starting normal telemetry extraction with offset "
+            f"{CAPSULE_CLOCK_OFFSET_SECONDS:.6f}s."
+        )
     
     processor = DataProcessor()
 

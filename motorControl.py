@@ -86,19 +86,20 @@ def calculate_magnet_pose_and_sendMagAbsPos(Motor):
     pitch = -1 * (Motor[5].current_position_real_unit - Motor[5].offset)
     yaw = -1 * (Motor[0].current_position_real_unit - Motor[0].offset)
     
-    Z = Motor[1].current_position_real_unit - Motor[1].offset
-    X = r * np.sin(np.radians(yaw))
-    Y = -1 * (r - r * np.cos(np.radians(yaw)))
+    Z = (Motor[1].current_position_real_unit - Motor[1].offset)/100
+    X = -1* r * np.sin(np.radians(yaw))
+    Y = 1 * r * np.cos(np.radians(yaw))-max_r
+
 
     # 2. Convert to Quaternion using SciPy
     # 'zyx' specifies the axes: Yaw(Z), Roll(Y), Pitch(X)
     # degrees=True allows us to pass your variables directly
-    euler_angles = [yaw, roll, pitch] 
-    rotation = R.from_euler('zyx', euler_angles, degrees=True)
+    euler_angles = [yaw, pitch, roll] 
+    rotation = R.from_euler('ZXY', euler_angles, degrees=True)
     
     # SciPy outputs quaternions in [x, y, z, w] format
     quat = rotation.as_quat() 
-    quat[1] = -1 * quat[1]  # Invert the y component to match your convention
+    # print(f"Roll: {roll:.3f}, Pitch: {pitch:.3f}, Yaw: {yaw:.3f}, X: {X:.3f}, Y: {Y:.3f}, Z: {Z:.3f}, r: {r:.3f}. q: [{quat[3]:.4f}, {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}]")
 
     encoder_timestamps = [
         motor.last_update_time for motor in Motor
@@ -106,7 +107,7 @@ def calculate_magnet_pose_and_sendMagAbsPos(Motor):
     ]
     pose_timestamp = max(encoder_timestamps) if encoder_timestamps else time.time()
     
-    # print(f"Magnet Pos- X: {X:.3f}, Y: {Y:.3f}, Z: {Z:.3f} q: [{quat[3]:.4f}, {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}]")
+    # print(f"Magnet Pos- X: {X:.3f}, Y: {Y:.3f}, Z: {Z:.3f} q: [{quat[3]:.4f}, {quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}] r: {r:.3f}")
 
     # Prepare data to send
     data_to_send = {
@@ -173,19 +174,42 @@ motors = [
 
 threads = []
 
-pitch_up = [0,0,0,40]
-pitch_down = [0,0,0,-40]
-half_pitch_up = [0,0,0,20]
-half_pitch_down = [0,0,0,-20]
+pitch_up = [0,0,0,30]
+pitch_down = [0,0,0,-30]
+half_pitch_up = [0,0,0,15]
+half_pitch_down = [0,0,0,-15]
 
+vert_start_offset = 12
+hori_start_offset = 10
+layer_z_sep = -2
 
+rev_vert_start_offset = 15
+rev_hori_start_offset = 10
+rev_movement_sequence = [
+[       0,         rev_vert_start_offset,     rev_hori_start_offset,   0                ],   # 0
+##First Revolution
+[360,0,0,0],
+##Height lowering
+[0,-3,0,0],
+## Second Revolution
+[-360,0,0,0],
+## Height lowering after second revolution
+[0,-3,0,0],
+## Third Revolution
+[360,0,0,0],
+## Height lowering after third revolution
+[0,-3,0,0],
+## Fourth Revolution
+[-360,0,0,0]
 
-movement_sequence= [
+]
+
+p2p_movement_sequence= [
 ## Rotary motor movement        vert motor movement     hori motor movement         pitch motor movement
-[       0,         5,     3,   0                ],   # 0
+[       0,         vert_start_offset,     hori_start_offset,   0                ],   # 0
 ## Move to 1st layer starting position
 [       -140,         0,     0,   0                ],   # 0
-[       0,         0,     3,   0                ],   # 0
+[       0,         0,     0,   0                ],   # 0
 
 half_pitch_down,
 pitch_up,
@@ -196,9 +220,6 @@ pitch_down,
 [       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       30,         0,     -3,   0                ],   # 0
-pitch_up,
-pitch_down,
 [       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
@@ -211,7 +232,10 @@ pitch_down,
 [       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       30,         0,     3,   0                ],   # 0
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 [       30,         0,     0,   0                ],   # 0
@@ -222,7 +246,7 @@ pitch_down,
 pitch_up,
 pitch_down,
 ## 1st layer finished, move to 2nd layer starting position
-[       0,         -5,     0,   0                ],   # 0
+[       0,         layer_z_sep,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 
@@ -233,9 +257,6 @@ pitch_down,
 [       -30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       -30,         0,     -3,   0                ],   # 0
-pitch_up,
-pitch_down,
 [       -30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
@@ -248,7 +269,10 @@ pitch_down,
 [       -30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       -30,         0,     3,   0                ],   # 0
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 [       -30,         0,     0,   0                ],   # 0
@@ -258,7 +282,7 @@ pitch_down,
 pitch_up,
 pitch_down,
 ## 2nd layer finished, move to 3rd layer starting position
-[       0,         -5,     0,   0                ],   # 0
+[       0,         layer_z_sep,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 ##starting 3rd layer scan
@@ -268,7 +292,73 @@ pitch_down,
 [       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       30,         0,     -3,   0                ],   # 0
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+
+## 3rd layer finished, move to 4th layer starting position
+[       0,         layer_z_sep,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+##starting 4th layer scan
+[       -20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       -20,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+
+## 4th layer finished, move to 5th layer starting position
+[       0,         layer_z_sep,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+##starting 5th layer scan
+[       20,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 [       30,         0,     0,   0                ],   # 0
@@ -283,7 +373,13 @@ pitch_down,
 [       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
-[       30,         0,     3,   0                ],   # 0
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
+pitch_up,
+pitch_down,
+[       30,         0,     0,   0                ],   # 0
 pitch_up,
 pitch_down,
 [       30,         0,     0,   0                ],   # 0
@@ -1453,8 +1549,8 @@ def euler_to_quaternion(roll, pitch, yaw, degrees=True):
 def rotateto1000(dev):
 
     
-    rotary_travel = 22.4   # degrees (positive/negative)
-    pitch_travel = 101.4
+    rotary_travel = 27.8   # degrees (positive/negative)
+    pitch_travel = 65.20
     vert_travel = 15
     hori_travel   = 6
 
@@ -1686,19 +1782,19 @@ def main():
 
                 # Initialize motors and release brakes
                 motors_init_brakeRelease(dev, motors)
-                relRotarySpeed = 250
+                relRotarySpeed = 65
                 relRotaryAcc = 180
                 relVertSpeed = 10
                 relVertAcc = 100
                 relHoriSpeed = 20
                 relHoriAcc = 100
-                relPitchSpeed = 50
-                relPitchAcc = 40
+                relPitchSpeed = 20
+                relPitchAcc = 30
 
                 print("\nStarting movement sequence. Press Enter to start each movement, or 'q' for emergency stop.")
 
-                for i, movement in enumerate(movement_sequence):
-                    print(f"\nPreparing movement {i+1}/{len(movement_sequence)}...")
+                for i, movement in enumerate(rev_movement_sequence):
+                    print(f"\nPreparing movement {i+1}/{len(rev_movement_sequence)}...")
 
                     relRotaryDeg = movement[0]
 
@@ -1884,7 +1980,7 @@ def main():
                             # Rotary (Option 1)
                             if selected_option == 1 and key in ('h', 'j'):
                                 travel = -rotary_travel if key == 'h' else rotary_travel
-                                setUpRotaryMotorMove(dev, rotary, travel, 350, 280, 280) 
+                                setUpRotaryMotorMove(dev, rotary, travel, 200, 280, 280) 
                                 launchMoveCommand(dev, motors)
 
                                 rotaryDisplacement = rotaryDisplacement + rotary_travel if key == 'h' else rotaryDisplacement - rotary_travel

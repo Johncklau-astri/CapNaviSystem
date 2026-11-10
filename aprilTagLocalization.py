@@ -26,6 +26,8 @@ from collections import deque
 import matplotlib.pyplot as plt
 import math
 import re
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 
 
@@ -240,8 +242,8 @@ position_latency_plotter = None
 # --- Configuration ---
 ## side camera id is 0
 ## top camera id is 1
-camera_id = 1
-top_camera_id = 0
+camera_id = 0
+top_camera_id = 1
 
 TAG_SIZE = 0.06
 CUBE_SIZE = 0.08
@@ -266,13 +268,78 @@ LOG_REPEAT_TEST_FILE = "repeatability_test_log.csv"  # For repeatability testing
 CAPTURE_MESSAGE_TYPE = "capture"
 # Set this to a local folder shared through SMB, or to a mapped SMB path.
 CAPTURE_EXPORT_DIRECTORY = r"R:\Release_Internal_V1A\export"
+# Paste the camera-to-PCB calibration matrix here when recalibrating.
+# Camera-to-PCB boresight calibration from capsule_calibration.py mode 2.
+R_CAM_TO_PCB = np.array([
+    [-0.907183,  0.420628, -0.009539],
+    [-0.023741, -0.073814, -0.996989],
+    [-0.420066, -0.904225,  0.076949],
+], dtype=float)
 CAPTURE_SOURCE_DIRECTORY = r"R:\Release_Internal_V1A\output"
 CAPSULE_CLOCK_CALIBRATION_FILE = "capsule_clock_calibration.json"
 CAPTURE_EXPORT_MAX_PENDING = 2
+CAPTURE_EXPORT_MIN_DISTANCE_MM = 8.0
+CAPTURE_EXPORT_MIN_ANGLE_DEG = 5.0
 capture_export_executor = ThreadPoolExecutor(max_workers=1)
 capture_export_result_queue = queue.Queue()
 capture_export_pending = 0
 capture_export_pending_lock = threading.Lock()
+capture_export_completion_times = deque()
+capture_export_rate_lock = threading.Lock()
+capture_export_output_lock = threading.Lock()
+capture_export_header_printed = False
+capture_metadata_retry_after = {}
+CAPTURE_METADATA_RETRY_INTERVAL = 1.0
+capture_image_event_queue = queue.Queue(maxsize=1000)
+
+
+def capture_sequence(path):
+    """Return the numeric sequence embedded in an image filename."""
+    try:
+        return int(Path(path).stem.split('_', 2)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+class CaptureOutputEventHandler(FileSystemEventHandler):
+    """Publish image candidates when images or their metadata change."""
+
+    @staticmethod
+    def _image_path_for_event(event_path):
+        path = Path(event_path)
+        if path.name.startswith('image_') and path.suffix.lower() == '.jpg':
+            return path
+        if path.name.startswith('imgInfo_') and path.suffix.lower() == '.txt':
+            capture_id = path.stem.removeprefix('imgInfo_')
+            return path.with_name(f'image_{capture_id}.jpg')
+        return None
+
+    def _publish(self, event_path):
+        image_path = self._image_path_for_event(event_path)
+        if image_path is None or '_corrupted_' in image_path.stem.lower():
+            return
+        try:
+            capture_image_event_queue.put_nowait(image_path)
+        except queue.Full:
+            pass
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._publish(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._publish(event.src_path)
+
+
+def get_capture_export_rate(window_seconds=10.0):
+    """Return the completed export rate over the recent rolling window."""
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    with capture_export_rate_lock:
+        while capture_export_completion_times and capture_export_completion_times[0] < cutoff:
+            capture_export_completion_times.popleft()
+        return len(capture_export_completion_times) / window_seconds
 
 
 def write_to_shared_file(t_xyz, q_wxyz):
@@ -855,6 +922,8 @@ def position_estimation_worker():
                     success = send_position_request(position_socket, magX, magY, magZ,
                                                     quat_w, quat_x, quat_y, quat_z)
                 if success:
+                    if isinstance(pending_request, dict):
+                        pending_request['position_sent_monotonic'] = time.perf_counter()
                     sent_requests.append(pending_request)
                     # print(f"Sent position request - Mag: ({magX:.2f}, {magY:.2f}, {magZ:.2f})")
                     pending_request = None  # Request sent, wait for response
@@ -884,6 +953,7 @@ def position_estimation_worker():
                     # print(f"Received position response: {response}")
                     request = sent_requests.popleft() if sent_requests else None
                     if isinstance(request, dict):
+                        request['position_response_monotonic'] = time.perf_counter()
                         capture_position_response_queue.put((request, response))
                         continue
                     
@@ -1016,6 +1086,7 @@ def request_capture_position_estimation(capture, motor_data=None):
         'qx': float(relative_quaternion[1]),
         'qy': float(relative_quaternion[2]),
         'qz': float(relative_quaternion[3]),
+        'capture_queued_monotonic': time.perf_counter(),
     }
     capture_position_request_queue.put(request)
     return True
@@ -1065,31 +1136,71 @@ def get_image_sensor_timestamp(capture_id):
     return sensor_timestamp, sensor_timestamp - clock_offset
 
 
-def queue_latest_image_capture(bt_data, motor_data, last_image_path=None):
-    """Queue the newest output image once it has live pose data available."""
+def get_latest_capture_event_path(pending_path=None):
+    """Return the highest-numbered image reported by the output watcher."""
+    candidates = [pending_path] if pending_path is not None else []
+    while True:
+        try:
+            candidates.append(capture_image_event_queue.get_nowait())
+        except queue.Empty:
+            break
+    candidates = [
+        path for path in candidates
+        if path is not None and '_corrupted_' not in path.stem.lower()
+    ]
+    return max(candidates, key=capture_sequence) if candidates else None
+
+
+def prime_latest_capture_event():
+    """Seed the watcher with the newest existing image once at startup."""
+    source_directory = Path(CAPTURE_SOURCE_DIRECTORY)
+    try:
+        image_path = max(
+            (
+                path for path in source_directory.glob('image_*.jpg')
+                if path.is_file() and '_corrupted_' not in path.stem.lower()
+            ),
+            key=capture_sequence,
+        )
+    except (FileNotFoundError, ValueError):
+        return
+    try:
+        capture_image_event_queue.put_nowait(image_path)
+    except queue.Full:
+        pass
+
+
+def queue_latest_image_capture(
+    bt_data,
+    motor_data,
+    last_image_path=None,
+    candidate_path=None,
+):
+    """Queue the newest watcher-reported image once pose data is available."""
     if bt_data is None or motor_data is None:
         return last_image_path
 
-    source_directory = Path(CAPTURE_SOURCE_DIRECTORY)
-    if not source_directory.is_dir():
+    if candidate_path is None:
         return last_image_path
-
-    image_paths = [
-        path for path in source_directory.glob('image_*.jpg')
-        if path.is_file()
-    ]
-    if not image_paths:
-        return last_image_path
-
-    image_path = max(image_paths, key=lambda path: path.stat().st_mtime_ns)
+    image_path = Path(candidate_path)
+    now = time.monotonic()
     if image_path == last_image_path:
+        return last_image_path
+
+    image_key = str(image_path)
+    retry_after = capture_metadata_retry_after.get(image_key, 0.0)
+    if now < retry_after:
         return last_image_path
 
     capture_id = image_path.stem.removeprefix('image_')
     sensor_timestamp, computer_timestamp = get_image_sensor_timestamp(capture_id)
     if sensor_timestamp is None or computer_timestamp is None:
-        print(f"[CAPTURE] waiting for sensor timestamp metadata for {image_path.name}")
+        if image_key not in capture_metadata_retry_after:
+            print(f"[CAPTURE] waiting for sensor timestamp metadata for {image_path.name}")
+        capture_metadata_retry_after[image_key] = now + CAPTURE_METADATA_RETRY_INTERVAL
         return last_image_path
+
+    capture_metadata_retry_after.pop(image_key, None)
 
     capture = {
         'type': CAPTURE_MESSAGE_TYPE,
@@ -1106,13 +1217,62 @@ def queue_latest_image_capture(bt_data, motor_data, last_image_path=None):
         'magZ': bt_data.get('magZ', 0.0),
     }
     if request_capture_position_estimation(capture, motor_data):
-        print(f"[CAPTURE] queued {image_path}")
         return image_path
     return last_image_path
 
 
+class CapturePoseFilter:
+    """Select exports relative to the last successfully exported valid pose."""
+
+    def __init__(self, min_distance_mm, min_angle_deg, enabled=True):
+        if not math.isfinite(min_distance_mm) or min_distance_mm <= 0:
+            raise ValueError('minimum export distance must be a positive finite number')
+        if not math.isfinite(min_angle_deg) or not 0 < min_angle_deg <= 180:
+            raise ValueError('minimum export angle must be finite and in (0, 180] degrees')
+        self.min_distance_m = min_distance_mm / 1000.0
+        self.min_angle_deg = min_angle_deg
+        self.enabled = enabled
+        self.last_pose = None
+
+    def select(self, position, quaternion, capture_id):
+        if not self.enabled:
+            return True, None
+        position = np.asarray(position, dtype=float)
+        quaternion = np.asarray(quaternion, dtype=float)
+        norm = np.linalg.norm(quaternion)
+        if (position.shape != (3,) or quaternion.shape != (4,) or
+                not np.all(np.isfinite(position)) or
+                not np.all(np.isfinite(quaternion)) or not np.isfinite(norm) or norm == 0):
+            print(f"[CAPTURE] cannot filter {capture_id}: invalid pose; exporting without filtering")
+            return True, None
+        pose = (position.copy(), quaternion / norm)
+        if self.last_pose is None:
+            return True, pose
+        previous_position, previous_quaternion = self.last_pose
+        distance = float(np.linalg.norm(position - previous_position))
+        dot = min(1.0, abs(float(np.dot(pose[1], previous_quaternion))))
+        angle = math.degrees(2.0 * math.acos(dot))
+        selected = (
+            distance >= self.min_distance_m or
+            math.isclose(distance, self.min_distance_m, rel_tol=1e-12) or
+            angle >= self.min_angle_deg or
+            math.isclose(angle, self.min_angle_deg, rel_tol=1e-12)
+        )
+        return selected, pose
+
+    def record_export(self, pose):
+        if pose is not None:
+            self.last_pose = pose
+
+
+capture_pose_filter = CapturePoseFilter(
+    CAPTURE_EXPORT_MIN_DISTANCE_MM, CAPTURE_EXPORT_MIN_ANGLE_DEG,
+)
+
+
 def export_capture_bundle(request, response):
     """Write an image and minimal world-pose manifest; create .ready last."""
+    export_started_monotonic = time.perf_counter()
     if 'error' in response:
         print(f"[CAPTURE] solver failed for {request['capture_id']}: {response['error']}")
         return None
@@ -1129,12 +1289,20 @@ def export_capture_bundle(request, response):
         motor_data['qw'], motor_data['qx'], motor_data['qy'], motor_data['qz'],
     ])
     position_world = motor_position + motor_rotation @ relative_position
+    orientation_world = [float(value) for value in request['orientation_world']]
+    q_cam_to_pcb = rotation_matrix_to_quaternion(R_CAM_TO_PCB)
+    camera_world = multiply_quaternions(orientation_world, q_cam_to_pcb).tolist()
+    selected, filter_pose = capture_pose_filter.select(position_world, camera_world, request['capture_id'])
+    if not selected:
+        return None
 
     capture_number = request['capture_id'].split('_', 1)[0]
     output_dir = Path(CAPTURE_EXPORT_DIRECTORY) / capture_number
     output_dir.mkdir(parents=True, exist_ok=True)
     output_image = output_dir / image_path.name
+    image_copy_started_monotonic = time.perf_counter()
     shutil.copy2(image_path, output_image)
+    image_copy_ms = (time.perf_counter() - image_copy_started_monotonic) * 1000.0
 
     payload = {
         'capture_id': request['capture_id'],
@@ -1146,23 +1314,50 @@ def export_capture_bundle(request, response):
             float(motor_data['qw']), float(motor_data['qx']),
             float(motor_data['qy']), float(motor_data['qz']),
         ],
+        'motor_position_world': [float(value) for value in motor_position],
         'position_world': [float(value) for value in position_world],
-        'orientation_world': [float(value) for value in request['orientation_world']],
+        'orientation_world': orientation_world,
+        'camera_world': camera_world,
     }
     temporary_manifest = output_dir / 'pos.json.tmp'
     with open(temporary_manifest, 'w', encoding='utf-8') as output_file:
         json.dump(payload, output_file, indent=2)
     os.replace(temporary_manifest, output_dir / 'pos.json')
     (output_dir / 'capture.ready').touch()
-    print(f"[CAPTURE] exported {request['capture_id']} to {output_dir}")
+    capture_pose_filter.record_export(filter_pose)
+    bundle_complete_monotonic = time.perf_counter()
+    capture_queued_monotonic = request.get('capture_queued_monotonic')
+    position_sent_monotonic = request.get('position_sent_monotonic')
+    position_response_monotonic = request.get('position_response_monotonic')
     return {
         'image_path': output_image,
+        'motor_position_world': motor_position,
         'position_world': position_world,
         'orientation_world': request['orientation_world'],
+        'camera_world': camera_world,
         'motor_orientation': [
             float(motor_data['qw']), float(motor_data['qx']),
             float(motor_data['qy']), float(motor_data['qz']),
         ],
+        '_capture_timing': {
+            'queue_wait_ms': (
+                (position_sent_monotonic - capture_queued_monotonic) * 1000.0
+                if position_sent_monotonic is not None and capture_queued_monotonic is not None
+                else None
+            ),
+            'solver_ms': (
+                (position_response_monotonic - position_sent_monotonic) * 1000.0
+                if position_response_monotonic is not None and position_sent_monotonic is not None
+                else None
+            ),
+            'export_queue_wait_ms': (
+                (export_started_monotonic - position_response_monotonic) * 1000.0
+                if position_response_monotonic is not None
+                else None
+            ),
+            'image_copy_ms': image_copy_ms,
+            'export_total_ms': (bundle_complete_monotonic - export_started_monotonic) * 1000.0,
+        },
     }
 
 
@@ -1174,12 +1369,19 @@ def display_exported_capture(exported_capture):
         return True
 
     position = exported_capture['position_world']
+    motor_position = exported_capture.get('motor_position_world')
     quaternion = exported_capture['orientation_world']
     motor_quaternion = exported_capture.get('motor_orientation')
     overlay_lines = [
         f"position: x={position[0]:.4f}, y={position[1]:.4f}, z={position[2]:.4f}",
         f"q: w={quaternion[0]:.4f}, x={quaternion[1]:.4f}, y={quaternion[2]:.4f}, z={quaternion[3]:.4f}",
     ]
+    if motor_position is not None:
+        overlay_lines.insert(
+            1,
+            f"motor position: x={motor_position[0]:.4f}, y={motor_position[1]:.4f}, "
+            f"z={motor_position[2]:.4f}",
+        )
     if motor_quaternion is not None:
         overlay_lines.append(
             f"motor q: w={motor_quaternion[0]:.4f}, x={motor_quaternion[1]:.4f}, "
@@ -1227,8 +1429,10 @@ def load_latest_exported_capture():
                 latest_timestamp = manifest_timestamp
                 latest_capture = {
                     'image_path': image_path,
+                    'motor_position_world': payload.get('motor_position_world'),
                     'position_world': payload['position_world'],
                     'orientation_world': payload['orientation_world'],
+                    'camera_world': payload.get('camera_world'),
                     'motor_orientation': payload.get('motor_orientation'),
                 }
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1239,13 +1443,26 @@ def load_latest_exported_capture():
 
 def finish_capture_export(future):
     """Make a completed background export available to the display loop."""
-    global capture_export_pending
+    global capture_export_pending, capture_export_header_printed
     try:
         exported_capture = future.result()
     except Exception as exc:
         print(f"[CAPTURE] background export failed: {exc}")
     else:
         if exported_capture is not None:
+            x, y, z = exported_capture['position_world']
+            with capture_export_output_lock:
+                header = ''
+                if not capture_export_header_printed:
+                    header = f"{'X (m)':>12}  {'Y (m)':>12}  {'Z (m)':>12}  Photo\n"
+                    capture_export_header_printed = True
+                print(
+                    header + f"{x:12.4f}  {y:12.4f}  {z:12.4f}  "
+                    f"{exported_capture['image_path'].name}",
+                    flush=True,
+                )
+            with capture_export_rate_lock:
+                capture_export_completion_times.append(time.monotonic())
             capture_export_result_queue.put(exported_capture)
     finally:
         with capture_export_pending_lock:
@@ -1382,10 +1599,38 @@ def compute_bt_only_quaternion(motor_data, bt_quat):
         return None
 
 
-def format_bt_only_timing_summary(step_durations_ms, avg_hz):
-    """Return a compact timing summary for the BT-only loop."""
-    parts = [f"{name}={value:.2f}ms" for name, value in step_durations_ms.items()]
-    return "BT-only timing | " + " | ".join(parts) + f" | avg_hz={avg_hz:.2f}"
+def format_bt_only_timing_summary(
+    export_rate,
+    image_path=None,
+    position=None,
+    step_durations_ms=None,
+    loop_duration_ms=None,
+):
+    """Return export status and BT-only loop timing diagnostics."""
+    image_name = Path(image_path).name if image_path is not None else "none"
+    if position is None:
+        position_text = "none"
+    else:
+        position_text = "(" + ", ".join(f"{value:.4f}" for value in position) + ")"
+    if step_durations_ms:
+        slowest_step, slowest_duration_ms = max(
+            step_durations_ms.items(), key=lambda item: item[1]
+        )
+        timing_text = ", ".join(
+            f"{name}={duration_ms:.1f}ms"
+            for name, duration_ms in step_durations_ms.items()
+        )
+        timing_text = (
+            f"slowest={slowest_step}:{slowest_duration_ms:.1f}ms"
+            f" | loop={loop_duration_ms:.1f}ms | {timing_text}"
+        )
+    else:
+        timing_text = "timing=none"
+    timestamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+    return (
+        f"[{timestamp}] Export rate={export_rate:.2f} FPS | image={image_name}"
+        f" | capsule_position={position_text} | {timing_text}"
+    )
 
 
 def run_bt_only_loop(args):
@@ -1401,8 +1646,14 @@ def run_bt_only_loop(args):
         input("Export capture data to the export directory? [y/N]: ").strip().lower()
         in {'y', 'yes'}
     )
+    export_fps = getattr(args, 'export_fps', None)
+    if export_fps is not None and export_fps <= 0.0:
+        raise ValueError('--export-fps must be greater than zero')
+    export_interval_s = 1.0 / export_fps if export_fps is not None else None
     if export_data:
         print(f"Capture export enabled: {CAPTURE_EXPORT_DIRECTORY}")
+        if export_fps is not None:
+            print(f"Capture export rate limited to the latest image at {export_fps:g} FPS.")
     else:
         print("Capture export disabled.")
 
@@ -1415,13 +1666,19 @@ def run_bt_only_loop(args):
 
     motor_data = None
     last_capture_image_path = None
+    pending_capture_path = None
+    last_capture_scan_time = 0.0
     last_motor_update = 0.0
     MOTOR_UPDATE_INTERVAL = 0.1
     last_position_update = 0.0
     POSITION_UPDATE_INTERVAL = 0.03
     loop_periods = deque(maxlen=100)
     last_stats_print = 0.0
-    step_names = ['bt_fetch', 'motor_update', 'quat_compute', 'position_update', 'plot_update']
+    step_names = [
+        'bt_fetch', 'motor_update', 'capture_scan', 'capture_queue',
+        'quat_compute', 'position_update', 'export_dispatch', 'display',
+        'plot_update',
+    ]
 
     position_thread = threading.Thread(target=position_estimation_worker, daemon=True)
     position_thread_running = True
@@ -1439,6 +1696,18 @@ def run_bt_only_loop(args):
         serial_thread = threading.Thread(target=run_serial_data_receiver, args=(stop_event,))
         serial_thread.daemon = True
         serial_thread.start()
+
+    capture_observer = None
+    if export_data:
+        prime_latest_capture_event()
+        capture_observer = Observer()
+        capture_observer.schedule(
+            CaptureOutputEventHandler(),
+            CAPTURE_SOURCE_DIRECTORY,
+            recursive=False,
+        )
+        capture_observer.start()
+        print(f"Watching capture output: {CAPTURE_SOURCE_DIRECTORY}")
 
     try:
         while not stop_event.is_set():
@@ -1461,11 +1730,30 @@ def run_bt_only_loop(args):
                 last_motor_update = time.time()
             step_durations_ms['motor_update'] = (time.perf_counter() - step_start) * 1000.0
 
-            if export_data:
-                last_capture_image_path = queue_latest_image_capture(
-                    latest_bt_data, motor_data, last_capture_image_path
+            step_start = time.perf_counter()
+            should_scan_for_capture = (
+                export_data and (
+                    export_interval_s is None or
+                    time.monotonic() - last_capture_scan_time >= export_interval_s
                 )
+            )
+            if should_scan_for_capture:
+                pending_capture_path = get_latest_capture_event_path(pending_capture_path)
+                previous_capture_path = last_capture_image_path
+                last_capture_image_path = queue_latest_image_capture(
+                    latest_bt_data,
+                    motor_data,
+                    last_capture_image_path,
+                    pending_capture_path,
+                )
+                if last_capture_image_path != previous_capture_path:
+                    pending_capture_path = None
+                last_capture_scan_time = time.monotonic()
+            step_durations_ms['capture_scan'] = (time.perf_counter() - step_start) * 1000.0
+
+            step_start = time.perf_counter()
             queue_pending_capture_requests(motor_data)
+            step_durations_ms['capture_queue'] = (time.perf_counter() - step_start) * 1000.0
 
             step_start = time.perf_counter()
             current_time = time.time()
@@ -1484,13 +1772,18 @@ def run_bt_only_loop(args):
                 estX, estY, estZ = latest_estimate
             step_durations_ms['position_update'] = (time.perf_counter() - step_start) * 1000.0
 
+            step_start = time.perf_counter()
             new_export = export_completed_capture_bundles(export_data)
+            step_durations_ms['export_dispatch'] = (time.perf_counter() - step_start) * 1000.0
             if new_export is not None:
                 latest_export = new_export
+
+            step_start = time.perf_counter()
             if display_export and latest_export is not None:
                 if not display_exported_capture(latest_export):
                     stop_event.set()
                     break
+            step_durations_ms['display'] = (time.perf_counter() - step_start) * 1000.0
 
             step_start = time.perf_counter()
             if position_latency_plotter is not None:
@@ -1502,8 +1795,22 @@ def run_bt_only_loop(args):
             loop_periods.append(loop_period)
             avg_loop_period = sum(loop_periods) / len(loop_periods)
             avg_hz = 1.0 / avg_loop_period if avg_loop_period > 0.0 else 0.0
-            if time.perf_counter() - last_stats_print >= 0.5 or not loop_periods:
-                print(format_bt_only_timing_summary(step_durations_ms, avg_hz))
+            if not export_data and (time.perf_counter() - last_stats_print >= 0.5 or not loop_periods):
+                exported_position = (
+                    latest_export.get('position_world')
+                    if latest_export is not None else None
+                )
+                current_position = (
+                    exported_position
+                    if exported_position is not None else [estX, estY, estZ]
+                )
+                print(format_bt_only_timing_summary(
+                    get_capture_export_rate(),
+                    last_capture_image_path,
+                    current_position,
+                    step_durations_ms,
+                    loop_period * 1000.0,
+                ))
                 last_stats_print = time.perf_counter()
     finally:
         position_thread_running = False
@@ -1516,6 +1823,9 @@ def run_bt_only_loop(args):
             bt_receiver_thread.join(timeout=1.0)
         if 'position_thread' in locals():
             position_thread.join(timeout=1.0)
+        if capture_observer is not None:
+            capture_observer.stop()
+            capture_observer.join(timeout=1.0)
         shutdown_capture_export_executor(export_data)
         if display_export:
             cv2.destroyAllWindows()
@@ -2917,6 +3227,8 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
 
                 tag_euler = rotation_matrix_to_euler(quaternion_to_rotation_matrix(fused_q_cube1_cube2)) if fused_q_cube1_cube2 is not None else [0.0, 0.0, 0.0]
                 bt_euler = rotation_matrix_to_euler(R_btcap_global) if R_btcap_global is not None else [0.0, 0.0, 0.0]
+                top_tag_euler = rotation_matrix_to_euler(top_R_cube1_cube2) if top_R_cube1_cube2 is not None else [0.0, 0.0, 0.0]
+                side_tag_euler = rotation_matrix_to_euler(R_cube1_cube2) if R_cube1_cube2 is not None else [0.0, 0.0, 0.0]
                 # plotter.push(tag_euler, bt_euler)  # Push both tag and BT Euler angles to the plotter for comparison
 
 
@@ -3007,9 +3319,9 @@ def detect_apriltags(camera_matrix, dist_coeffs ,top_camera_matrix, top_dist_coe
                 ## TAG 
                 q_cube1_global_text =     f"q_Cap_global: [{q_cube1_global[0]:.3f}, {q_cube1_global[1]:.3f}, {q_cube1_global[2]:.3f}, {q_cube1_global[3]:.3f}]" if q_cube1_global is not None else "Cube2 Quat Cap: N/A"
                 q_cube2_global_text =     f"q_Mag_global: [{q_cube2_global[0]:.3f}, {q_cube2_global[1]:.3f}, {q_cube2_global[2]:.3f}, {q_cube2_global[3]:.3f}]" if q_cube2_global is not None else "Cube2 Quat Global: N/A"
-                top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f}" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
-                side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f}" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
-                fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f}" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
+                top_cam_text = f"TOP:  x={top_t_cube1_cube2_tag[0]:.3f}, y={top_t_cube1_cube2_tag[1]:.3f}, z={top_t_cube1_cube2_tag[2]:.3f} q:x={top_q_cube1_cube2[0]:.3f},{top_q_cube1_cube2[1]:.3f},{top_q_cube1_cube2[2]:.3f},{top_q_cube1_cube2[3]:.3f} Euler:R={top_tag_euler[0]:.1f},P={top_tag_euler[1]:.1f},Y={top_tag_euler[2]:.1f}deg" if top_t_cube1_cube2_tag is not None and top_q_cube1_cube2 is not None else "TOP: N/A"
+                side_cam_text = f"SIDE: x={t_cube1_cube2_tag[0]:.3f}, y={t_cube1_cube2_tag[1]:.3f}, z={t_cube1_cube2_tag[2]:.3f} q:x={q_cube1_cube2[0]:.3f},{q_cube1_cube2[1]:.3f},{q_cube1_cube2[2]:.3f},{q_cube1_cube2[3]:.3f} Euler:R={side_tag_euler[0]:.1f},P={side_tag_euler[1]:.1f},Y={side_tag_euler[2]:.1f}deg" if t_cube1_cube2_tag is not None and q_cube1_cube2 is not None else "SIDE: N/A"
+                fused_cam_text = f"FUSED:x={fused_t_cube1_cube2_tag[0]:.3f}, y={fused_t_cube1_cube2_tag[1]:.3f}, z={fused_t_cube1_cube2_tag[2]:.3f} q:x={fused_q_cube1_cube2[0]:.3f},{fused_q_cube1_cube2[1]:.3f},{fused_q_cube1_cube2[2]:.3f},{fused_q_cube1_cube2[3]:.3f} Euler:R={tag_euler[0]:.1f},P={tag_euler[1]:.1f},Y={tag_euler[2]:.1f}deg" if fused_t_cube1_cube2_tag is not None and fused_q_cube1_cube2 is not None else "FUSED: N/A"
                 t_cube1_worldCube_text = f"Cube1 Global: x={t_cube1_worldCube[0]:.3f}, y={t_cube1_worldCube[1]:.3f}, z={t_cube1_worldCube[2]:.3f} q:x={q_cube1_worldCube[0]:.3f},{q_cube1_worldCube[1]:.3f},{q_cube1_worldCube[2]:.3f},{q_cube1_worldCube[3]:.3f}" if t_cube1_worldCube is not None and q_cube1_worldCube is not None else "Cube1 Global: N/A"
                 q_cube1_worldCube_text = f"Cube1 Global: qx={q_cube1_worldCube[0]:.3f}, qy={q_cube1_global[1]:.3f}, qz={q_cube1_global[2]:.3f}, qw={q_cube1_global[3]:.3f}" if q_cube1_worldCube is not None else "Cube1 Global: N/A"
                 ## Repeat Test
@@ -3215,12 +3527,31 @@ if __name__ == "__main__":
         parser.add_argument('--vert', action='store_true', help='Run in verticality test mode (logs cube2 global orientation)')
         parser.add_argument('--bt_only', action='store_true', help='Skip AprilTag processing and use BT + motor data only')
         parser.add_argument('--display-export', action='store_true', help='Display the latest BT-only exported image with pose overlay')
+        parser.add_argument('--export-fps', type=float, help='Export only the latest available image and pose data at this maximum rate, for example --export-fps 6')
+        parser.add_argument('--export-min-distance-mm', type=float, default=CAPTURE_EXPORT_MIN_DISTANCE_MM,
+                            help='Export when position changes by this many mm from the last export (default: 8)')
+        parser.add_argument('--export-min-angle-deg', type=float, default=CAPTURE_EXPORT_MIN_ANGLE_DEG,
+                            help='Or export when camera orientation changes by this many degrees (default: 5)')
+        parser.add_argument('--no-export-pose-filter', action='store_true',
+                            help='Disable pose-based capture export filtering')
         parser.add_argument(
             '--telemetry-source',
             choices=[TELEMETRY_SOURCE_BT_ANGLE_EST, TELEMETRY_SOURCE_CAPSULE_ORIENTATION],
             help='Use bt_angleEst data with remapping or already-aligned capsule_orientation data',
         )
         args = parser.parse_args()
+
+        try:
+            capture_pose_filter = CapturePoseFilter(
+                args.export_min_distance_mm, args.export_min_angle_deg,
+                enabled=not args.no_export_pose_filter,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if capture_pose_filter.enabled:
+            print(f"Capture pose filter: {args.export_min_distance_mm:g} mm or {args.export_min_angle_deg:g} deg")
+        else:
+            print("Capture pose filter disabled.")
 
         select_telemetry_source(args.telemetry_source)
 

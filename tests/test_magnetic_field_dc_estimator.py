@@ -108,3 +108,40 @@ def test_successfully_processed_file_is_deleted(tmp_path, monkeypatch):
     processor.process_file(telemetry_file)
 
     assert not telemetry_file.exists()
+
+
+def test_compute_magnetometer_weight_rejects_small_ac_to_dc_ratio():
+    weight = module.compute_magnetometer_weight(
+        np.array([15000.0, 0.0, 0.0]),
+        np.array([200.0, 0.0, 0.0]),
+    )
+
+    assert weight == 0.0
+
+
+def test_madgwick_zero_mag_weight_matches_imu_only_update():
+    filter_with_zero_weight = module.MadgwickFilter(alpha=1.0, beta=0.3)
+    filter_with_zero_weight.init()
+
+    filter_without_mag = module.MadgwickFilter(alpha=1.0, beta=0.3)
+    filter_without_mag.init()
+
+    gyro = np.array([0.0, 0.0, np.radians(15.0)])
+    accel = np.array([0.0, 0.0, -1.0])
+    disturbed_mag = np.array([0.0, 1.0, 0.0])
+
+    q_zero_weight, _, _ = filter_with_zero_weight.update(
+        gyro,
+        accel,
+        disturbed_mag,
+        current_time=0.01,
+        mag_weight=0.0,
+    )
+    q_imu_only, _, _ = filter_without_mag.update(
+        gyro,
+        accel,
+        None,
+        current_time=0.01,
+    )
+
+    assert np.allclose(q_zero_weight, q_imu_only)

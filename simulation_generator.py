@@ -170,10 +170,9 @@ def render_charuco_view(board_image, board_to_camera, intrinsic_matrix, distorti
 
 
 def save_frame(frame, pose_index):
-    # capsule_calibration.load_capsule_frame rotates production frames by 180 deg.
-    # Emit synthetic frames in that raw orientation so the calibration path sees
-    # the same rendered camera-frame convention used to define ground truth.
-    raw_frame = cv2.rotate(frame, cv2.ROTATE_180)
+    # Intrinsic and boresight modes each apply a second 180-degree rotation
+    # after load_capsule_frame(), so preserve the rendered camera frame here.
+    raw_frame = frame
     numbered_path = os.path.join(DATA_DIRECTORY, f"imgInfo_{pose_index:05d}.jpg")
     live_path = os.path.join(DATA_DIRECTORY, "live_feed.jpg")
     for destination in (numbered_path, live_path):
