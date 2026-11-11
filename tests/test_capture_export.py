@@ -417,9 +417,14 @@ def test_bt_loop_reports_timing_only_when_export_is_disabled(monkeypatch, capsys
     monkeypatch.setattr(module, 'prime_latest_capture_event', lambda: None)
     monkeypatch.setattr(module, 'shutdown_capture_export_executor', lambda enabled: None)
     monkeypatch.setattr(module, 'get_latest_bt_data', lambda: None)
-    monkeypatch.setattr('builtins.input', lambda prompt: 'y' if export_enabled else 'n')
+    monkeypatch.setattr('builtins.input', lambda prompt: pytest.fail('Unexpected input prompt'))
 
-    module.run_bt_only_loop(types.SimpleNamespace(display_export=False, export_fps=None))
+    args = types.SimpleNamespace(display_export=False, export_fps=None)
+    if not export_enabled:
+        args.no_export = True
+    module.run_bt_only_loop(args)
 
     output = capsys.readouterr().out
+    assert ('Capture export enabled:' in output) is export_enabled
+    assert ('Capture export disabled.' in output) is not export_enabled
     assert ('Export rate=' in output) is not export_enabled

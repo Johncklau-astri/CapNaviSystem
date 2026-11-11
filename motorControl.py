@@ -3,6 +3,9 @@ import time
 import select
 import sys
 import msvcrt
+import argparse
+import subprocess
+from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import socket
@@ -16,6 +19,33 @@ from gs_usb.constants import (
     CAN_ERR_FLAG,
     CAN_RTR_FLAG,
 )
+
+
+def start_localization_after_delay(localization_script, delay_seconds):
+    """Start AprilTag localization after the demo sequence has begun."""
+    time.sleep(delay_seconds)
+    if not localization_script.is_file():
+        print(f"AprilTag localization script not found: {localization_script}")
+        return
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(localization_script),
+                "--bt_only",
+                "--export-min-distance-mm",
+                "7",
+                "--export-min-angle-deg",
+                "7",
+            ],
+            cwd=str(localization_script.parent),
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+        print("AprilTag localization started.")
+    except OSError as exc:
+        print(f"Failed to start AprilTag localization: {exc}")
+
+
 class Motor:
     def __init__(self, name, node_id):
         self.name = name
@@ -1610,7 +1640,26 @@ def autoZeroing(dev,motors):
 
 
 def main():
-    # Existing code...
+    parser = argparse.ArgumentParser(description="CAN bus motor controller")
+    parser.add_argument(
+        "--auto-scan",
+        action="store_true",
+        help="Automatically run menu option 1 once at startup",
+    )
+    parser.add_argument(
+        "--auto-nmt",
+        action="store_true",
+        help="After a successful scan, run menu option 2 with NMT state 01",
+    )
+    args = parser.parse_args()
+    automatic_option = 1 if args.auto_scan else None
+    automatic_nmt_pending = False
+    automatic_zeroing_confirmation_pending = args.auto_nmt
+    automatic_rotation_confirmation_pending = args.auto_nmt
+    automatic_demo_confirmation_pending = args.auto_nmt
+    automatic_demo_after_offset_pending = False
+    automatic_localization_pending = False
+
     dev = None  # Initialize dev outside the conditional block
     stop_event = threading.Event()  # Event to stop the thread
     reader_thread = None  # To track the reader thread
@@ -1618,7 +1667,12 @@ def main():
 
     try:
         while True:
-            user_input = input("""
+            if automatic_option is not None:
+                print(automatic_option)
+                user_input = str(automatic_option)
+                automatic_option = None
+            else:
+                user_input = input("""
     Choose an option:
     1. Scan for Device
     2. Set NMT state for all nodes
@@ -1700,6 +1754,9 @@ def main():
                     pos_printer_thread_obj.start()
                     threads.append(('position_printer', pos_printer_stop_event))
                     print("Motor position printer started. It will print current positions once per second.")
+                    if args.auto_nmt:
+                        automatic_nmt_pending = True
+                        automatic_option = 2
                     
                 else:
                     print("Device not found.")
@@ -1707,7 +1764,11 @@ def main():
 
             elif user_input == "2":
 
-                nmt_input = input("Enter NMT state for all nodes: ").strip()
+                if automatic_nmt_pending:
+                    nmt_input = "01"
+                    print(nmt_input)
+                else:
+                    nmt_input = input("Enter NMT state for all nodes: ").strip()
                 #01 oP
                 #02 sTOP
                 #80 Pre-op
@@ -1719,12 +1780,27 @@ def main():
                 data = bytes.fromhex(data)  # Convert to bytes: b"\x01\x00"
                 nmtAll2Op_frame = GsUsbFrame(can_id=0x000, data=data)
                 if(nmt_input == "01"):
-                    ret = input("Did you restart the motor power after e-stop? (y/n): ").strip().lower()
+                    if automatic_nmt_pending:
+                        ret = "y"
+                        print(ret)
+                        automatic_nmt_pending = False
+                    else:
+                        ret = input("Did you restart the motor power after e-stop? (y/n): ").strip().lower()
                     if ret != "y":
                         print("Please restart the motor power before sending the stop command.")
                         continue
                 dev.send(nmtAll2Op_frame)
                 vertPreMove(dev, motors)
+                if automatic_zeroing_confirmation_pending:
+                    confirmation = input(
+                        "CAN bus is configured and NMT state 01 is active. "
+                        "Enter 'y' to start automatic zeroing (option 10): "
+                    ).strip().lower()
+                    automatic_zeroing_confirmation_pending = False
+                    if confirmation == "y":
+                        automatic_option = 10
+                    else:
+                        print("Automatic zeroing cancelled.")
 
             elif user_input == "3":
                 # Zeroing motors
@@ -1779,6 +1855,20 @@ def main():
                 if dev is None:
                     print("Please scan for a device first (Option 1).")
                     continue
+
+                if automatic_localization_pending:
+                    localization_script = Path(__file__).with_name("aprilTagLocalization.py")
+                    localization_thread = threading.Thread(
+                        target=start_localization_after_delay,
+                        args=(localization_script, 10),
+                        daemon=True,
+                    )
+                    localization_thread.start()
+                    automatic_localization_pending = False
+                    print(
+                        "Demo sequence started. "
+                        "AprilTag export will start in 10 seconds."
+                    )
 
                 # Initialize motors and release brakes
                 motors_init_brakeRelease(dev, motors)
@@ -2164,11 +2254,35 @@ def main():
                     print("Please scan for a device first (Option 1).")
                     continue
                 autoZeroing(dev,motors)
+                if automatic_rotation_confirmation_pending:
+                    print("Waiting 15 seconds before allowing rotation to start...")
+                    time.sleep(15)
+                    confirmation = input(
+                        "Make sure the motors all stopped zeroing. "
+                        "Enter 'y' to start rotation (option 11): "
+                    ).strip().lower()
+                    automatic_rotation_confirmation_pending = False
+                    if confirmation == "y":
+                        automatic_option = 11
+                    else:
+                        print("Rotation cancelled.")
             elif user_input == "11":
                 if dev is None:
                     print("Please scan for a device first (Option 1).")
                     continue
                 rotateto1000(dev)
+                if automatic_demo_confirmation_pending:
+                    confirmation = input(
+                        "Make sure all motors have stopped moving. Confirm starting demo sequence (option 4). "
+                        "Press 'y' to start demo: "
+                    ).strip().lower()
+                    automatic_demo_confirmation_pending = False
+                    if confirmation == "y":
+                        automatic_localization_pending = True
+                        automatic_demo_after_offset_pending = True
+                        automatic_option = 13
+                    else:
+                        print("Demo sequence cancelled.")
 
             elif user_input == "12":
                 if dev is None:
@@ -2204,6 +2318,9 @@ def main():
 
             elif user_input == "13":
                 magnet_offset(motors)
+                if automatic_demo_after_offset_pending:
+                    automatic_demo_after_offset_pending = False
+                    automatic_option = 4
 
 
 

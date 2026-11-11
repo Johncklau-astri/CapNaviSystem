@@ -3,6 +3,9 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / 'aprilTagLocalization.py'
@@ -55,6 +58,25 @@ if 'matplotlib' not in sys.modules:
 spec = importlib.util.spec_from_file_location('aprilTagLocalization', MODULE_PATH)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+def test_default_telemetry_source_is_capsule_orientation(monkeypatch):
+    monkeypatch.setattr('builtins.input', lambda prompt: pytest.fail('Unexpected input prompt'))
+    module.select_telemetry_source()
+
+    magnetometer, _ = module.decode_bt_telemetry({'magX': 1.0, 'magY': 2.0, 'magZ': 3.0})
+
+    assert module.telemetry_source == module.TELEMETRY_SOURCE_CAPSULE_ORIENTATION
+    np.testing.assert_array_equal(magnetometer, [1.0, 2.0, 3.0])
+
+
+def test_bt_angle_est_telemetry_remains_selectable():
+    try:
+        module.select_telemetry_source(module.TELEMETRY_SOURCE_BT_ANGLE_EST)
+        magnetometer, _ = module.decode_bt_telemetry({'magX': 1.0, 'magY': 2.0, 'magZ': 3.0})
+        np.testing.assert_array_equal(magnetometer, [-2.0, -1.0, -3.0])
+    finally:
+        module.select_telemetry_source()
 
 
 def test_compute_bt_only_quaternion_returns_expected_shape():

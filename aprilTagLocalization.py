@@ -414,7 +414,7 @@ MOTOR_SERVER_PORT = 12345
 BT_ANGLE_EST_PORT = 12347  # Port for receiving data from bt_angleEst
 TELEMETRY_SOURCE_BT_ANGLE_EST = 'bt_angleEst'
 TELEMETRY_SOURCE_CAPSULE_ORIENTATION = 'capsule_orientation'
-telemetry_source = TELEMETRY_SOURCE_BT_ANGLE_EST
+telemetry_source = TELEMETRY_SOURCE_CAPSULE_ORIENTATION
 
 # Global variables
 magX = 0.0
@@ -457,7 +457,7 @@ motor_pose_history = deque()
 stop_event = threading.Event()
 
 
-def select_telemetry_source(source=None):
+def select_telemetry_source(source=TELEMETRY_SOURCE_CAPSULE_ORIENTATION):
     """Select the TCP telemetry producer and its required frame conversion."""
     global telemetry_source
     valid_sources = {
@@ -1642,10 +1642,7 @@ def run_bt_only_loop(args):
 
     print("BT-only mode enabled; camera and AprilTag processing are skipped.")
     display_export = getattr(args, 'display_export', False)
-    export_data = display_export or (
-        input("Export capture data to the export directory? [y/N]: ").strip().lower()
-        in {'y', 'yes'}
-    )
+    export_data = not getattr(args, 'no_export', False)
     export_fps = getattr(args, 'export_fps', None)
     if export_fps is not None and export_fps <= 0.0:
         raise ValueError('--export-fps must be greater than zero')
@@ -3526,7 +3523,9 @@ if __name__ == "__main__":
         parser.add_argument('--repeat', action='store_true', help='Run in repeatability test mode (logs cube2 position relative to origin)')
         parser.add_argument('--vert', action='store_true', help='Run in verticality test mode (logs cube2 global orientation)')
         parser.add_argument('--bt_only', action='store_true', help='Skip AprilTag processing and use BT + motor data only')
-        parser.add_argument('--display-export', action='store_true', help='Display the latest BT-only exported image with pose overlay')
+        export_options = parser.add_mutually_exclusive_group()
+        export_options.add_argument('--display-export', action='store_true', help='Display the latest BT-only exported image with pose overlay')
+        export_options.add_argument('--no-export', action='store_true', help='Disable capture export in BT-only mode')
         parser.add_argument('--export-fps', type=float, help='Export only the latest available image and pose data at this maximum rate, for example --export-fps 6')
         parser.add_argument('--export-min-distance-mm', type=float, default=CAPTURE_EXPORT_MIN_DISTANCE_MM,
                             help='Export when position changes by this many mm from the last export (default: 8)')
@@ -3537,7 +3536,8 @@ if __name__ == "__main__":
         parser.add_argument(
             '--telemetry-source',
             choices=[TELEMETRY_SOURCE_BT_ANGLE_EST, TELEMETRY_SOURCE_CAPSULE_ORIENTATION],
-            help='Use bt_angleEst data with remapping or already-aligned capsule_orientation data',
+            default=TELEMETRY_SOURCE_CAPSULE_ORIENTATION,
+            help='Use bt_angleEst data with remapping or already-aligned capsule_orientation data (default: capsule_orientation)',
         )
         args = parser.parse_args()
 
