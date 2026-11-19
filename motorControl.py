@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation as R
 import socket
 import json
 import struct
+import csv
 from collections import defaultdict
 from gs_usb.gs_usb import GsUsb
 from gs_usb.gs_usb_frame import GsUsbFrame
@@ -20,10 +21,73 @@ from gs_usb.constants import (
     CAN_RTR_FLAG,
 )
 
+CAPSULE_CALIBRATION_TRIGGER_FILE = Path(__file__).with_name(
+    ".capsule_calibration_request"
+)
+INSPECTION_COMPLETE_REQUEST_FILE = Path(__file__).with_name(
+    ".inspection_complete_request"
+)
+MOTOR_MOTION_DEBUG_LOG = Path(__file__).with_name("motor_motion_debug_log.csv")
+motor_motion_debug_lock = threading.Lock()
+motor_motion_debug_enabled = False
+inspection_motion_direction = 0.0
+
+
+def start_motor_motion_debug_log():
+    """Start a fresh motor-reference log for option 4."""
+    global motor_motion_debug_enabled
+    with motor_motion_debug_lock:
+        with MOTOR_MOTION_DEBUG_LOG.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as output_file:
+            csv.writer(output_file).writerow([
+                "timestamp_computer",
+                "rotary_output_angle_deg",
+                "expected_yaw_direction",
+            ])
+    motor_motion_debug_enabled = True
+
+
+def write_motor_motion_debug_sample(motors_list):
+    """Append the actual rotary position and expected capsule direction."""
+    if not motor_motion_debug_enabled:
+        return
+    rotary_motor = motors_list[rotary - 1]
+    output_angle = rotary_motor.current_position_real_unit - rotary_motor.offset
+    with motor_motion_debug_lock:
+        with MOTOR_MOTION_DEBUG_LOG.open(
+            "a",
+            newline="",
+            encoding="utf-8",
+        ) as output_file:
+            writer = csv.writer(output_file)
+            writer.writerow([
+                time.time(),
+                output_angle,
+                inspection_motion_direction,
+            ])
+            output_file.flush()
+
 
 def start_localization_after_delay(localization_script, delay_seconds):
-    """Start AprilTag localization after the demo sequence has begun."""
+    """Recalibrate capsule polarity, then start AprilTag localization."""
     time.sleep(delay_seconds)
+    try:
+        CAPSULE_CALIBRATION_TRIGGER_FILE.write_text(
+            "automatic calibration request\n",
+            encoding="utf-8",
+        )
+        print(
+            "Sent automatic AC polarity calibration request to "
+            "capsule_orientation.py."
+        )
+    except OSError as exc:
+        print(f"Failed to trigger capsule AC polarity recalibration: {exc}")
+        return
+
+    time.sleep(1)
     if not localization_script.is_file():
         print(f"AprilTag localization script not found: {localization_script}")
         return
@@ -44,6 +108,18 @@ def start_localization_after_delay(localization_script, delay_seconds):
         print("AprilTag localization started.")
     except OSError as exc:
         print(f"Failed to start AprilTag localization: {exc}")
+
+
+def request_inspection_complete_export():
+    """Request an end-of-inspection manifest from AprilTag localization."""
+    try:
+        INSPECTION_COMPLETE_REQUEST_FILE.write_text(
+            "inspection complete\n",
+            encoding="utf-8",
+        )
+        print("Requested inspection-complete manifest export.")
+    except OSError as exc:
+        print(f"Failed to request inspection-complete manifest export: {exc}")
 
 
 class Motor:
@@ -209,7 +285,7 @@ pitch_down = [0,0,0,-30]
 half_pitch_up = [0,0,0,15]
 half_pitch_down = [0,0,0,-15]
 
-vert_start_offset = 12
+vert_start_offset = 13
 hori_start_offset = 10
 layer_z_sep = -2
 
@@ -220,19 +296,59 @@ rev_movement_sequence = [
 ##First Revolution
 [360,0,0,0],
 ##Height lowering
-[0,-3,0,0],
+[0,-4,0,0],
 ## Second Revolution
 [-360,0,0,0],
 ## Height lowering after second revolution
-[0,-3,0,0],
+[0,-4,0,0],
 ## Third Revolution
 [360,0,0,0],
 ## Height lowering after third revolution
-[0,-3,0,0],
+[0,-4,0,0],
 ## Fourth Revolution
 [-360,0,0,0]
 
 ]
+
+ROTARY_MOTION_SAFETY_MARGIN_SECONDS = 1.0
+ROTARY_PROFILE_VALUE_TO_RPM = 0.1
+
+
+def calculate_rotary_motion_duration(
+    angle_degrees, speed_profile_value, acceleration_profile_value
+):
+    """Estimate the minimum rotary profile time for a position move.
+
+    The rotary controller profile values use 0.1 RPM and 0.1 RPM/s units.
+    """
+    distance_revolutions = abs(float(angle_degrees)) * 12.9704 / 360.0
+    speed_rpm = (
+        abs(float(speed_profile_value)) * ROTARY_PROFILE_VALUE_TO_RPM
+    )
+    acceleration_rpm_per_second = (
+        abs(float(acceleration_profile_value))
+        * ROTARY_PROFILE_VALUE_TO_RPM
+    )
+
+    if distance_revolutions == 0:
+        return 0.0
+    if speed_rpm <= 0 or acceleration_rpm_per_second <= 0:
+        raise ValueError("Rotary speed and acceleration must be positive.")
+
+    acceleration_distance = speed_rpm**2 / (
+        60.0 * acceleration_rpm_per_second
+    )
+    if distance_revolutions <= acceleration_distance:
+        peak_speed_rpm = np.sqrt(
+            distance_revolutions * 60.0 * acceleration_rpm_per_second
+        )
+        return 2.0 * peak_speed_rpm / acceleration_rpm_per_second
+
+    acceleration_time = speed_rpm / acceleration_rpm_per_second
+    cruise_distance = distance_revolutions - acceleration_distance
+    cruise_time = cruise_distance * 60.0 / speed_rpm
+    return 2.0 * acceleration_time + cruise_time
+
 
 p2p_movement_sequence= [
 ## Rotary motor movement        vert motor movement     hori motor movement         pitch motor movement
@@ -1129,9 +1245,9 @@ def rotaryInit(dev,motor_id):
 
 def setUpRotaryMotorMove(dev, motor_id, output_pos, speed, acc, dec):
 
-    # speed is rpm
+    # speed profile value is in tenths of RPM
     # target_pos is a tenth of a degree
-    # acce and dec are in rpm/s
+    # acc and dec profile values are in tenths of RPM/s
     # 3600 steps / rev
     # Gear ratio to final output is 12.9704:1
     # 1 cm = 0.5 rev                            
@@ -1527,6 +1643,7 @@ def position_printer_thread(motors_list, stop_event, interval):
 
 
             calculate_magnet_pose_and_sendMagAbsPos(motors_list)
+            write_motor_motion_debug_sample(motors_list)
 
             # is_stopped = " | ".join(f"{motor.name}:{'Stopped' if motor.is_stopped else 'Moving'}" for motor in motors_list)
             # print(f"[Motor Status] {is_stopped}")
@@ -1580,7 +1697,7 @@ def rotateto1000(dev):
 
     
     rotary_travel = 27.8   # degrees (positive/negative)
-    pitch_travel = 65.20
+    pitch_travel = 96.4
     vert_travel = 15
     hori_travel   = 6
 
@@ -1612,7 +1729,7 @@ def autoZeroing(dev,motors):
     dev.send(start_zeroing_frame)
     dev.send(start_zeroing_frame1)
     print(f"hori Motor  zeroing started")
-    time.sleep(10)  # Wait for pitch motor to start zeroing
+    time.sleep(1)  # Wait for pitch motor to start zeroing
 
 
 
@@ -1640,11 +1757,12 @@ def autoZeroing(dev,motors):
 
 
 def main():
+    global inspection_motion_direction
     parser = argparse.ArgumentParser(description="CAN bus motor controller")
     parser.add_argument(
         "--auto-scan",
         action="store_true",
-        help="Automatically run menu option 1 once at startup",
+        help="Automatically run menu option 1 once at startup (the default)",
     )
     parser.add_argument(
         "--auto-nmt",
@@ -1652,7 +1770,8 @@ def main():
         help="After a successful scan, run menu option 2 with NMT state 01",
     )
     args = parser.parse_args()
-    automatic_option = 1 if args.auto_scan else None
+    automatic_option = 1
+    startup_nmt_pending = True
     automatic_nmt_pending = False
     automatic_zeroing_confirmation_pending = args.auto_nmt
     automatic_rotation_confirmation_pending = args.auto_nmt
@@ -1743,18 +1862,18 @@ def main():
 
                     if any(name == 'position_printer' for name, _ in threads):
                         print("Motor position printer is already running.")
-                        continue
-
-                    pos_printer_stop_event = threading.Event()
-                    pos_printer_thread_obj = threading.Thread(
-                        target=position_printer_thread,
-                        args=(motors, pos_printer_stop_event, 0.01)
-                    )
-                    pos_printer_thread_obj.daemon = True
-                    pos_printer_thread_obj.start()
-                    threads.append(('position_printer', pos_printer_stop_event))
-                    print("Motor position printer started. It will print current positions once per second.")
-                    if args.auto_nmt:
+                    else:
+                        pos_printer_stop_event = threading.Event()
+                        pos_printer_thread_obj = threading.Thread(
+                            target=position_printer_thread,
+                            args=(motors, pos_printer_stop_event, 0.01)
+                        )
+                        pos_printer_thread_obj.daemon = True
+                        pos_printer_thread_obj.start()
+                        threads.append(('position_printer', pos_printer_stop_event))
+                        print("Motor position printer started. It will print current positions once per second.")
+                    if startup_nmt_pending or args.auto_nmt:
+                        startup_nmt_pending = False
                         automatic_nmt_pending = True
                         automatic_option = 2
                     
@@ -1856,6 +1975,10 @@ def main():
                     print("Please scan for a device first (Option 1).")
                     continue
 
+                start_motor_motion_debug_log()
+                inspection_motion_direction = 0.0
+                print("Motor motion diagnostic logging enabled for option 4.")
+
                 if automatic_localization_pending:
                     localization_script = Path(__file__).with_name("aprilTagLocalization.py")
                     localization_thread = threading.Thread(
@@ -1883,10 +2006,13 @@ def main():
 
                 print("\nStarting movement sequence. Press Enter to start each movement, or 'q' for emergency stop.")
 
+                next_movement_allowed_at = 0.0
                 for i, movement in enumerate(rev_movement_sequence):
                     print(f"\nPreparing movement {i+1}/{len(rev_movement_sequence)}...")
 
                     relRotaryDeg = movement[0]
+                    if relRotaryDeg:
+                        inspection_motion_direction = -float(np.sign(relRotaryDeg))
 
                     relVertDisp = movement[1]
 
@@ -1922,7 +2048,7 @@ def main():
                                 # print(f"Motor {motor.node_id} ({motor.name}) is still moving.")
                                 
                         # print(f"all stop: {all_stop}")
-                        if all_stop:
+                        if all_stop and time.time() >= next_movement_allowed_at:
                             data_to_send = {
                                 "record_data": True
                             }
@@ -1931,6 +2057,27 @@ def main():
                             launchMoveCommand(dev, motors)
                             print(f"Movement {i+1} launched.")
                             time.sleep(1)  # Small delay to ensure command is sent before checking for next input
+                            if relRotaryDeg != 0:
+                                rotary_duration = calculate_rotary_motion_duration(
+                                    relRotaryDeg,
+                                    relRotarySpeed,
+                                    relRotaryAcc,
+                                )
+                                next_movement_allowed_at = (
+                                    time.time()
+                                    + rotary_duration
+                                    + ROTARY_MOTION_SAFETY_MARGIN_SECONDS
+                                )
+                                print(
+                                    "Waiting %.2f seconds for the rotary move "
+                                    "to complete before the next movement."
+                                    % (
+                                        rotary_duration
+                                        + ROTARY_MOTION_SAFETY_MARGIN_SECONDS
+                                    )
+                                )
+                            else:
+                                next_movement_allowed_at = time.time()
                             break  # Proceed to next movement                                
 
                         if msvcrt.kbhit():  # Check if a key has been pressed
@@ -1968,6 +2115,17 @@ def main():
                                 break  # Proceed to next movement
                         time.sleep(0.01)  # Small delay to prevent CPU hogging
 
+                remaining_rotation_time = (
+                    next_movement_allowed_at - time.time()
+                )
+                if remaining_rotation_time > 0:
+                    print(
+                        "Waiting %.2f seconds for the final revolution "
+                        "to complete before marking the inspection complete."
+                        % remaining_rotation_time
+                    )
+                    time.sleep(remaining_rotation_time)
+                request_inspection_complete_export()
                 print("Movement sequence completed.")
 
             elif user_input == "5":
@@ -1981,7 +2139,7 @@ def main():
 
                 global rotaryDisplacement, vertDisplacement, horiDisplacement, pitchAngle, rollAngle , yawAngle
                 # Predefined travel amounts
-                rotary_travel = 30.0    # degrees (positive/negative)
+                rotary_travel = 90.0    # degrees (positive/negative)
                 vert_travel = 5      # cm (positive/negative, for vert1 and vert2)
                 hori_travel = 3      # cm (positive/negative, for hori1 and hori2)
                 pitch_travel = 10.0     # degrees (positive/negative)
@@ -2259,7 +2417,7 @@ def main():
                     time.sleep(15)
                     confirmation = input(
                         "Make sure the motors all stopped zeroing. "
-                        "Enter 'y' to start rotation (option 11): "
+                        "Enter 'y' to move motor to starting position (option 11): "
                     ).strip().lower()
                     automatic_rotation_confirmation_pending = False
                     if confirmation == "y":

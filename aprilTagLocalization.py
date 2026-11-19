@@ -268,6 +268,12 @@ LOG_REPEAT_TEST_FILE = "repeatability_test_log.csv"  # For repeatability testing
 CAPTURE_MESSAGE_TYPE = "capture"
 # Set this to a local folder shared through SMB, or to a mapped SMB path.
 CAPTURE_EXPORT_DIRECTORY = r"R:\Release_Internal_V1A\export"
+INSPECTION_COMPLETE_REQUEST_FILE = Path(__file__).with_name(
+    ".inspection_complete_request"
+)
+INSPECTION_COMPLETE_MANIFEST = (
+    Path(CAPTURE_EXPORT_DIRECTORY) / "inspection_complete.json"
+)
 # Paste the camera-to-PCB calibration matrix here when recalibrating.
 # Camera-to-PCB boresight calibration from capsule_calibration.py mode 2.
 R_CAM_TO_PCB = np.array([
@@ -1528,6 +1534,41 @@ def shutdown_capture_export_executor(should_export=True):
         except queue.Empty:
             return
 
+
+def export_inspection_complete_manifest():
+    """Write the end marker after all queued capture bundles are exported."""
+    if not INSPECTION_COMPLETE_REQUEST_FILE.is_file():
+        return
+    if capture_export_pending > 0 or not capture_position_response_queue.empty():
+        return
+
+    try:
+        payload = {
+            "schema_version": 1,
+            "frame_type": "inspection_end",
+            "event": "inspection_complete",
+            "timestamp_unix": time.time(),
+            "timestamp_utc": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(),
+            ),
+            "source": "aprilTagLocalization.py",
+        }
+        temporary_manifest = INSPECTION_COMPLETE_MANIFEST.with_suffix(
+            ".json.tmp"
+        )
+        with temporary_manifest.open("w", encoding="utf-8") as output_file:
+            json.dump(payload, output_file, indent=2)
+        os.replace(temporary_manifest, INSPECTION_COMPLETE_MANIFEST)
+        INSPECTION_COMPLETE_REQUEST_FILE.unlink()
+        print(
+            f"Inspection-complete manifest exported: "
+            f"{INSPECTION_COMPLETE_MANIFEST}",
+            flush=True,
+        )
+    except OSError as exc:
+        print(f"[CAPTURE] inspection-complete manifest failed: {exc}")
+
 def get_latest_position_estimate():
     """Get the latest position estimate (non-blocking)"""
     try:
@@ -1774,6 +1815,7 @@ def run_bt_only_loop(args):
             step_durations_ms['export_dispatch'] = (time.perf_counter() - step_start) * 1000.0
             if new_export is not None:
                 latest_export = new_export
+            export_inspection_complete_manifest()
 
             step_start = time.perf_counter()
             if display_export and latest_export is not None:
